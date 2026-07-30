@@ -8,10 +8,13 @@
 """
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import unittest
 from typing import Any
 
+from anklang.backends import BackendSearchResult
 from anklang.backends.local_engine import LocalEngineBackend
 from anklang.backends.reverse_proxy import ReverseProxyBackend
 from anklang.cache import ResultCache
@@ -48,7 +51,7 @@ def _config(**overrides: Any) -> AppConfig:
 def _request(content_hash: str | None = None, statement: str = "给定 n 个整数，输出它们的和。") -> dict[str, Any]:
     return {
         "apiVersion": "1",
-        "requestId": "22222222-2222-2222-2222-222222222222",
+        "requestId": "22222222-2222-4222-8222-222222222222",
         "contentHash": content_hash or ("d" * 64),
         "problem": {
             "title": "数组求和",
@@ -82,6 +85,32 @@ class _FakeEmbeddingOpener:
                 return response_body
 
         return _Response()
+
+
+class _FakeYuantijiClient:
+    def search(self, *, query: str, k: int, rerank: bool) -> list[dict[str, Any]]:
+        self.last_search = (query, k, rerank)
+        return [
+            {
+                "source": "unit-test",
+                "externalId": "one",
+                "title": "示例候选",
+                "similarity": 0.8,
+            }
+        ]
+
+    def health(self) -> dict[str, Any]:
+        return {"ok": True}
+
+
+class _FailingEmbeddingOpener:
+    def __init__(self, external_error: str) -> None:
+        self.external_error = external_error
+        self.calls = 0
+
+    def __call__(self, _request: Any, timeout: float) -> Any:  # noqa: ARG002
+        self.calls += 1
+        raise OSError(self.external_error)
 
 
 class _ServerHarness:
@@ -118,6 +147,17 @@ class _ServerHarness:
 
 
 class BuildBackendTests(unittest.TestCase):
+    def test_reverse_proxy_search_result_is_not_degraded(self) -> None:
+        client = _FakeYuantijiClient()
+        backend = ReverseProxyBackend(client, use_rerank=False)  # type: ignore[arg-type]
+
+        search_result = backend.search("自编测试题面", 3)
+
+        self.assertIsInstance(search_result, BackendSearchResult)
+        self.assertFalse(search_result.degraded)
+        self.assertEqual(search_result.candidates[0]["externalId"], "one")
+        self.assertEqual(client.last_search, ("自编测试题面", 3, False))
+
     def test_default_config_selects_reverse_proxy(self) -> None:
         config = _config()
         backend = build_backend(config)
@@ -178,6 +218,76 @@ class LocalEngineServerFlowTests(unittest.TestCase):
         self.assertEqual(payload["apiVersion"], "1")
         self.assertEqual(payload["candidates"][0]["externalId"], "array-sum")
         self.assertEqual(payload["candidates"][0]["source"], "unit-test")
+
+    def test_embedding_failure_returns_candidates_without_caching(self) -> None:
+        submitted_statement = "数组 求和 投题题面不可泄露标记"
+        candidate_excerpt = "数组 求和 候选正文不可泄露标记"
+        external_error = "文字转数字服务错误不可泄露标记"
+        config = _config(backend="local_engine", local_db_path=":memory:")
+        store = ProblemStore(":memory:")
+        self.addCleanup(store.close)
+        store.add_problem(
+            source="unit-test",
+            external_id="keyword-fallback",
+            title="公开候选标题",
+            statement=candidate_excerpt,
+            content_hash="keyword-fallback-hash",
+            embedding=[1.0, 0.0],
+        )
+        opener = _FailingEmbeddingOpener(external_error)
+        embedder = EmbeddingClient(
+            base_url="https://dashscope.test/compatible-mode/v1",
+            api_key="test-key",
+            model="text-embedding-v4",
+            dimensions=2,
+            opener=opener,
+        )
+        backend = LocalEngineBackend(
+            store,
+            embedder,
+            vector_top_k=10,
+            keyword_top_k=10,
+        )
+        service = AnklangService(
+            config,
+            backend,
+            ResultCache(config.cache_ttl_seconds, config.cache_max_entries),
+            None,
+        )
+        harness = _ServerHarness(service)
+        self.addCleanup(harness.close)
+        headers = {
+            "Authorization": "Bearer service-token-abcdef123456",
+            "Content-Type": "application/json",
+        }
+        body = json.dumps(_request(statement=submitted_statement)).encode("utf-8")
+        responses: list[dict[str, Any]] = []
+        stderr = io.StringIO()
+
+        with contextlib.redirect_stderr(stderr):
+            for _ in range(2):
+                status, payload = harness.request(
+                    "POST",
+                    "/api/v1/checks/similarity",
+                    body,
+                    headers,
+                )
+                self.assertEqual(status, 200)
+                self.assertFalse(payload["recommendation"]["blockSubmission"])
+                self.assertEqual(
+                    payload["candidates"][0]["externalId"],
+                    "keyword-fallback",
+                )
+                responses.append(payload)
+
+        self.assertEqual(opener.calls, 2)
+        serialized = json.dumps(responses, ensure_ascii=False)
+        captured_stderr = stderr.getvalue()
+        for secret in (submitted_statement, candidate_excerpt, external_error):
+            self.assertNotIn(secret, serialized)
+            self.assertNotIn(secret, captured_stderr)
+        self.assertNotIn("degraded", serialized)
+        self.assertNotIn("review_failed", serialized)
 
     def test_health_reports_local_engine_info(self) -> None:
         service = self._service()

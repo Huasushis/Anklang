@@ -31,7 +31,9 @@ from .review import evaluate
 from .store import ProblemStore
 from .yuantiji import YuantijiClient
 
-_MAX_REQUEST_BYTES = 2_000_000
+# 合法题面最多 500,000 个 UTF-16 单元；控制字符经 JSON 转义后一个单元可能
+# 占 6 字节，因此请求上限要高于 3MB。2MB 只用于响应上限。
+_MAX_REQUEST_BYTES = 4_000_000
 
 
 class AnklangService:
@@ -52,16 +54,44 @@ class AnklangService:
         if cached is not None:
             return cached
 
-        candidates = self.backend.search(request["basic_statement"], self.config.search_k)
-        decision = evaluate(self.config, request, candidates, self.llm_client)
-        result = build_result(
-            content_hash=request["content_hash"],
-            candidates=decision["candidates"],
-            block_submission=decision["block_submission"],
-            message=decision["message"],
-        )
-        self.cache.set(request["content_hash"], result)
+        try:
+            search_result = self.backend.search(
+                request["basic_statement"], self.config.search_k
+            )
+        except BackendError:
+            # 第三方服务或本地索引暂时不可用，不应该变成投稿接口的 5xx。返回一个
+            # 字段完整、明确不自动拦截的结果，让 Urmotiv 能给出可理解的人工核对提示。
+            # 降级结果不写缓存，下一次请求可以立即重新尝试。
+            return self._build_unavailable_result(request["content_hash"])
+        try:
+            decision = evaluate(
+                self.config,
+                request,
+                search_result.candidates,
+                self.llm_client,
+            )
+            result = build_result(
+                content_hash=request["content_hash"],
+                candidates=decision["candidates"],
+                block_submission=decision["block_submission"],
+                message=decision["message"],
+            )
+        except (ContractError, KeyError, TypeError, ValueError, OverflowError):
+            # 上游候选结构异常也属于“本次检索未完成”，不能让 Urmotiv 收到一个
+            # 无法解释的 5xx，更不能把异常候选内容带进错误信息。
+            return self._build_unavailable_result(request["content_hash"])
+        if not search_result.degraded and not decision["review_failed"]:
+            self.cache.set(request["content_hash"], result)
         return result
+
+    @staticmethod
+    def _build_unavailable_result(content_hash: str) -> dict[str, Any]:
+        return build_result(
+            content_hash=content_hash,
+            candidates=[],
+            block_submission=False,
+            message="本次未能完成原题检索，请稍后重试并由审题人手工核对。",
+        )
 
 
 def make_handler(service: AnklangService) -> type[BaseHTTPRequestHandler]:
@@ -95,12 +125,6 @@ def make_handler(service: AnklangService) -> type[BaseHTTPRequestHandler]:
                 return
             try:
                 result = service.check_similarity(request)
-            except BackendError:
-                self._send(
-                    502,
-                    {"error": {"code": "UPSTREAM_UNAVAILABLE", "message": "原题检索后端暂时不可用。"}},
-                )
-                return
             except ContractError as error:
                 self._send(500, {"error": {"code": "INVALID_RESULT", "message": str(error)}})
                 return
@@ -128,7 +152,7 @@ def make_handler(service: AnklangService) -> type[BaseHTTPRequestHandler]:
             if not header.startswith("Bearer "):
                 return False
             provided = header[len("Bearer ") :].strip()
-            return hmac.compare_digest(provided, expected)
+            return hmac.compare_digest(provided.encode("utf-8"), expected.encode("utf-8"))
 
         def _read_json(self) -> Any | None:
             try:
@@ -142,7 +166,7 @@ def make_handler(service: AnklangService) -> type[BaseHTTPRequestHandler]:
             raw = self.rfile.read(length)
             try:
                 return json.loads(raw.decode("utf-8"))
-            except (json.JSONDecodeError, UnicodeDecodeError):
+            except (ValueError, RecursionError):
                 self._send(400, {"error": {"code": "INVALID_REQUEST", "message": "请求体不是有效 JSON。"}})
                 return None
 
@@ -180,6 +204,11 @@ def build_backend(config: AppConfig) -> SearchBackend:
         base_url=config.yuantiji_base_url,
         timeout_seconds=config.yuantiji_timeout_seconds,
         minimum_interval_seconds=config.yuantiji_minimum_interval_seconds,
+        max_retries=config.yuantiji_max_retries,
+        retry_base_delay_seconds=config.yuantiji_retry_base_delay_seconds,
+        circuit_failure_threshold=config.yuantiji_circuit_failure_threshold,
+        circuit_open_seconds=config.yuantiji_circuit_open_seconds,
+        health_cache_seconds=config.yuantiji_health_cache_seconds,
     )
     return ReverseProxyBackend(yuantiji, use_rerank=config.use_rerank)
 

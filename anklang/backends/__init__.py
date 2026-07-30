@@ -11,6 +11,7 @@
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 
 
@@ -21,17 +22,30 @@ class BackendError(RuntimeError):
     """
 
 
+@dataclass(frozen=True)
+class BackendSearchResult:
+    """一次后端检索的内部结果，不会直接作为 HTTP 响应发送。
+
+    degraded 表示本次检索有一部分没有完成，例如本地文字转数字服务失败后只做了
+    关键词检索。服务层仍可展示 candidates，但不应缓存这次不完整的结果。
+    """
+
+    candidates: list[dict[str, Any]]
+    degraded: bool
+
+
 @runtime_checkable
 class SearchBackend(Protocol):
     """所有检索后端必须实现的统一接口。
 
-    search() 返回的每个候选 dict 至少包含 source / externalId / title / similarity，
-    可以再带 url / explanation —— 字段名和含义与 anklang.contracts.build_result
-    期望的候选结构一致，anklang.review.evaluate 会在此基础上做相似度阈值判定和
-    可选的 LLM 复核，两种后端不需要、也不应该重复实现这部分判定逻辑。
+    search() 返回 BackendSearchResult，其中每个候选 dict 至少包含 source /
+    externalId / title / similarity，可以再带 url / explanation —— 字段名和含义与
+    anklang.contracts.build_result 期望的候选结构一致。anklang.review.evaluate 会
+    在此基础上做相似度阈值判定和可选的 LLM 复核，两种后端不需要、也不应该重复
+    实现这部分判定逻辑。
     """
 
-    def search(self, query_text: str, k: int) -> list[dict[str, Any]]:
+    def search(self, query_text: str, k: int) -> BackendSearchResult:
         """用 query_text（题面文本）检索最相似的最多 k 条候选，不要求调用方再排序。
         遇到自身不可用的情况（上游服务挂了、本地存储读取失败等）应该抛出
         BackendError，而不是返回空列表悄悄吞掉——"完全没有候选"和"这次没查成功"

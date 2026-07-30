@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from . import BackendError
+from . import BackendError, BackendSearchResult
 from ..yuantiji import YuantijiClient, YuantijiError
 
 
@@ -20,11 +20,16 @@ class ReverseProxyBackend:
         self._client = client
         self._use_rerank = use_rerank
 
-    def search(self, query_text: str, k: int) -> list[dict[str, Any]]:
+    def search(self, query_text: str, k: int) -> BackendSearchResult:
         try:
-            return self._client.search(query=query_text, k=k, rerank=self._use_rerank)
+            candidates = self._client.search(
+                query=query_text,
+                k=k,
+                rerank=self._use_rerank,
+            )
         except YuantijiError as error:
             raise BackendError(str(error)) from error
+        return BackendSearchResult(candidates=candidates, degraded=False)
 
     def describe_health(self) -> dict[str, Any]:
         try:

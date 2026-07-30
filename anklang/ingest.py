@@ -19,8 +19,14 @@ from dataclasses import dataclass, field
 
 from .config import ConfigError, load_config
 from .embedding import EmbeddingClient, EmbeddingError
-from .sources import discover_source_modules
-from .store import ProblemStore
+from .sources import (
+    RawProblem,
+    SourceContractError,
+    discover_source_modules,
+    is_valid_source_updated_at,
+    validate_raw_problem,
+)
+from .store import ProblemStore, StoredProblem
 from .text_normalize import content_hash_of, normalize_statement
 
 
@@ -30,7 +36,10 @@ class IngestSummary:
 
     per_source_fetched: dict[str, int] = field(default_factory=dict)
     inserted: int = 0
-    duplicates: int = 0
+    updated: int = 0
+    unchanged: int = 0
+    skipped: int = 0
+    source_failures: int = 0
     embedding_failures: int = 0
 
     @property
@@ -45,15 +54,47 @@ def ingest_once(store: ProblemStore, embedder: EmbeddingClient | None) -> Ingest
     summary = IngestSummary()
     for module in discover_source_modules():
         source_name = module.SOURCE_NAME
-        since = store.get_cursor(source_name)
-        raw_problems = module.fetch_new_problems(since)
+        stored_since = store.get_cursor(source_name)
+        # 旧版本曾允许来源自定义任意游标。遇到这种旧值时做一次全量读取，
+        # 成功后再用规范 UTC 时间替换它。
+        fetch_since = (
+            stored_since
+            if stored_since is None or is_valid_source_updated_at(stored_since)
+            else None
+        )
+        try:
+            raw_problems = module.fetch_new_problems(fetch_since)
+            selected, ambiguous_count = _select_latest_versions(raw_problems)
+        except Exception:
+            # 一个来源失效不应阻断其他来源；异常内容可能带有私有地址或响应摘要，
+            # 因此这里只记录固定计数，不输出原异常。
+            summary.source_failures += 1
+            continue
         summary.per_source_fetched[source_name] = len(raw_problems)
+        summary.skipped += ambiguous_count
+        # 只要本批有题目没有更新时间，就不能用其他题目的时间代表整批进度，
+        # 否则来源下次按时间筛选时可能漏掉这类题目。
+        may_advance_cursor = ambiguous_count == 0 and all(
+            raw.updated_at is not None for raw in raw_problems
+        )
 
         latest_updated_at: str | None = None
         for raw in raw_problems:
+            if raw.updated_at is not None and (
+                latest_updated_at is None or raw.updated_at > latest_updated_at
+            ):
+                latest_updated_at = raw.updated_at
+
+        for raw in selected:
             statement = normalize_statement(raw.statement)
+            content_hash = content_hash_of(statement)
+            existing = store.get_problem(source_name, raw.external_id)
             embedding: list[float] | None = None
-            if embedder is not None:
+            if embedder is not None and _needs_embedding(
+                existing,
+                raw,
+                content_hash,
+            ):
                 try:
                     embedding = embedder.embed_one(statement)
                 except EmbeddingError:
@@ -61,27 +102,115 @@ def ingest_once(store: ProblemStore, embedder: EmbeddingClient | None) -> Ingest
                     # anklang.backfill 补算，不影响这道题先入库。
                     summary.embedding_failures += 1
                     embedding = None
-            inserted = store.add_problem(
+            write_result = store.add_problem(
                 source=source_name,
                 external_id=raw.external_id,
                 title=raw.title,
                 url=raw.url,
                 statement=statement,
                 embedding=embedding,
-                content_hash=content_hash_of(statement),
+                content_hash=content_hash,
+                source_updated_at=raw.updated_at,
             )
-            if inserted:
+            if write_result == "inserted":
                 summary.inserted += 1
+            elif write_result == "updated":
+                summary.updated += 1
+            elif write_result == "skipped":
+                summary.skipped += 1
+                may_advance_cursor = False
             else:
-                summary.duplicates += 1
-            if raw.updated_at is not None and (
-                latest_updated_at is None or raw.updated_at > latest_updated_at
-            ):
-                latest_updated_at = raw.updated_at
+                summary.unchanged += 1
 
-        if latest_updated_at is not None:
-            store.set_cursor(source_name, latest_updated_at)
+        if (
+            may_advance_cursor
+            and latest_updated_at is not None
+            and (fetch_since is None or latest_updated_at > fetch_since)
+        ):
+            store.set_cursor_if_current(
+                source_name,
+                expected_value=stored_since,
+                next_value=latest_updated_at,
+            )
     return summary
+
+
+def _select_latest_versions(
+    raw_problems: object,
+) -> tuple[list[RawProblem], int]:
+    """每个题号只保留明确较新的版本；无法判断先后的冲突整组跳过。"""
+    if not isinstance(raw_problems, list):
+        raise SourceContractError("来源返回值必须是题目列表。")
+
+    selected: dict[str, RawProblem] = {}
+    ambiguous: set[str] = set()
+    for raw_value in raw_problems:
+        raw = validate_raw_problem(raw_value)
+        if raw.external_id in ambiguous:
+            continue
+        previous = selected.get(raw.external_id)
+        if previous is None:
+            selected[raw.external_id] = raw
+            continue
+        choice = _newer_problem(previous, raw)
+        if choice is None:
+            selected.pop(raw.external_id, None)
+            ambiguous.add(raw.external_id)
+        else:
+            selected[raw.external_id] = choice
+    return list(selected.values()), len(ambiguous)
+
+
+def _newer_problem(first: RawProblem, second: RawProblem) -> RawProblem | None:
+    if first.updated_at is not None and second.updated_at is not None:
+        if second.updated_at > first.updated_at:
+            return second
+        if second.updated_at < first.updated_at:
+            return first
+    if _same_source_content(first, second):
+        if first.updated_at is None and second.updated_at is not None:
+            return second
+        return first
+    return None
+
+
+def _same_source_content(first: RawProblem, second: RawProblem) -> bool:
+    return (
+        first.title == second.title
+        and first.statement == second.statement
+        and first.url == second.url
+    )
+
+
+def _source_fields_can_be_updated(
+    existing: StoredProblem,
+    raw: RawProblem,
+    content_hash: str,
+) -> bool:
+    source_fields_changed = (
+        existing.title != raw.title
+        or existing.url != raw.url
+        or existing.content_hash != content_hash
+    )
+    if not source_fields_changed:
+        return True
+    return (
+        raw.updated_at is not None
+        and existing.source_updated_at is not None
+        and raw.updated_at > existing.source_updated_at
+    )
+
+
+def _needs_embedding(
+    existing: StoredProblem | None,
+    raw: RawProblem,
+    content_hash: str,
+) -> bool:
+    if existing is None:
+        return True
+    if not _source_fields_can_be_updated(existing, raw, content_hash):
+        return False
+    return existing.embedding is None or existing.content_hash != content_hash
 
 
 def main() -> int:
@@ -104,7 +233,10 @@ def main() -> int:
     sys.stderr.write(
         "抓取完成："
         f"共发现 {summary.fetched} 条，新入库 {summary.inserted} 条，"
-        f"重复跳过 {summary.duplicates} 条，embedding 失败 {summary.embedding_failures} 条。\n"
+        f"更新 {summary.updated} 条，未变化 {summary.unchanged} 条，"
+        f"因版本不明确跳过 {summary.skipped} 条，"
+        f"来源失败 {summary.source_failures} 个，"
+        f"embedding 失败 {summary.embedding_failures} 条。\n"
     )
     return 0
 

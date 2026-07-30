@@ -27,8 +27,15 @@ def backfill_missing_embeddings(store: ProblemStore, embedder: EmbeddingClient) 
         except EmbeddingError:
             failed += 1
             continue
-        store.update_embedding(problem.id, embedding)
-        succeeded += 1
+        if store.update_embedding(
+            problem.id,
+            embedding,
+            expected_content_hash=problem.content_hash,
+        ):
+            succeeded += 1
+        else:
+            # 计算期间题面已经更新，旧向量不能写回新题面。
+            failed += 1
     return succeeded, failed
 
 

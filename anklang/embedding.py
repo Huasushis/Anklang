@@ -27,6 +27,8 @@ import urllib.error
 import urllib.request
 from typing import Any
 
+from .vectormath import validate_embedding
+
 _MAX_RESPONSE_BYTES = 8_000_000
 _MAX_BATCH_SIZE = 10
 
@@ -45,6 +47,8 @@ class EmbeddingClient:
         timeout_seconds: float = 30.0,
         opener: Any | None = None,
     ) -> None:
+        if isinstance(dimensions, bool) or not isinstance(dimensions, int) or dimensions <= 0:
+            raise ValueError("向量维度必须是正整数。")
         self._url = f"{base_url}/embeddings"
         self._api_key = api_key
         self._model = model
@@ -98,7 +102,7 @@ class EmbeddingClient:
             raise EmbeddingError("百炼 embedding 响应过大。")
         try:
             payload = json.loads(raw.decode("utf-8"))
-        except (json.JSONDecodeError, UnicodeDecodeError) as error:
+        except (ValueError, UnicodeDecodeError, RecursionError) as error:
             raise EmbeddingError("百炼 embedding 响应不是有效 JSON。") from error
         data = payload.get("data") if isinstance(payload, dict) else None
         if not isinstance(data, list) or len(data) != len(chunk):
@@ -106,18 +110,35 @@ class EmbeddingClient:
 
         # 有些 OpenAI 兼容的 embedding 接口会在每条结果里带 index 字段标明原始顺序；
         # 没有这个字段时按响应数组的原始顺序处理。两种情况都要能正确处理。
+        has_indices = ["index" in item for item in data if isinstance(item, dict)]
+        if has_indices and any(has_indices) and not all(has_indices):
+            raise EmbeddingError("百炼 embedding 响应不能只给部分结果提供 index。")
         indexed: list[tuple[int, list[float]]] = []
         for position, item in enumerate(data):
             if not isinstance(item, dict):
                 raise EmbeddingError("百炼 embedding 响应格式不正确。")
             embedding = item.get("embedding")
-            if not isinstance(embedding, list) or not all(
-                isinstance(value, (int, float)) for value in embedding
-            ):
+            if not isinstance(embedding, list):
                 raise EmbeddingError("百炼 embedding 响应缺少向量数据。")
-            index = item.get("index", position)
-            if not isinstance(index, int):
+            try:
+                vector = validate_embedding(
+                    embedding, expected_dimensions=self._dimensions
+                )
+            except ValueError as error:
+                raise EmbeddingError("百炼 embedding 响应里的向量不合法。") from error
+
+            # 接口允许省略 index，此时按响应数组位置处理；只要给出了 index，就不能
+            # 用布尔值、字符串或小数冒充整数，也不能靠回退逻辑掩盖错误。
+            if "index" in item:
+                index = item["index"]
+                if isinstance(index, bool) or not isinstance(index, int):
+                    raise EmbeddingError("百炼 embedding 响应里的 index 不是整数。")
+            else:
                 index = position
-            indexed.append((index, [float(value) for value in embedding]))
+            indexed.append((index, vector))
+
+        indices = [index for index, _ in indexed]
+        if len(set(indices)) != len(indices) or set(indices) != set(range(len(chunk))):
+            raise EmbeddingError("百炼 embedding 响应里的 index 不完整或有重复。")
         indexed.sort(key=lambda pair: pair[0])
         return [vector for _, vector in indexed]

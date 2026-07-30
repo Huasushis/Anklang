@@ -12,6 +12,7 @@ import unittest
 from typing import Any
 
 from anklang.backends.local_engine import LocalEngineBackend
+from anklang.contracts import build_result
 from anklang.embedding import EmbeddingClient
 from anklang.store import ProblemStore
 
@@ -109,9 +110,11 @@ class LocalEngineBackendTests(unittest.TestCase):
 
     def test_similar_problem_ranks_first(self) -> None:
         backend = LocalEngineBackend(self.store, self.embedder, vector_top_k=10, keyword_top_k=10)
-        results = backend.search(_QUERY_TEXT, k=5)
+        search_result = backend.search(_QUERY_TEXT, k=5)
+        results = search_result.candidates
 
         self.assertTrue(results)
+        self.assertFalse(search_result.degraded)
         self.assertEqual(results[0]["externalId"], "array-sum")
         ranked_ids = [item["externalId"] for item in results]
         self.assertLess(ranked_ids.index("array-sum-2"), ranked_ids.index("graph"))
@@ -121,37 +124,52 @@ class LocalEngineBackendTests(unittest.TestCase):
 
     def test_candidate_shape_matches_contract_expectations(self) -> None:
         backend = LocalEngineBackend(self.store, self.embedder, vector_top_k=10, keyword_top_k=10)
-        results = backend.search(_QUERY_TEXT, k=5)
+        search_result = backend.search(_QUERY_TEXT, k=5)
+        results = search_result.candidates
         top = results[0]
         self.assertEqual(top["source"], "unit-test")
         self.assertIn("similarity", top)
         self.assertTrue(0.0 <= top["similarity"] <= 1.0)
         self.assertTrue(top["url"].startswith("http") if "url" in top else True)
+        self.assertIn("_reviewExcerpt", top)
+
+        result = build_result("a" * 64, [top], False, "已完成")
+        serialized = json.dumps(result, ensure_ascii=False)
+        self.assertNotIn("_reviewExcerpt", result["candidates"][0])
+        self.assertNotIn("degraded", serialized)
+        self.assertNotIn("输出它们的和", serialized)
 
     def test_falls_back_to_keyword_when_embedding_unavailable(self) -> None:
         backend = LocalEngineBackend(self.store, embedder=None, vector_top_k=10, keyword_top_k=10)
-        results = backend.search("数组求和 给定 n 个整数 输出它们的和", k=5)
+        search_result = backend.search("数组求和 给定 n 个整数 输出它们的和", k=5)
+        results = search_result.candidates
         self.assertTrue(results)
+        self.assertFalse(search_result.degraded)
         self.assertEqual(self.opener.calls, 0)
 
-    def test_falls_back_when_embedding_call_fails(self) -> None:
+    def test_embedding_failure_marks_keyword_fallback_as_degraded(self) -> None:
         # 注册的表里没有这个 query 文本，_FakeEmbeddingOpener 会抛 KeyError，
         # EmbeddingClient 应该把它当成失败，LocalEngineBackend 捕获后降级为关键词召回。
         broken_embedder, opener = _make_embedder({})
         backend = LocalEngineBackend(self.store, broken_embedder, vector_top_k=10, keyword_top_k=10)
-        results = backend.search("数组求和 给定 n 个整数 输出它们的和", k=5)
+        search_result = backend.search("数组求和 给定 n 个整数 输出它们的和", k=5)
+        results = search_result.candidates
         self.assertTrue(results)
+        self.assertTrue(search_result.degraded)
+        self.assertEqual(opener.calls, 1)
 
     def test_respects_k_limit(self) -> None:
         backend = LocalEngineBackend(self.store, self.embedder, vector_top_k=10, keyword_top_k=10)
-        results = backend.search(_QUERY_TEXT, k=2)
+        results = backend.search(_QUERY_TEXT, k=2).candidates
         self.assertLessEqual(len(results), 2)
 
     def test_empty_store_returns_empty(self) -> None:
         empty_store = ProblemStore(":memory:")
         self.addCleanup(empty_store.close)
         backend = LocalEngineBackend(empty_store, self.embedder)
-        self.assertEqual(backend.search(_QUERY_TEXT, k=5), [])
+        search_result = backend.search(_QUERY_TEXT, k=5)
+        self.assertEqual(search_result.candidates, [])
+        self.assertFalse(search_result.degraded)
 
     def test_describe_health_reports_count_and_embedding_availability(self) -> None:
         backend = LocalEngineBackend(self.store, self.embedder)

@@ -20,10 +20,11 @@ Top-K2，取并集去重后，统一交给 LLM 复核环节做最终判断，不
 """
 from __future__ import annotations
 
+import math
 import re
 from typing import Any
 
-from . import BackendError
+from . import BackendError, BackendSearchResult
 from ..embedding import EmbeddingClient, EmbeddingError
 from ..store import ProblemStore, StoredProblem
 from ..vectormath import cosine_similarity
@@ -46,7 +47,7 @@ class LocalEngineBackend:
         self._vector_top_k = vector_top_k
         self._keyword_top_k = keyword_top_k
 
-    def search(self, query_text: str, k: int) -> list[dict[str, Any]]:
+    def search(self, query_text: str, k: int) -> BackendSearchResult:
         try:
             problems = self.store.iter_all()
         except Exception as error:
@@ -55,11 +56,14 @@ class LocalEngineBackend:
             raise BackendError("本地题库读取失败。") from error
 
         query_vector: list[float] | None = None
+        degraded = False
         if self.embedder is not None:
             try:
                 query_vector = self.embedder.embed_one(query_text)
             except EmbeddingError:
-                query_vector = None  # 向量召回不可用时退化为只用关键词召回，不报错
+                # 已配置的文字转数字服务调用失败时仍做关键词检索，但要让服务层知道
+                # 结果不完整，从而不缓存；未配置服务本来就是正常的关键词模式。
+                degraded = True
 
         query_tokens = _tokenize(query_text)
 
@@ -68,7 +72,10 @@ class LocalEngineBackend:
         for problem in problems:
             if query_vector is not None and problem.embedding is not None:
                 similarity = cosine_similarity(query_vector, problem.embedding)
-                vector_scored.append((similarity, problem))
+                # 无法安全比较的向量会得到 0 分；不要把这种记录塞进 Top-K，
+                # 否则题库很小时它仍可能作为候选显示。
+                if similarity > 0.0:
+                    vector_scored.append((similarity, problem))
             if query_tokens:
                 score = _keyword_score(query_tokens, problem.statement)
                 if score > 0.0:
@@ -88,7 +95,7 @@ class LocalEngineBackend:
                 merged[key] = _to_candidate(problem, score)
 
         ranked = sorted(merged.values(), key=lambda item: item["similarity"], reverse=True)
-        return ranked[:k]
+        return BackendSearchResult(candidates=ranked[:k], degraded=degraded)
 
     def describe_health(self) -> dict[str, Any]:
         try:
@@ -109,16 +116,25 @@ class LocalEngineBackend:
 
 def _to_candidate(problem: StoredProblem, similarity: float) -> dict[str, Any]:
     snippet = " ".join(problem.statement.split())[:400]
+    if isinstance(similarity, bool) or not isinstance(similarity, (int, float)):
+        numeric_similarity = 0.0
+    else:
+        numeric_similarity = float(similarity)
+        if not math.isfinite(numeric_similarity):
+            numeric_similarity = 0.0
     candidate: dict[str, Any] = {
         "source": problem.source,
         "externalId": problem.external_id,
         "title": problem.title,
-        "similarity": max(0.0, min(1.0, float(similarity))),
+        "similarity": max(0.0, min(1.0, numeric_similarity)),
+        "explanation": "该候选由本地题库的文字含义或字面重合信号找到，请人工核对来源记录。",
     }
     if problem.url:
         candidate["url"] = problem.url
     if snippet:
-        candidate["explanation"] = f"本地题库候选题面片段：{snippet}"
+        # 仅供当前请求里的可选模型复核使用。contracts.build_result 不会把这个
+        # 内部字段写进返回结果，ResultCache 也只缓存已经清理过的契约结果。
+        candidate["_reviewExcerpt"] = snippet
     return candidate
 
 

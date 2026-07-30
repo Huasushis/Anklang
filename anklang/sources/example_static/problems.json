@@ -4,34 +4,34 @@
     "title": "数组元素之和",
     "statement": "给定一个包含 n 个整数的数组，请计算这些整数的总和。输入第一行是整数 n，第二行是 n 个用空格分隔的整数。输出这些整数的和。",
     "url": "https://example.invalid/problems/demo-1001",
-    "updated_at": "2026-01-01"
+    "updated_at": "2026-01-01T00:00:00.000Z"
   },
   {
     "external_id": "demo-1002",
     "title": "数组求和（改写版）",
     "statement": "给定一个包含 n 个整数的数列，请你求出这些数的总和并输出。第一行输入一个整数 n，第二行输入 n 个整数，用空格隔开。请输出所有整数之和。",
     "url": "https://example.invalid/problems/demo-1002",
-    "updated_at": "2026-01-02"
+    "updated_at": "2026-01-02T00:00:00.000Z"
   },
   {
     "external_id": "demo-1003",
     "title": "最长上升子序列",
     "statement": "给定一个长度为 n 的整数序列，求其最长严格递增子序列的长度。子序列不要求连续，但要求下标递增且对应元素严格递增。",
     "url": "https://example.invalid/problems/demo-1003",
-    "updated_at": "2026-01-03"
+    "updated_at": "2026-01-03T00:00:00.000Z"
   },
   {
     "external_id": "demo-1004",
     "title": "图的最短路径",
     "statement": "给定一张带权无向图，求从起点到终点的最短路径长度。图中可能存在重边和自环，边权均为正整数。",
     "url": "https://example.invalid/problems/demo-1004",
-    "updated_at": "2026-01-04"
+    "updated_at": "2026-01-04T00:00:00.000Z"
   },
   {
     "external_id": "demo-1005",
     "title": "交互题：猜数字",
     "statement": "这是一道交互题。系统内心想了一个 1 到 n 之间的整数，你每次可以询问一个数，系统会告诉你猜大了、猜小了还是猜对了，请在规定次数内猜出这个数。",
     "url": "https://example.invalid/problems/demo-1005",
-    "updated_at": "2026-01-05"
+    "updated_at": "2026-01-05T00:00:00.000Z"
   }
 ]

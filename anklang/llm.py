@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import http.client
 import json
 import re
 import urllib.error
@@ -52,14 +53,25 @@ class LlmClient:
         try:
             with self._opener(request, timeout=timeout_seconds) as response:
                 raw = response.read(_MAX_RESPONSE_BYTES + 1)
-        except (urllib.error.URLError, TimeoutError) as error:
+        except (
+            urllib.error.URLError,
+            TimeoutError,
+            OSError,
+            http.client.HTTPException,
+        ) as error:
             raise LlmError("LLM 请求失败。") from error
         if len(raw) > _MAX_RESPONSE_BYTES:
             raise LlmError("LLM 响应过大。")
         try:
             payload = json.loads(raw.decode("utf-8"))
             content = payload["choices"][0]["message"]["content"]
-        except (json.JSONDecodeError, UnicodeDecodeError, KeyError, IndexError, TypeError) as error:
+        except (
+            ValueError,
+            KeyError,
+            IndexError,
+            TypeError,
+            RecursionError,
+        ) as error:
             raise LlmError("LLM 响应结构不符合预期。") from error
         if not isinstance(content, str):
             raise LlmError("LLM 响应内容不是文本。")
@@ -68,7 +80,7 @@ class LlmClient:
             raise LlmError("LLM 响应里没有 JSON 对象。")
         try:
             parsed = json.loads(match.group(0))
-        except json.JSONDecodeError as error:
+        except (ValueError, RecursionError) as error:
             raise LlmError("LLM 响应里的 JSON 无法解析。") from error
         if not isinstance(parsed, dict):
             raise LlmError("LLM 响应的 JSON 不是对象。")

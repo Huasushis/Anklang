@@ -13,8 +13,8 @@ problems.json 是自己编写的示例题目（不是任何真实题库的原文
       "title": "...",
       "statement": "...",
       "url": "...",
-      "updated_at": "2026-01-01"   # 字符串，本示例用 ISO 8601 日期，方便直接按
-                                   # 字符串比较大小实现增量过滤
+      "updated_at": "2026-01-01T00:00:00.000Z"
+                                   # 规范 UTC 时间，可直接比较先后
     },
     ...
   ]
@@ -34,9 +34,7 @@ _DATA_PATH = Path(__file__).with_name("problems.json")
 def fetch_new_problems(since: str | None) -> list[RawProblem]:
     """读取 problems.json；若给定 since，则只返回 updated_at 大于它的题目。
 
-    示例数据的 updated_at 是形如 "2026-01-01" 的日期字符串，ISO 8601 日期格式的
-    字符串顺序恰好等于时间顺序，可以直接按字符串比较大小，不需要真正解析成日期
-    对象——这是这个示例数据格式本身的特性，不是所有来源都能这样简化。
+    示例数据的 updated_at 是统一精度的 UTC 时间，字符串顺序等于时间顺序。
     """
     problems = _load_all()
     if since is None:
@@ -51,9 +49,9 @@ def _load_all() -> list[RawProblem]:
     for item in raw_items:
         problems.append(
             RawProblem(
-                external_id=str(item["external_id"]),
-                title=str(item["title"]),
-                statement=str(item["statement"]),
+                external_id=item["external_id"],
+                title=item["title"],
+                statement=item["statement"],
                 url=item.get("url"),
                 updated_at=item.get("updated_at"),
             )

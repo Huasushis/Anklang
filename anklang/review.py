@@ -3,10 +3,12 @@
 流程：
 1. 过滤掉相似度低于显示下限的候选，按相似度降序；
 2. 若开启 LLM 复核且最高相似度达到复核线，用 LLM 判断前 N 组是否同题，
-   结果写进对应候选的 sameProblemSuggestion / explanation，并可提升拦截建议；
-3. 拦截建议：最高相似度超过 block_threshold，或 LLM 确认存在同题，即建议不要提交。
+   结果写进对应候选的 sameProblemSuggestion，并用固定说明展示复核结论；
+3. 拦截建议：LLM 确认存在同题时建议不要提交；只有管理员明确开启、且阈值已经
+   用人工标注数据校准后，才允许只凭最高相似度建议拦截。
 
-LLM 复核失败不影响主流程：降级为“仅按相似度阈值判定”，不因外部模型不可用而报错。
+LLM 复核失败不影响候选展示和拦截判断：不因外部模型不可用而报错，也不会偷偷启用
+未经校准的纯相似度拦截。内部结果会标记本次复核失败，让服务不要缓存这个不完整结果。
 """
 from __future__ import annotations
 
@@ -32,6 +34,7 @@ def evaluate(
 
     highest = visible[0]["similarity"] if visible else 0.0
     llm_confirms_same = False
+    review_failed = False
 
     if (
         config.llm_review_enabled
@@ -40,21 +43,40 @@ def evaluate(
         and highest >= config.minimum_similarity
     ):
         for candidate in visible[: config.llm_review_top_n]:
-            verdict = _llm_review_one(llm_client, config, request, candidate)
+            try:
+                verdict = _llm_review_one(llm_client, config, request, candidate)
+            except LlmError:
+                review_failed = True
+                continue
             if verdict is None:
+                review_failed = True
                 continue
             candidate["sameProblemSuggestion"] = verdict["sameProblem"]
-            if verdict.get("explanation"):
-                candidate["explanation"] = verdict["explanation"]
+            candidate["explanation"] = (
+                "模型复核认为这两道题可能相同，请人工核对来源记录。"
+                if verdict["sameProblem"]
+                else "模型复核没有确认同题，仍请人工核对来源记录。"
+            )
             if verdict["sameProblem"]:
                 llm_confirms_same = True
 
-    block = highest >= config.block_threshold or llm_confirms_same
-    message = _summarize(visible, highest, block, llm_confirms_same)
+    similarity_blocks = (
+        config.similarity_block_enabled and highest >= config.block_threshold
+    )
+    block = similarity_blocks or llm_confirms_same
+    message = _summarize(
+        visible,
+        highest,
+        block,
+        llm_confirms_same,
+        similarity_blocks,
+        config.similarity_block_enabled,
+    )
     return {
         "candidates": visible,
         "block_submission": block,
         "message": message,
+        "review_failed": review_failed,
     }
 
 
@@ -67,7 +89,7 @@ def _llm_review_one(
     system = (
         "你是算法竞赛命题查重助手。给你一道待投稿题目的题面和一道候选公开题目的信息，"
         "判断它们是否是同一道题（考点、输入输出、数据范围本质一致即算同题，仅背景包装不同也算）。"
-        "只输出 JSON：{\"sameProblem\": true|false, \"explanation\": \"简短中文理由\"}。"
+        "只输出 JSON：{\"sameProblem\": true|false}。"
     )
     user = json.dumps(
         {
@@ -76,28 +98,22 @@ def _llm_review_one(
                 "title": candidate["title"],
                 "source": candidate["source"],
                 "similarity": candidate["similarity"],
-                "excerpt": (candidate.get("explanation") or "")[:2000],
+                # 这段文字只在当前请求内交给复核模型，不进入返回结果、缓存或日志。
+                "excerpt": (candidate.get("_reviewExcerpt") or "")[:2000],
             },
         },
         ensure_ascii=False,
     )
-    try:
-        data = llm_client.complete_json(
-            model=config.llm_model,
-            system=system,
-            user=user,
-            timeout_seconds=config.llm_timeout_seconds,
-        )
-    except LlmError:
-        return None
+    data = llm_client.complete_json(
+        model=config.llm_model,
+        system=system,
+        user=user,
+        timeout_seconds=config.llm_timeout_seconds,
+    )
     same = data.get("sameProblem")
     if not isinstance(same, bool):
         return None
-    explanation = data.get("explanation")
-    return {
-        "sameProblem": same,
-        "explanation": explanation.strip()[:2000] if isinstance(explanation, str) else "",
-    }
+    return {"sameProblem": same}
 
 
 def _summarize(
@@ -105,6 +121,8 @@ def _summarize(
     highest: float,
     block: bool,
     llm_confirms_same: bool,
+    similarity_blocks: bool,
+    similarity_block_enabled: bool,
 ) -> str:
     if not visible:
         return "没有找到达到显示下限的相似题目，可以继续提交。"
@@ -112,6 +130,8 @@ def _summarize(
     base = f"发现 {len(visible)} 道候选题，最高相似度约 {percent}%。"
     if block and llm_confirms_same:
         return base + "复核判断存在疑似同题，建议先核实再提交。"
-    if block:
+    if block and similarity_blocks:
         return base + "相似度很高，建议先核实是否为原题再提交。"
-    return base + "相似度未达到拦截线，请出题人自行确认。"
+    if not similarity_block_enabled:
+        return base + "系统未启用只凭相似度自动拦截，请出题人自行确认。"
+    return base + "相似度未达到已校准的拦截线，请出题人自行确认。"
