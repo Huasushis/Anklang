@@ -1,0 +1,49 @@
+# Secrets and machine-local configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+
+# Problem data and caches — never committed.
+# Candidate problem text, any locally-built corpus, and cached similarity
+# results must stay local. See AGENTS.md and docs/plan.md for why.
+problems-data/
+cache/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+.Python
+.venv/
+venv/
+env/
+*.egg-info/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+dist/
+build/
+
+# JavaScript / TypeScript (kept as a safeguard if auxiliary tooling ever uses Node)
+node_modules/
+.pnpm-store/
+
+# Docker
+docker-compose.override.yml
+
+# Logs
+*.log
+logs/
+
+# Editors and operating systems
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+desktop.ini
