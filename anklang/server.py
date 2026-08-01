@@ -77,11 +77,22 @@ class AnklangService:
         if api_version not in {"1", "2"}:
             raise ValueError("服务端 API 版本不合法。")
         content_hash = request["content_hash"]
-        cache_key = self._current_cache_key(request, api_version)
-        if cache_key is not None:
+        cache_lookup = self._current_cache_lookup(request, api_version)
+        if cache_lookup is not None:
+            cache_key, initial_backend_identity = cache_lookup
             cached = self.cache.get(cache_key)
             if cached is not None:
-                return cached
+                if not isinstance(self.backend, LocalEngineBackend):
+                    return cached
+                # cache.get() 与返回结果之间，后台 ingest 或另一个 SQLite 连接
+                # 仍可能改变索引。再次做 O(1) 身份门禁；身份包含 data_version
+                # 和当前进程写入代际，所以内容被改回原值的 ABA 窗口也会失配。
+                confirmed_identity = self.backend.current_cache_identity()
+                if (
+                    confirmed_identity is not None
+                    and confirmed_identity == initial_backend_identity
+                ):
+                    return cached
 
         try:
             search_result = self.backend.search(
@@ -213,18 +224,18 @@ class AnklangService:
                 retryable=False,
             )
 
-    def _current_cache_key(
+    def _current_cache_lookup(
         self,
         request: dict[str, Any],
         api_version: str,
-    ) -> str | None:
+    ) -> tuple[str, str] | None:
         if not isinstance(self.backend, LocalEngineBackend):
             identity = "remote"
         else:
             identity = self.backend.current_cache_identity()
             if identity is None:
                 return None
-        return self._make_cache_key(request, api_version, identity)
+        return self._make_cache_key(request, api_version, identity), identity
 
     def _make_cache_key(
         self,
