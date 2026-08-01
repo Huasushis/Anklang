@@ -135,6 +135,25 @@ def _read_choice(name: str, default: str, choices: tuple[str, ...]) -> str:
     return raw
 
 
+def _read_bind_host(name: str, default: str) -> str:
+    """读取 HTTP 监听地址，不允许把 URL、端口或控制字符混进来。"""
+
+    raw = os.environ.get(name, "").strip() or default
+    if (
+        len(raw) > 253
+        or ":" in raw
+        or "/" in raw
+        or "\\" in raw
+        or any(
+            character.isspace() or ord(character) < 32 or ord(character) == 127
+            for character in raw
+        )
+        or not _valid_hostname(raw)
+    ):
+        raise ConfigError(f"{name} 必须是合法的 IPv4 地址或主机名，且不能包含端口。")
+    return raw
+
+
 def _validate_request_wait_budget(
     *,
     backend: str,
@@ -220,12 +239,24 @@ class AppConfig:
     yuantiji_circuit_failure_threshold: int = 3
     yuantiji_circuit_open_seconds: float = 60.0
     yuantiji_health_cache_seconds: float = 60.0
+    # 默认只在回环地址监听。容器部署必须显式改为 0.0.0.0，并由宿主继续
+    # 只绑定 127.0.0.1，避免直接暴露到外网。
+    bind_host: str = "127.0.0.1"
+    require_service_token: bool = False
+    max_in_flight_checks: int = 16
+    client_idle_timeout_seconds: float = 15.0
+    shutdown_grace_seconds: float = 30.0
 
 
 def load_config() -> AppConfig:
+    require_service_token = _read_bool("ANKLANG_REQUIRE_SERVICE_TOKEN")
     service_token = os.environ.get("ANKLANG_SERVICE_TOKEN", "").strip() or None
     if service_token is not None and len(service_token) < 16:
         raise ConfigError("ANKLANG_SERVICE_TOKEN 至少需要 16 个字符。")
+    if require_service_token and service_token is None:
+        raise ConfigError(
+            "启用 ANKLANG_REQUIRE_SERVICE_TOKEN 时必须配置至少 16 个字符的服务令牌。"
+        )
 
     llm_review_enabled = _read_bool("ANKLANG_LLM_REVIEW")
     llm_base_url: str | None = None
@@ -318,5 +349,16 @@ def load_config() -> AppConfig:
         ),
         yuantiji_health_cache_seconds=_read_float(
             "YUANTIJI_HEALTH_CACHE_SECONDS", 60.0, 1.0, 600.0
+        ),
+        bind_host=_read_bind_host("ANKLANG_BIND_HOST", "127.0.0.1"),
+        require_service_token=require_service_token,
+        max_in_flight_checks=_read_int(
+            "ANKLANG_MAX_IN_FLIGHT_CHECKS", 16, 1, 256
+        ),
+        client_idle_timeout_seconds=_read_float(
+            "ANKLANG_CLIENT_IDLE_TIMEOUT_SECONDS", 15.0, 1.0, 300.0
+        ),
+        shutdown_grace_seconds=_read_float(
+            "ANKLANG_SHUTDOWN_GRACE_SECONDS", 30.0, 1.0, 300.0
         ),
     )

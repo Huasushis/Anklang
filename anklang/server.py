@@ -16,7 +16,10 @@ from __future__ import annotations
 import hmac
 import hashlib
 import json
+import signal
+import socket
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
@@ -45,7 +48,80 @@ from .yuantiji import YuantijiClient
 _MAX_REQUEST_BYTES = 4_000_000
 _V1_SIMILARITY_PATH = "/api/v1/checks/similarity"
 _V2_SIMILARITY_PATH = "/api/v2/checks/similarity"
+_LIVE_PATH = "/api/v1/live"
 _CACHE_SCHEMA_REVISION = "similarity-outcome-v2"
+_BUSY_RETRY_AFTER_SECONDS = 1
+
+
+class ServiceRuntime:
+    """限制在途查重，并为停止接收与有界等待提供一个原子状态。"""
+
+    def __init__(self, max_in_flight_checks: int) -> None:
+        if (
+            isinstance(max_in_flight_checks, bool)
+            or not isinstance(max_in_flight_checks, int)
+            or max_in_flight_checks < 1
+        ):
+            raise ValueError("最大在途查重数必须为正数。")
+        self._max_in_flight_checks = max_in_flight_checks
+        self._condition = threading.Condition()
+        self._accepting = True
+        self._in_flight = 0
+
+    def try_begin_check(self) -> bool:
+        with self._condition:
+            if (
+                not self._accepting
+                or self._in_flight >= self._max_in_flight_checks
+            ):
+                return False
+            self._in_flight += 1
+            return True
+
+    def finish_check(self) -> None:
+        with self._condition:
+            if self._in_flight <= 0:
+                raise RuntimeError("在途查重计数不一致。")
+            self._in_flight -= 1
+            if self._in_flight == 0:
+                self._condition.notify_all()
+
+    def begin_shutdown(self) -> None:
+        with self._condition:
+            self._accepting = False
+            self._condition.notify_all()
+
+    def wait_for_idle(self, timeout_seconds: float) -> bool:
+        deadline = time.monotonic() + timeout_seconds
+        with self._condition:
+            while self._in_flight > 0:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._condition.wait(remaining)
+            return True
+
+    @property
+    def accepting(self) -> bool:
+        with self._condition:
+            return self._accepting
+
+    @property
+    def in_flight(self) -> int:
+        with self._condition:
+            return self._in_flight
+
+
+class AnklangHTTPServer(ThreadingHTTPServer):
+    """请求线程不会把退出拖成无界等待，也不打印原始异常。"""
+
+    daemon_threads = True
+    block_on_close = False
+
+    def handle_error(self, _request: Any, _client_address: Any) -> None:
+        # 标准库默认会把异常堆栈写到 stderr。异常可能来自处理题面的路径，
+        # 因此生产服务器只返回固定响应或静默关闭已经断开的连接。
+        return
 
 
 class AnklangService:
@@ -361,9 +437,20 @@ def _v1_result_from_v2(result: dict[str, Any]) -> dict[str, Any]:
     )
 
 
-def make_handler(service: AnklangService) -> type[BaseHTTPRequestHandler]:
+def make_handler(
+    service: AnklangService,
+    runtime: ServiceRuntime | None = None,
+) -> type[BaseHTTPRequestHandler]:
+    runtime = runtime or ServiceRuntime(service.config.max_in_flight_checks)
+
     class Handler(BaseHTTPRequestHandler):
         server_version = "Anklang/0.1"
+
+        def setup(self) -> None:
+            super().setup()
+            # socket timeout 是“连续多久没有收到/发出任何字节”的上限，能阻止
+            # 声明超长正文后停住的客户端永久占用一个查重名额。
+            self.connection.settimeout(service.config.client_idle_timeout_seconds)
 
         def version_string(self) -> str:
             # 不在 Server 头暴露 Python 运行时版本。
@@ -374,7 +461,12 @@ def make_handler(service: AnklangService) -> type[BaseHTTPRequestHandler]:
             return
 
         def do_GET(self) -> None:  # noqa: N802 (BaseHTTPRequestHandler 约定的方法名)
-            if self.path == "/api/v1/health":
+            if self.path == _LIVE_PATH:
+                self._send(
+                    200,
+                    {"status": "ok", "service": "anklang", "apiVersion": "1"},
+                )
+            elif self.path == "/api/v1/health":
                 self._handle_health()
             elif self.path in {_V1_SIMILARITY_PATH, _V2_SIMILARITY_PATH}:
                 self._handle_unsupported_method()
@@ -439,6 +531,28 @@ def make_handler(service: AnklangService) -> type[BaseHTTPRequestHandler]:
                     {"error": {"code": "NOT_FOUND", "message": "未找到资源。"}},
                 )
                 return
+            # 在鉴权、读取正文和调用任何后端之前取得名额。满载或退出中的请求
+            # 都得到同一个小型响应；未读正文所在连接随即关闭，不能被复用。
+            if not runtime.try_begin_check():
+                self.close_connection = True
+                self._send(
+                    503,
+                    {
+                        "error": {
+                            "code": "SERVICE_BUSY",
+                            "message": "查重服务正忙，请稍后重试。",
+                        }
+                    },
+                    retry_after_seconds=_BUSY_RETRY_AFTER_SECONDS,
+                    close_connection=True,
+                )
+                return
+            try:
+                self._handle_similarity(api_version)
+            finally:
+                runtime.finish_check()
+
+        def _handle_similarity(self, api_version: str) -> None:
             if not self._authorized():
                 self._send(
                     401,
@@ -526,7 +640,11 @@ def make_handler(service: AnklangService) -> type[BaseHTTPRequestHandler]:
             }
             # describe_health() 约定不抛异常，各后端把自己的失败情况体现成状态字段
             # （例如 upstreamReady=False），这里统一根据这些字段判断是否整体降级。
-            info.update(service.backend.describe_health())
+            try:
+                info.update(service.backend.describe_health())
+            except Exception:
+                # 健康检查也不传播外部服务的异常原文。
+                info["status"] = "degraded"
             if (
                 info.get("upstreamReady") is False
                 or info.get("localStoreReady") is False
@@ -564,7 +682,29 @@ def make_handler(service: AnklangService) -> type[BaseHTTPRequestHandler]:
                     {"error": {"code": "INVALID_REQUEST", "message": "请求体大小不合法。"}},
                 )
                 return None
-            raw = self.rfile.read(length)
+            try:
+                raw = self.rfile.read(length)
+            except (TimeoutError, socket.timeout, OSError):
+                self.close_connection = True
+                self._send(
+                    408,
+                    {
+                        "error": {
+                            "code": "CLIENT_TIMEOUT",
+                            "message": "等待请求正文超时。",
+                        }
+                    },
+                    close_connection=True,
+                )
+                return None
+            if len(raw) != length:
+                self.close_connection = True
+                self._send(
+                    400,
+                    {"error": {"code": "INVALID_REQUEST", "message": "请求正文不完整。"}},
+                    close_connection=True,
+                )
+                return None
             try:
                 return json.loads(raw.decode("utf-8"))
             except (ValueError, RecursionError):
@@ -581,23 +721,30 @@ def make_handler(service: AnklangService) -> type[BaseHTTPRequestHandler]:
             *,
             retry_after_seconds: Any = None,
             suppress_body: bool = False,
+            close_connection: bool = False,
         ) -> None:
             body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-            self.send_response(status)
-            self.send_header("Content-Type", "application/json; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            # Anklang 的任何响应都不应由浏览器或中间代理保存；健康信息和错误
-            # 也保持同一条简单、不可被调用方配置绕过的规则。
-            self.send_header("Cache-Control", "no-store")
-            if (
-                not isinstance(retry_after_seconds, bool)
-                and isinstance(retry_after_seconds, int)
-                and 1 <= retry_after_seconds <= 86_400
-            ):
-                self.send_header("Retry-After", str(retry_after_seconds))
-            self.end_headers()
-            if not suppress_body:
-                self.wfile.write(body)
+            try:
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                # Anklang 的任何响应都不应由浏览器或中间代理保存；健康信息和错误
+                # 也保持同一条简单、不可被调用方配置绕过的规则。
+                self.send_header("Cache-Control", "no-store")
+                if close_connection:
+                    self.send_header("Connection", "close")
+                if (
+                    not isinstance(retry_after_seconds, bool)
+                    and isinstance(retry_after_seconds, int)
+                    and 1 <= retry_after_seconds <= 86_400
+                ):
+                    self.send_header("Retry-After", str(retry_after_seconds))
+                self.end_headers()
+                if not suppress_body:
+                    self.wfile.write(body)
+            except OSError:
+                # 客户端中途断开时不输出异常，也不让名额泄漏。
+                self.close_connection = True
 
     return Handler
 
@@ -674,20 +821,55 @@ def _start_background_ingest(
     return thread
 
 
+def _install_shutdown_handlers(
+    runtime: ServiceRuntime,
+) -> dict[int, Any]:
+    """只在主线程安装信号处理；返回原处理器以便嵌入测试时恢复。"""
+
+    if threading.current_thread() is not threading.main_thread():
+        return {}
+    previous: dict[int, Any] = {}
+
+    def _request_shutdown(_signum: int, _frame: Any) -> None:
+        runtime.begin_shutdown()
+
+    for signum in (signal.SIGTERM, signal.SIGINT):
+        previous[signum] = signal.getsignal(signum)
+        signal.signal(signum, _request_shutdown)
+    return previous
+
+
+def _restore_shutdown_handlers(previous: dict[int, Any]) -> None:
+    for signum, handler in previous.items():
+        signal.signal(signum, handler)
+
+
 def serve(config: AppConfig) -> None:
     service = build_service(config)
-    handler = make_handler(service)
-    httpd = ThreadingHTTPServer(("0.0.0.0", config.port), handler)
+    runtime = ServiceRuntime(config.max_in_flight_checks)
+    handler = make_handler(service, runtime)
+    httpd = AnklangHTTPServer((config.bind_host, config.port), handler)
+    # handle_request 的短轮询让信号处理器只改内存状态即可；不需要在信号
+    # 处理器中调用 shutdown()，也就不会与同一线程的 serve_forever 死锁。
+    httpd.timeout = 0.2
     stop_event = threading.Event()
     ingest_thread: threading.Thread | None = None
     if config.ingest_enabled and isinstance(service.backend, LocalEngineBackend):
         ingest_thread = _start_background_ingest(service.backend, config, stop_event)
+    previous_handlers = _install_shutdown_handlers(runtime)
     try:
-        httpd.serve_forever()
+        while runtime.accepting:
+            httpd.handle_request()
     except KeyboardInterrupt:
-        pass
+        runtime.begin_shutdown()
     finally:
+        runtime.begin_shutdown()
         stop_event.set()
+        # 先关闭监听套接字，再等待已经取得名额的请求。请求线程是 daemon，
+        # 即使后端无视自己的超时，也不会越过退出宽限无限阻止进程结束。
         httpd.server_close()
+        deadline = time.monotonic() + config.shutdown_grace_seconds
+        runtime.wait_for_idle(config.shutdown_grace_seconds)
         if ingest_thread is not None:
-            ingest_thread.join(timeout=5.0)
+            ingest_thread.join(timeout=max(0.0, deadline - time.monotonic()))
+        _restore_shutdown_handlers(previous_handlers)

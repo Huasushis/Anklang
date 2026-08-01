@@ -45,6 +45,10 @@ v1 的成功响应形状保持不变，但它无法表达“部分完成”。�
 代理或浏览器保存题目相关结果；健康检查和固定错误同样使用 `no-store`，服务没有可由调用方绕过的
 HTTP 缓存分支。
 
+`GET /api/v1/live` 是只检查当前进程仍能响应的存活探针，固定在本地完成，不读取题库，也不调用
+yuantiji、文字转数字服务或模型。`GET /api/v1/health` 继续提供后端就绪状态；容器编排判断进程是否
+存活时应使用 `/live`，避免监控本身访问外部服务。
+
 v2 的 `reuse` 只描述调用方是否可以在业务层复用这次判断：只有完整结果可能是
 `{"policy":"allowed","expiresAt":"...Z"}`，且有效期最多七天；其他情况都是
 `{"policy":"no-store"}`。`checkedAt` 是实际计算完成的原始时间，缓存命中不会刷新它或
@@ -68,7 +72,8 @@ v2 的 `reuse` 只描述调用方是否可以在业务层复用这次判断：�
 # 需要 Python 3.11+，无第三方依赖
 # 先由部署平台或进程管理器传入 ANKLANG_SERVICE_TOKEN，再启动：
 python3 -m anklang
-# 默认监听 8730 端口；GET /api/v1/health，以及 v1/v2 两个 similarity 接口
+# 默认只监听 127.0.0.1:8730；提供 /api/v1/live、/api/v1/health，
+# 以及 v1/v2 两个 similarity 接口
 ```
 
 在 Urmotiv 管理后台启用"原题相似度检查"插件，把 baseUrl 指向本服务地址、

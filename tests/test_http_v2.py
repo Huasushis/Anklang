@@ -99,6 +99,7 @@ class _ScriptedBackend:
     def __init__(self, *outcomes: BackendSearchResult | BaseException) -> None:
         self.outcomes = outcomes
         self.calls = 0
+        self.health_calls = 0
 
     def search(self, _query_text: str, _k: int) -> BackendSearchResult:
         outcome = self.outcomes[min(self.calls, len(self.outcomes) - 1)]
@@ -108,6 +109,7 @@ class _ScriptedBackend:
         return copy.deepcopy(outcome)
 
     def describe_health(self) -> dict[str, Any]:
+        self.health_calls += 1
         return {"upstreamReady": True}
 
 
@@ -685,6 +687,7 @@ class HttpV2Tests(unittest.TestCase):
         backend = _ScriptedBackend(BackendSearchResult([]))
         harness, _ = self._harness(backend)
         cases = (
+            ("GET", "/api/v1/live", 200),
             ("GET", "/api/v1/health", 200),
             ("GET", "/unrelated", 404),
             ("SYNTHETIC", "/unrelated", 405),
@@ -697,6 +700,31 @@ class HttpV2Tests(unittest.TestCase):
                 self.assertEqual(status, expected)
                 self.assertEqual(headers.get("cache-control"), "no-store")
                 self.assertNotIn("Python", headers.get("server", ""))
+
+    def test_live_is_fixed_local_and_never_calls_backend_health(self) -> None:
+        backend = _ScriptedBackend(BackendSearchResult([]))
+        harness, _ = self._harness(backend)
+        status, payload, headers = harness.request("GET", "/api/v1/live")
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            payload,
+            {"status": "ok", "service": "anklang", "apiVersion": "1"},
+        )
+        self.assertEqual(backend.health_calls, 0)
+        self.assertEqual(headers.get("cache-control"), "no-store")
+
+    def test_health_backend_exception_is_fixed_without_original_text(self) -> None:
+        backend = _ScriptedBackend(BackendSearchResult([]))
+        harness, _ = self._harness(backend)
+        private_marker = "synthetic-private-health-detail"
+        with patch.object(
+            backend, "describe_health", side_effect=RuntimeError(private_marker)
+        ):
+            status, payload, headers = harness.request("GET", "/api/v1/health")
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["status"], "degraded")
+        self.assertNotIn(private_marker, json.dumps(payload, ensure_ascii=False))
+        self.assertEqual(headers.get("cache-control"), "no-store")
 
     def test_untrusted_internal_result_becomes_fixed_500_no_store(self) -> None:
         backend = _ScriptedBackend(BackendSearchResult([]))
