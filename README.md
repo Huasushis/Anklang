@@ -85,6 +85,35 @@ python3 -m anklang.backfill
 列表，后台补算也只会在题面摘要没变且向量仍为空时写回。游标更新会核对本轮开始时读到的旧值，
 并发的旧任务不能把新游标倒退；重复全量导入也会先比较内容，避免为未变化题目重复调用付费服务。
 
+### 相似度标定
+
+工程测试通过只说明服务按接口运行，不代表原题判断准确。仓库提供一个只产证据的本地标定入口；它
+不会修改线上配置、不会打开自动拦截，也不会调用 LLM 复核：
+
+```sh
+python3 -m anklang.calibrate \
+  --workspace problems-data/calibration \
+  --dataset problems-data/calibration/dataset.json \
+  --corpus-manifest problems-data/calibration/corpus.json \
+  --label public-baseline-20260801
+```
+
+上面这条命令只适用于不外发题面的本地关键词模式，而且
+`ANKLANG_LOCAL_DB_PATH` 必须正好指向清单绑定的只读 SQLite 快照。默认反向代理或已配置外部
+embedding 时，程序默认拒绝发送；确认当前这一次允许外发后，还必须显式添加
+`--allow-external-statements`，该许可会进入报告的后端摘要。
+
+真实题面、人工答案、检查点和报告全部留在被 Git 忽略且权限受限的
+`problems-data/calibration/`。程序把数据、设置、代码、后端和实际语料快照绑定到报告；标签不能覆盖，
+同标签由独占锁保护。每条检索前会同步登记进行中样本；若此时中断，恢复会把它记为取消且绝不自动
+重发，防止重复付费调用。任何异常、取消、缺失或跳过都会让报告判为不完整。
+
+完整也不等于足以推荐阈值：每个 calibration/holdout 分组至少各有 100 个正例和 100 个反例，召回率
+和假拦截率的 95% 保守区间都达标，并且 SQLite 内容、向量模型、维度和索引构建版本可由实际快照核对
+时，才可能提供建议；无法证明实际远端语料的反向代理报告不会推荐阈值。该入口从不修改运行时阈值或
+自动拦截开关。数据格式、指标定义、权限要求和基线/候选对比流程见
+[`docs/calibration.md`](docs/calibration.md)。
+
 ### 测试
 
 ```sh
@@ -97,6 +126,8 @@ python3 -m unittest discover -s tests
   测试要求。第一次接手这个项目，从这份文件开始读。
 - [`docs/plan.md`](docs/plan.md)：从零设计时留下的分阶段规划和决策记录。文档顶部说明了当前
   标准库实现与最初技术设想的差异；来源合规、vjudge 暂缓原因和待人工决定事项仍可作为背景。
+- [`docs/calibration.md`](docs/calibration.md)：相似度标定的私有数据格式、不可覆盖检查点、安全
+  汇总指标与恢复方法。
 
 ## 许可证
 
