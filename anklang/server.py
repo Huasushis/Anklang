@@ -18,7 +18,7 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
-from .backends import BackendError, SearchBackend
+from .backends import BackendError, BackendSearchResult, SearchBackend
 from .backends.local_engine import LocalEngineBackend
 from .backends.reverse_proxy import ReverseProxyBackend
 from .cache import ResultCache
@@ -28,7 +28,7 @@ from .embedding import EmbeddingClient
 from .ingest import ingest_once
 from .llm import LlmClient
 from .review import evaluate
-from .store import ProblemStore
+from .store import IndexMetadataError, ProblemStore
 from .yuantiji import YuantijiClient
 
 # 合法题面最多 500,000 个 UTF-16 单元；控制字符经 JSON 转义后一个单元可能
@@ -50,9 +50,12 @@ class AnklangService:
         self.llm_client = llm_client
 
     def check_similarity(self, request: dict[str, Any]) -> dict[str, Any]:
-        cached = self.cache.get(request["content_hash"])
-        if cached is not None:
-            return cached
+        content_hash = request["content_hash"]
+        cache_key = self._current_cache_key(content_hash)
+        if cache_key is not None:
+            cached = self.cache.get(cache_key)
+            if cached is not None:
+                return cached
 
         try:
             search_result = self.backend.search(
@@ -62,7 +65,12 @@ class AnklangService:
             # 第三方服务或本地索引暂时不可用，不应该变成投稿接口的 5xx。返回一个
             # 字段完整、明确不自动拦截的结果，让 Urmotiv 能给出可理解的人工核对提示。
             # 降级结果不写缓存，下一次请求可以立即重新尝试。
-            return self._build_unavailable_result(request["content_hash"])
+            return self._build_unavailable_result(content_hash)
+        if search_result.degraded:
+            # 不完整检索不能进入“没有命中即可继续提交”的正常判定，也不能触发
+            # 可选模型复核或缓存。HTTP 契约只有布尔拦截字段，因此固定写 false，
+            # 但 message 必须明确要求人工核对，不能把它解释成自动放行。
+            return self._build_unavailable_result(content_hash)
         try:
             decision = evaluate(
                 self.config,
@@ -71,7 +79,7 @@ class AnklangService:
                 self.llm_client,
             )
             result = build_result(
-                content_hash=request["content_hash"],
+                content_hash=content_hash,
                 candidates=decision["candidates"],
                 block_submission=decision["block_submission"],
                 message=decision["message"],
@@ -79,10 +87,37 @@ class AnklangService:
         except (ContractError, KeyError, TypeError, ValueError, OverflowError):
             # 上游候选结构异常也属于“本次检索未完成”，不能让 Urmotiv 收到一个
             # 无法解释的 5xx，更不能把异常候选内容带进错误信息。
-            return self._build_unavailable_result(request["content_hash"])
-        if not search_result.degraded and not decision["review_failed"]:
-            self.cache.set(request["content_hash"], result)
+            return self._build_unavailable_result(content_hash)
+        if not decision["review_failed"]:
+            cache_key = self._result_cache_key(content_hash, search_result)
+            if cache_key is not None:
+                self.cache.set(cache_key, result)
         return result
+
+    def _current_cache_key(self, content_hash: str) -> str | None:
+        if not isinstance(self.backend, LocalEngineBackend):
+            # 远程后端继续沿用原有按题面摘要缓存的语义。
+            return content_hash
+        identity = self.backend.current_cache_identity()
+        if identity is None:
+            return None
+        return _local_cache_key(content_hash, identity)
+
+    def _result_cache_key(
+        self,
+        content_hash: str,
+        search_result: BackendSearchResult,
+    ) -> str | None:
+        if not isinstance(self.backend, LocalEngineBackend):
+            return content_hash
+        identity = search_result.cache_identity
+        if (
+            identity is None
+            or self.backend.current_cache_identity() != identity
+        ):
+            # 检索后索引已变化，旧快照的判断不能登记到新索引身份下。
+            return None
+        return _local_cache_key(content_hash, identity)
 
     @staticmethod
     def _build_unavailable_result(content_hash: str) -> dict[str, Any]:
@@ -92,6 +127,10 @@ class AnklangService:
             block_submission=False,
             message="本次未能完成原题检索，请稍后重试并由审题人手工核对。",
         )
+
+
+def _local_cache_key(content_hash: str, identity: str) -> str:
+    return f"local-index:{identity}:{content_hash}"
 
 
 def make_handler(service: AnklangService) -> type[BaseHTTPRequestHandler]:
@@ -140,7 +179,15 @@ def make_handler(service: AnklangService) -> type[BaseHTTPRequestHandler]:
             # describe_health() 约定不抛异常，各后端把自己的失败情况体现成状态字段
             # （例如 upstreamReady=False），这里统一根据这些字段判断是否整体降级。
             info.update(service.backend.describe_health())
-            if info.get("upstreamReady") is False or info.get("localStoreReady") is False:
+            if (
+                info.get("upstreamReady") is False
+                or info.get("localStoreReady") is False
+                or info.get("indexMetadataReady") is False
+                or (
+                    info.get("embeddingAvailable") is True
+                    and info.get("vectorIndexReady") is False
+                )
+            ):
                 info["status"] = "degraded"
             self._send(200, info)
 
@@ -194,12 +241,22 @@ def build_backend(config: AppConfig) -> SearchBackend:
                 model=config.dashscope_embedding_model,
                 dimensions=config.dashscope_embedding_dim,
             )
-        return LocalEngineBackend(
+        backend = LocalEngineBackend(
             store=store,
             embedder=embedder,
             vector_top_k=config.local_vector_top_k,
             keyword_top_k=config.local_keyword_top_k,
         )
+        try:
+            # 新库或没有旧向量的关键词库可安全登记；旧向量身份未知或规格
+            # 冲突时保留原库并由后端降级，不让启动过程破坏数据。
+            if backend.index_spec is not None:
+                store.prepare_embedding_writes(backend.index_spec)
+            else:
+                store.prepare_keyword_writes()
+        except IndexMetadataError:
+            pass
+        return backend
     yuantiji = YuantijiClient(
         base_url=config.yuantiji_base_url,
         timeout_seconds=config.yuantiji_timeout_seconds,

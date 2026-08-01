@@ -121,14 +121,26 @@ install -d -m 700 problems-data/calibration
 
 本地模式只允许把 `ANKLANG_LOCAL_DB_PATH` 指向这份 SQLite 快照，并用只读、不可变方式钉住已核对
 摘要的文件描述符；不会建表、迁移、写 WAL 或改数据库。程序会核对 `problems` 的行数、非空向量数和
-每条向量的实际维度。只要快照含向量，数据库还必须有机器可读表：
+每条向量的实际维度。无论当前是否已经补齐向量，正式本地索引都必须有由 `ProblemStore` 生成、
+随题目写入在同一事务维护的机器可读表：
 
 ```sql
 CREATE TABLE index_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 ```
 
-该表必须恰好登记 `embedding_model`、`embedding_dimensions`、`index_build_revision` 三项，并与清单
-一致。缺少这些来源证据仍可跑出聚合指标，但 `thresholdEvidenceEligible` 会是 `false`，不会推荐阈值。
+该表必须恰好登记 `schema_version`、`embedding_model`、`embedding_dimensions`、
+`corpus_revision`、`index_build_revision`、`problem_count`、`embedding_rows` 七项，不能手工添加扩展键。
+程序会从实际 `(source, external_id, content_hash)` 集合复算 `corpus_revision`，并重新统计两类行数；
+含向量时，模型、维度和构建版本还必须与清单一致。同维但模型不同也不兼容。缺少、冲突或无法复算
+这些证据仍可跑出聚合指标，但 `thresholdEvidenceEligible` 会是 `false`，不会推荐阈值。不要为让旧
+报告变成可用而手填这张表；旧库已有未知向量时，应保留旧文件并按 README 的新数据库路径流程重建。
+没有向量的正式关键词索引由程序登记固定的“未使用向量”模型状态和零维度；清单仍按前述格式把三项
+向量构建信息写成 `null`，校准器会核对数据库确实没有向量，而不会把该固定状态冒充实际模型。
+零向量却登记了真实向量模型，或只有部分题目带向量，都属于未完成的向量索引：只读标定会与线上
+检索一样把样本记为失败，并把阈值证据判为不合格；不能通过关闭向量客户端把它冒充完整关键词索引。
+`corpus_revision` 的每行摘要使用域分离、长度前缀规范编码的 SHA-256，再逐字节异或成与顺序无关的
+集合承诺；题目身份唯一约束和 `problem_count` 一并核对。算法版本属于 `index_build_revision`，任何
+算法调整都必须提升构建版本并重建快照，不能静默接受旧值。
 反向代理无法证明远端实际使用了哪份不可变语料，因此 `artifact.kind` 使用 `remote-snapshot` 只作运行
 留档；这类报告同样永远不推荐阈值。
 

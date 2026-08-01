@@ -23,6 +23,7 @@ from anklang.calibration import (
     SampleSkipped,
     run_calibration,
 )
+from anklang.store import EmbeddingIndexSpec, IndexMetadataError, ProblemStore
 from anklang.vectormath import pack_embedding
 
 
@@ -971,46 +972,25 @@ class CalibrateCliTests(unittest.TestCase):
 
     def test_cli_local_calibration_reads_exact_sqlite_snapshot_without_writes(self) -> None:
         database_path = self.workspace / "local-snapshot.db"
-        connection = sqlite3.connect(database_path)
+        store = ProblemStore(str(database_path))
         try:
-            connection.execute(
-                """
-                CREATE TABLE problems (
-                    id INTEGER PRIMARY KEY,
-                    source TEXT NOT NULL,
-                    external_id TEXT NOT NULL,
-                    title TEXT NOT NULL,
-                    url TEXT,
-                    statement TEXT NOT NULL,
-                    embedding BLOB,
-                    content_hash TEXT NOT NULL,
-                    source_updated_at TEXT,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
-                )
-                """
-            )
             for index, case in enumerate(self.dataset["cases"]):
                 expected = case["expectedDuplicateCandidates"]
                 external_id = (
                     expected[0]["externalId"] if expected else f"negative-{index}"
                 )
-                connection.execute(
-                    "INSERT INTO problems VALUES (?, ?, ?, ?, NULL, ?, NULL, ?, NULL, ?, ?)",
-                    (
-                        index + 1,
-                        "synthetic",
-                        external_id,
-                        f"合成标题-{index}",
-                        case["statement"],
-                        "b" * 64,
-                        "2026-01-01T00:00:00.000Z",
-                        "2026-01-01T00:00:00.000Z",
-                    ),
+                store.add_problem(
+                    source="synthetic",
+                    external_id=external_id,
+                    title=f"合成标题-{index}",
+                    statement=case["statement"],
+                    content_hash=hashlib.sha256(
+                        case["statement"].encode("utf-8")
+                    ).hexdigest(),
                 )
-            connection.commit()
+            store.prepare_keyword_writes()
         finally:
-            connection.close()
+            store.close()
         database_path.chmod(0o600)
         before = hashlib.sha256(database_path.read_bytes()).hexdigest()
         manifest = _corpus_manifest(
@@ -1062,6 +1042,179 @@ class CalibrateCliTests(unittest.TestCase):
         )
         self.assertTrue(report["thresholdEvidenceEligible"])
 
+    def test_readonly_store_mirrors_empty_partial_and_corrupt_index_status(
+        self,
+    ) -> None:
+        spec = EmbeddingIndexSpec("synthetic-vector-v1", 2)
+
+        empty_path = self.workspace / "empty-vector-index.db"
+        empty = ProblemStore(str(empty_path))
+        try:
+            empty.prepare_embedding_writes(spec)
+        finally:
+            empty.close()
+        empty_path.chmod(0o600)
+        readonly = calibrate._ReadOnlyProblemStore(
+            empty_path,
+            hashlib.sha256(empty_path.read_bytes()).hexdigest(),
+        )
+        try:
+            self.assertEqual(
+                readonly.search_snapshot(spec).vector_status,
+                "empty_corpus",
+            )
+            self.assertEqual(
+                readonly.search_snapshot(None).vector_status,
+                "empty_corpus",
+            )
+        finally:
+            readonly.close()
+
+        partial_path = self.workspace / "partial-vector-index.db"
+        partial = ProblemStore(str(partial_path))
+        try:
+            partial.prepare_embedding_writes(spec)
+            partial.add_problem(
+                source="synthetic",
+                external_id="partial",
+                title="合成部分索引",
+                statement="合成部分索引题面",
+                content_hash="partial-hash",
+            )
+        finally:
+            partial.close()
+        partial_path.chmod(0o600)
+        readonly = calibrate._ReadOnlyProblemStore(
+            partial_path,
+            hashlib.sha256(partial_path.read_bytes()).hexdigest(),
+        )
+        try:
+            for requested_spec in (None, spec):
+                with self.subTest(requested_spec=requested_spec):
+                    snapshot = readonly.search_snapshot(requested_spec)
+                    self.assertFalse(snapshot.vector_ready)
+                    self.assertEqual(
+                        snapshot.vector_status,
+                        "incomplete_vectors",
+                    )
+        finally:
+            readonly.close()
+
+        corrupt_path = self.workspace / "corrupt-vector-index.db"
+        corrupt = ProblemStore(str(corrupt_path))
+        try:
+            corrupt.prepare_embedding_writes(spec)
+            corrupt.add_problem(
+                source="synthetic",
+                external_id="corrupt",
+                title="合成损坏索引",
+                statement="合成损坏索引题面",
+                content_hash="corrupt-hash",
+                embedding=[1.0, 0.0],
+                index_spec=spec,
+            )
+        finally:
+            corrupt.close()
+        connection = sqlite3.connect(corrupt_path)
+        try:
+            connection.execute(
+                "UPDATE problems SET embedding = ? WHERE external_id = ?",
+                (pack_embedding([1.0]), "corrupt"),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        corrupt_path.chmod(0o600)
+        readonly = calibrate._ReadOnlyProblemStore(
+            corrupt_path,
+            hashlib.sha256(corrupt_path.read_bytes()).hexdigest(),
+        )
+        try:
+            for requested_spec in (None, spec):
+                with self.subTest(requested_spec=requested_spec):
+                    snapshot = readonly.search_snapshot(requested_spec)
+                    self.assertFalse(snapshot.vector_ready)
+                    self.assertEqual(snapshot.vector_status, "invalid_vectors")
+        finally:
+            readonly.close()
+
+    def test_cli_partial_zero_vector_index_is_incomplete_and_ineligible(
+        self,
+    ) -> None:
+        database_path = self.workspace / "partial-zero-vector.db"
+        store = ProblemStore(str(database_path))
+        spec = EmbeddingIndexSpec("synthetic-vector-v1", 2)
+        try:
+            store.prepare_embedding_writes(spec)
+            for index, case in enumerate(self.dataset["cases"]):
+                store.add_problem(
+                    source="synthetic",
+                    external_id=f"partial-{index}",
+                    title=f"合成部分标题-{index}",
+                    statement=case["statement"],
+                    content_hash=hashlib.sha256(
+                        case["statement"].encode("utf-8")
+                    ).hexdigest(),
+                )
+        finally:
+            store.close()
+        database_path.chmod(0o600)
+        before = hashlib.sha256(database_path.read_bytes()).hexdigest()
+        manifest = _corpus_manifest(
+            before,
+            kind="anklang-sqlite-v1",
+            file_name=database_path.name,
+            embedding_rows=0,
+        )
+        CalibrationTestCase._write_private_json(self.corpus_path, manifest)
+        config = SimpleNamespace(
+            backend="local_engine",
+            search_k=8,
+            minimum_similarity=0.5,
+            local_db_path=str(database_path),
+            local_vector_top_k=20,
+            local_keyword_top_k=20,
+            dashscope_base_url=None,
+            dashscope_api_key=None,
+            dashscope_embedding_model="synthetic-vector-v1",
+            dashscope_embedding_dim=2,
+        )
+        stderr = io.StringIO()
+        with (
+            patch("anklang.calibrate.load_config", return_value=config),
+            patch("sys.stderr", stderr),
+        ):
+            code = calibrate.main(
+                [
+                    "--workspace",
+                    str(self.workspace),
+                    "--dataset",
+                    str(self.dataset_path),
+                    "--corpus-manifest",
+                    str(self.corpus_path),
+                    "--label",
+                    "partial-zero-vector",
+                ]
+            )
+
+        self.assertEqual(code, 1, stderr.getvalue())
+        self.assertEqual(
+            hashlib.sha256(database_path.read_bytes()).hexdigest(),
+            before,
+        )
+        report = json.loads(
+            (
+                self.workspace
+                / "runs"
+                / "partial-zero-vector"
+                / "report.json"
+            ).read_text(encoding="utf-8")
+        )
+        self.assertFalse(report["complete"])
+        self.assertFalse(report["thresholdEvidenceEligible"])
+        self.assertEqual(report["counts"]["statuses"]["error"], 8)
+        self.assertIsNone(report["thresholdRecommendation"])
+
     def test_local_vector_snapshot_needs_machine_readable_model_provenance(self) -> None:
         database_path = self.workspace / "vector-snapshot.db"
         connection = sqlite3.connect(database_path)
@@ -1108,31 +1261,60 @@ class CalibrateCliTests(unittest.TestCase):
                 embedding_rows=1,
                 embedding_model="synthetic-vector-v1",
                 embedding_dimensions=2,
-                index_build_revision="builder-revision-one",
+                index_build_revision=EmbeddingIndexSpec(
+                    "synthetic-vector-v1", 2
+                ).build_revision,
             )
 
         verifier = calibrate._corpus_verifier(config)
         self.assertFalse(verifier(evidence()))
 
-        connection = sqlite3.connect(database_path)
+        legacy_store = ProblemStore(str(database_path))
         try:
-            connection.execute(
-                "CREATE TABLE index_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
-            )
-            connection.executemany(
-                "INSERT INTO index_metadata VALUES (?, ?)",
-                [
-                    ("embedding_model", "synthetic-vector-v1"),
-                    ("embedding_dimensions", "2"),
-                    ("index_build_revision", "builder-revision-one"),
-                ],
-            )
-            connection.commit()
+            with self.assertRaises(IndexMetadataError):
+                legacy_store.prepare_embedding_writes(
+                    EmbeddingIndexSpec("synthetic-vector-v1", 2)
+                )
+            self.assertEqual(legacy_store.count(), 1)
         finally:
-            connection.close()
-        self.assertTrue(verifier(evidence()))
+            legacy_store.close()
 
-        connection = sqlite3.connect(database_path)
+        generated_path = self.workspace / "generated-vector-snapshot.db"
+        generated = ProblemStore(str(generated_path))
+        spec = EmbeddingIndexSpec("synthetic-vector-v1", 2)
+        try:
+            generated.prepare_embedding_writes(spec)
+            generated.add_problem(
+                source="synthetic",
+                external_id="one",
+                title="title",
+                statement="statement",
+                embedding=[0.25, 0.75],
+                index_spec=spec,
+                content_hash="c" * 64,
+            )
+        finally:
+            generated.close()
+        generated_path.chmod(0o600)
+        config.local_db_path = str(generated_path)
+
+        def generated_evidence() -> CorpusArtifactEvidence:
+            value = evidence()
+            return CorpusArtifactEvidence(
+                kind=value.kind,
+                path=generated_path,
+                content_hash=hashlib.sha256(generated_path.read_bytes()).hexdigest(),
+                problem_count=value.problem_count,
+                embedding_rows=value.embedding_rows,
+                embedding_model=value.embedding_model,
+                embedding_dimensions=value.embedding_dimensions,
+                index_build_revision=value.index_build_revision,
+            )
+
+        verifier = calibrate._corpus_verifier(config)
+        self.assertTrue(verifier(generated_evidence()))
+
+        connection = sqlite3.connect(generated_path)
         try:
             connection.execute(
                 "UPDATE index_metadata SET value = 'wrong-model' "
@@ -1141,7 +1323,7 @@ class CalibrateCliTests(unittest.TestCase):
             connection.commit()
         finally:
             connection.close()
-        self.assertFalse(verifier(evidence()))
+        self.assertFalse(verifier(generated_evidence()))
 
     def test_invalid_private_input_does_not_construct_backend(self) -> None:
         self.dataset_path.chmod(0o644)

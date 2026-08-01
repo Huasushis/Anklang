@@ -26,7 +26,7 @@ from typing import Any
 
 from . import BackendError, BackendSearchResult
 from ..embedding import EmbeddingClient, EmbeddingError
-from ..store import ProblemStore, StoredProblem
+from ..store import EmbeddingIndexSpec, ProblemStore, StoredProblem
 from ..vectormath import cosine_similarity
 
 _TOKEN_RE = re.compile(r"[A-Za-z0-9]+|[一-鿿]")
@@ -41,23 +41,43 @@ class LocalEngineBackend:
         embedder: EmbeddingClient | None,
         vector_top_k: int = 20,
         keyword_top_k: int = 20,
+        index_spec: EmbeddingIndexSpec | None = None,
     ) -> None:
         self.store = store
         self.embedder = embedder
+        if embedder is None:
+            if index_spec is not None:
+                raise ValueError("未配置向量客户端时不能提供索引规格。")
+            self.index_spec = None
+        else:
+            self.index_spec = index_spec or EmbeddingIndexSpec(
+                model=embedder.model,
+                dimensions=embedder.dimensions,
+            )
         self._vector_top_k = vector_top_k
         self._keyword_top_k = keyword_top_k
 
     def search(self, query_text: str, k: int) -> BackendSearchResult:
         try:
-            problems = self.store.iter_all()
+            snapshot = self.store.search_snapshot(self.index_spec)
         except Exception as error:
             # 存储层读取失败时不让整个请求崩溃，转换成 BackendError 交给 server
             # 降级处理，和阶段 1 反代后端遇到 YuantijiError 时的处理方式保持一致。
             raise BackendError("本地题库读取失败。") from error
 
+        problems = snapshot.problems
+        degraded = snapshot.vector_status not in {"ready", "disabled"}
+        if not problems:
+            return BackendSearchResult(
+                candidates=[],
+                degraded=degraded,
+                cache_identity=(
+                    snapshot.cache_identity if not degraded else None
+                ),
+            )
+
         query_vector: list[float] | None = None
-        degraded = False
-        if self.embedder is not None:
+        if self.embedder is not None and snapshot.vector_ready:
             try:
                 query_vector = self.embedder.embed_one(query_text)
             except EmbeddingError:
@@ -95,22 +115,40 @@ class LocalEngineBackend:
                 merged[key] = _to_candidate(problem, score)
 
         ranked = sorted(merged.values(), key=lambda item: item["similarity"], reverse=True)
-        return BackendSearchResult(candidates=ranked[:k], degraded=degraded)
+        return BackendSearchResult(
+            candidates=ranked[:k],
+            degraded=degraded,
+            cache_identity=(snapshot.cache_identity if not degraded else None),
+        )
+
+    def current_cache_identity(self) -> str | None:
+        """O(1) 核对当前索引是否仍可复用缓存，并返回不含配置原文的身份摘要。"""
+
+        try:
+            return self.store.inspect_index(self.index_spec).cache_identity
+        except Exception:
+            return None
 
     def describe_health(self) -> dict[str, Any]:
         try:
-            count = self.store.count()
+            inspection = self.store.inspect_index(self.index_spec)
         except Exception:
             # 健康检查本身不应该因为存储异常而失败，这里故意宽泛捕获，转换成状态字段。
             return {
                 "localProblemCount": None,
                 "embeddingAvailable": self.embedder is not None,
                 "localStoreReady": False,
+                "indexMetadataReady": False,
+                "vectorIndexReady": False,
+                "vectorIndexStatus": "store_error",
             }
         return {
-            "localProblemCount": count,
+            "localProblemCount": inspection.problem_count,
             "embeddingAvailable": self.embedder is not None,
             "localStoreReady": True,
+            "indexMetadataReady": inspection.metadata_ready,
+            "vectorIndexReady": inspection.vector_ready,
+            "vectorIndexStatus": inspection.status,
         }
 
 

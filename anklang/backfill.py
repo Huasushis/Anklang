@@ -13,23 +13,35 @@ import sys
 
 from .config import ConfigError, load_config
 from .embedding import EmbeddingClient, EmbeddingError
-from .store import ProblemStore
+from .store import EmbeddingIndexSpec, IndexMetadataError, ProblemStore
+from .vectormath import validate_embedding
 
 
 def backfill_missing_embeddings(store: ProblemStore, embedder: EmbeddingClient) -> tuple[int, int]:
     """对 store 里 embedding 为空的题目重新计算向量并写回。返回 (成功补算数, 失败数)。"""
+    index_spec = EmbeddingIndexSpec(
+        model=embedder.model,
+        dimensions=embedder.dimensions,
+    )
+    # 必须在读取题面或调用付费服务前完成门禁；冲突时不发送任何内容。
+    store.prepare_embedding_writes(index_spec)
     missing = store.iter_missing_embeddings()
     succeeded = 0
     failed = 0
     for problem in missing:
         try:
             embedding = embedder.embed_one(problem.statement)
-        except EmbeddingError:
+            embedding = validate_embedding(
+                embedding,
+                expected_dimensions=index_spec.dimensions,
+            )
+        except (EmbeddingError, ValueError):
             failed += 1
             continue
         if store.update_embedding(
             problem.id,
             embedding,
+            index_spec=index_spec,
             expected_content_hash=problem.content_hash,
         ):
             succeeded += 1
@@ -56,7 +68,16 @@ def main() -> int:
         model=config.dashscope_embedding_model,
         dimensions=config.dashscope_embedding_dim,
     )
-    succeeded, failed = backfill_missing_embeddings(store, embedder)
+    try:
+        succeeded, failed = backfill_missing_embeddings(store, embedder)
+    except IndexMetadataError:
+        sys.stderr.write(
+            "本地向量索引未通过当前写入门禁，任务没有继续；现有数据未被清空。"
+            "请按文档使用新的数据库路径重建。\n"
+        )
+        return 2
+    finally:
+        store.close()
     sys.stderr.write(f"embedding 补算完成：成功 {succeeded} 条，失败 {failed} 条。\n")
     return 0
 

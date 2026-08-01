@@ -14,7 +14,7 @@ from typing import Any
 from anklang.backends.local_engine import LocalEngineBackend
 from anklang.contracts import build_result
 from anklang.embedding import EmbeddingClient
-from anklang.store import ProblemStore
+from anklang.store import EmbeddingIndexSpec, ProblemStore
 
 # 四个方向清晰分离的向量，避免真实语义向量里"常见字/词"造成的噪音，
 # 让"谁更相似"这件事在测试里是无歧义的。
@@ -25,6 +25,7 @@ _GRAPH_VECTOR = [0.0, 0.0, 1.0, 0.0]
 
 _QUERY_TEXT = "给定 n 个整数，求它们的和"
 _QUERY_VECTOR = [0.97, 0.05, 0.0, 0.0]  # 刻意设计成明显更接近"数组求和"类的向量
+_INDEX_SPEC = EmbeddingIndexSpec("text-embedding-v4", 4)
 
 
 class _FakeEmbeddingOpener:
@@ -41,7 +42,10 @@ class _FakeEmbeddingOpener:
         raw_input = body["input"]
         texts = raw_input if isinstance(raw_input, list) else [raw_input]
         vectors = [self._vectors_by_text[text] for text in texts]
-        payload = {"data": [{"embedding": vector} for vector in vectors]}
+        payload = {
+            "model": "text-embedding-v4",
+            "data": [{"embedding": vector} for vector in vectors],
+        }
         response_body = json.dumps(payload).encode("utf-8")
 
         class _Response:
@@ -74,6 +78,7 @@ class LocalEngineBackendTests(unittest.TestCase):
         self.store = ProblemStore(":memory:")
         self.addCleanup(self.store.close)
         self.embedder, self.opener = _make_embedder({_QUERY_TEXT: _QUERY_VECTOR})
+        self.store.prepare_embedding_writes(_INDEX_SPEC)
 
         self.store.add_problem(
             source="unit-test",
@@ -82,6 +87,7 @@ class LocalEngineBackendTests(unittest.TestCase):
             statement="给定 n 个整数，输出它们的和。",
             content_hash="h1",
             embedding=_ARRAY_SUM_VECTOR,
+            index_spec=_INDEX_SPEC,
         )
         self.store.add_problem(
             source="unit-test",
@@ -90,6 +96,7 @@ class LocalEngineBackendTests(unittest.TestCase):
             statement="给定 n 个整数，计算它们的总和并输出。",
             content_hash="h2",
             embedding=_ARRAY_SUM_2_VECTOR,
+            index_spec=_INDEX_SPEC,
         )
         self.store.add_problem(
             source="unit-test",
@@ -98,6 +105,7 @@ class LocalEngineBackendTests(unittest.TestCase):
             statement="给定一个序列，求最长严格递增子序列的长度。",
             content_hash="h3",
             embedding=_LIS_VECTOR,
+            index_spec=_INDEX_SPEC,
         )
         self.store.add_problem(
             source="unit-test",
@@ -106,6 +114,7 @@ class LocalEngineBackendTests(unittest.TestCase):
             statement="给定一张带权无向图，求最短路径长度。",
             content_hash="h4",
             embedding=_GRAPH_VECTOR,
+            index_spec=_INDEX_SPEC,
         )
 
     def test_similar_problem_ranks_first(self) -> None:
@@ -169,7 +178,8 @@ class LocalEngineBackendTests(unittest.TestCase):
         backend = LocalEngineBackend(empty_store, self.embedder)
         search_result = backend.search(_QUERY_TEXT, k=5)
         self.assertEqual(search_result.candidates, [])
-        self.assertFalse(search_result.degraded)
+        self.assertTrue(search_result.degraded)
+        self.assertEqual(self.opener.calls, 0)
 
     def test_describe_health_reports_count_and_embedding_availability(self) -> None:
         backend = LocalEngineBackend(self.store, self.embedder)
@@ -177,9 +187,57 @@ class LocalEngineBackendTests(unittest.TestCase):
         self.assertEqual(info["localProblemCount"], 4)
         self.assertTrue(info["embeddingAvailable"])
         self.assertTrue(info["localStoreReady"])
+        self.assertTrue(info["indexMetadataReady"])
 
         backend_no_embed = LocalEngineBackend(self.store, embedder=None)
         self.assertFalse(backend_no_embed.describe_health()["embeddingAvailable"])
+
+    def test_missing_metadata_uses_keyword_without_calling_embedder(self) -> None:
+        store = ProblemStore(":memory:")
+        self.addCleanup(store.close)
+        store.add_problem(
+            source="unit-test",
+            external_id="keyword-only",
+            title="关键词候选",
+            statement="数组 求和 关键词候选",
+            content_hash="keyword-hash",
+        )
+        embedder, opener = _make_embedder({})
+        backend = LocalEngineBackend(store, embedder)
+
+        result = backend.search("数组 求和", k=5)
+
+        self.assertTrue(result.degraded)
+        self.assertEqual(result.candidates[0]["externalId"], "keyword-only")
+        self.assertEqual(opener.calls, 0)
+        health = backend.describe_health()
+        self.assertFalse(health["indexMetadataReady"])
+        self.assertFalse(health["vectorIndexReady"])
+        self.assertEqual(health["vectorIndexStatus"], "uninitialized")
+        self.assertNotIn("model", json.dumps(health))
+
+    def test_same_dimension_other_model_disables_all_vector_scores(self) -> None:
+        store = ProblemStore(":memory:")
+        self.addCleanup(store.close)
+        stored_spec = EmbeddingIndexSpec("different-model", 4)
+        store.prepare_embedding_writes(stored_spec)
+        store.add_problem(
+            source="unit-test",
+            external_id="keyword-only",
+            title="关键词候选",
+            statement="数组 求和 关键词候选",
+            content_hash="keyword-hash",
+            embedding=[1.0, 0.0, 0.0, 0.0],
+            index_spec=stored_spec,
+        )
+        embedder, opener = _make_embedder({})
+        backend = LocalEngineBackend(store, embedder)
+
+        result = backend.search("数组 求和", k=5)
+
+        self.assertTrue(result.degraded)
+        self.assertEqual(result.candidates[0]["externalId"], "keyword-only")
+        self.assertEqual(opener.calls, 0)
 
 
 if __name__ == "__main__":

@@ -26,8 +26,9 @@ from .sources import (
     is_valid_source_updated_at,
     validate_raw_problem,
 )
-from .store import ProblemStore, StoredProblem
+from .store import EmbeddingIndexSpec, IndexMetadataError, ProblemStore, StoredProblem
 from .text_normalize import content_hash_of, normalize_statement
+from .vectormath import validate_embedding
 
 
 @dataclass
@@ -52,6 +53,16 @@ def ingest_once(store: ProblemStore, embedder: EmbeddingClient | None) -> Ingest
     决定（命令行一次性调用，或者后台线程定时调用）。
     """
     summary = IngestSummary()
+    index_spec: EmbeddingIndexSpec | None = None
+    if embedder is not None:
+        index_spec = EmbeddingIndexSpec(
+            model=embedder.model,
+            dimensions=embedder.dimensions,
+        )
+        # 在发现来源、读取题面和调用外部模型前拒绝旧向量或规格冲突。
+        store.prepare_embedding_writes(index_spec)
+    else:
+        store.prepare_keyword_writes()
     for module in discover_source_modules():
         source_name = module.SOURCE_NAME
         stored_since = store.get_cursor(source_name)
@@ -97,7 +108,12 @@ def ingest_once(store: ProblemStore, embedder: EmbeddingClient | None) -> Ingest
             ):
                 try:
                     embedding = embedder.embed_one(statement)
-                except EmbeddingError:
+                    assert index_spec is not None
+                    embedding = validate_embedding(
+                        embedding,
+                        expected_dimensions=index_spec.dimensions,
+                    )
+                except (EmbeddingError, ValueError):
                     # embedding 服务暂不可用时先存 embedding=None，之后用
                     # anklang.backfill 补算，不影响这道题先入库。
                     summary.embedding_failures += 1
@@ -109,6 +125,7 @@ def ingest_once(store: ProblemStore, embedder: EmbeddingClient | None) -> Ingest
                 url=raw.url,
                 statement=statement,
                 embedding=embedding,
+                index_spec=index_spec if embedding is not None else None,
                 content_hash=content_hash,
                 source_updated_at=raw.updated_at,
             )
@@ -229,7 +246,16 @@ def main() -> int:
             model=config.dashscope_embedding_model,
             dimensions=config.dashscope_embedding_dim,
         )
-    summary = ingest_once(store, embedder)
+    try:
+        summary = ingest_once(store, embedder)
+    except IndexMetadataError:
+        sys.stderr.write(
+            "本地向量索引未通过当前写入门禁，任务没有继续；现有数据未被清空。"
+            "请按文档使用新的数据库路径重建。\n"
+        )
+        return 2
+    finally:
+        store.close()
     sys.stderr.write(
         "抓取完成："
         f"共发现 {summary.fetched} 条，新入库 {summary.inserted} 条，"

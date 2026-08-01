@@ -27,11 +27,15 @@ class BackendSearchResult:
     """一次后端检索的内部结果，不会直接作为 HTTP 响应发送。
 
     degraded 表示本次检索有一部分没有完成，例如本地文字转数字服务失败后只做了
-    关键词检索。服务层仍可展示 candidates，但不应缓存这次不完整的结果。
+    关键词检索。候选只供后端内部诊断测试使用；服务层必须返回固定的“检索未完成”
+    结果，不能据此自动放行、拒绝、调用模型复核或写入缓存。
     """
 
     candidates: list[dict[str, Any]]
     degraded: bool
+    # 本地索引成功结果所属的机器身份摘要；远程后端保持 None。服务层只会在
+    # 当前 O(1) 门禁仍返回同一摘要时缓存，避免跨语料或跨模型复用旧判断。
+    cache_identity: str | None = None
 
 
 @runtime_checkable

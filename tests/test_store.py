@@ -12,7 +12,14 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
-from anklang.store import ProblemStore
+from anklang.store import (
+    INDEX_BUILD_REVISION,
+    EmbeddingIndexSpec,
+    IndexMetadataError,
+    ProblemStore,
+    calculate_corpus_revision,
+)
+from anklang.vectormath import pack_embedding
 
 
 class ProblemStoreTests(unittest.TestCase):
@@ -35,6 +42,8 @@ class ProblemStoreTests(unittest.TestCase):
         clock = {"value": "2026-01-01T00:00:00.000Z"}
         store = ProblemStore(":memory:", now=lambda: clock["value"])
         self.addCleanup(store.close)
+        spec = EmbeddingIndexSpec("test-model", 2)
+        store.prepare_embedding_writes(spec)
 
         first = store.add_problem(
             source="s",
@@ -43,6 +52,7 @@ class ProblemStoreTests(unittest.TestCase):
             statement="body1",
             content_hash="h1",
             embedding=[1.0, 0.0],
+            index_spec=spec,
             source_updated_at="2026-01-01T00:00:00.000Z",
         )
         inserted = store.iter_all()[0]
@@ -112,6 +122,8 @@ class ProblemStoreTests(unittest.TestCase):
 
     def test_embedding_blob_roundtrip(self) -> None:
         vector = [0.1, -0.2, 0.3, 0.0, 12.5]
+        spec = EmbeddingIndexSpec("test-model", len(vector))
+        self.store.prepare_embedding_writes(spec)
         self.store.add_problem(
             source="s",
             external_id="1",
@@ -119,6 +131,7 @@ class ProblemStoreTests(unittest.TestCase):
             statement="body",
             content_hash="h",
             embedding=vector,
+            index_spec=spec,
         )
         problems = self.store.iter_all()
         self.assertEqual(len(problems), 1)
@@ -131,6 +144,8 @@ class ProblemStoreTests(unittest.TestCase):
 
     def test_missing_embedding_stays_none_until_backfilled(self) -> None:
         self.store.add_problem(source="s", external_id="1", title="t", statement="body", content_hash="h")
+        spec = EmbeddingIndexSpec("test-model", 3)
+        self.store.prepare_embedding_writes(spec)
         problems = self.store.iter_all()
         self.assertIsNone(problems[0].embedding)
 
@@ -140,6 +155,7 @@ class ProblemStoreTests(unittest.TestCase):
             self.store.update_embedding(
                 missing[0].id,
                 [1.0, 2.0, 3.0],
+                index_spec=spec,
                 expected_content_hash=missing[0].content_hash,
             )
         )
@@ -151,6 +167,7 @@ class ProblemStoreTests(unittest.TestCase):
             self.store.update_embedding(
                 missing[0].id,
                 [9.0, 9.0, 9.0],
+                index_spec=spec,
                 expected_content_hash=missing[0].content_hash,
             )
         )
@@ -179,6 +196,8 @@ class ProblemStoreTests(unittest.TestCase):
             source_updated_at="2026-01-01T00:00:00.000Z",
         )
         old = self.store.iter_all()[0]
+        spec = EmbeddingIndexSpec("test-model", 2)
+        self.store.prepare_embedding_writes(spec)
         self.store.add_problem(
             source="s",
             external_id="1",
@@ -191,6 +210,7 @@ class ProblemStoreTests(unittest.TestCase):
             self.store.update_embedding(
                 old.id,
                 [1.0, 2.0],
+                index_spec=spec,
                 expected_content_hash=old.content_hash,
             )
         )
@@ -510,6 +530,609 @@ class ProblemStoreTests(unittest.TestCase):
             )
         )
         self.assertEqual(self.store.get_cursor("s"), normalized)
+
+
+class IndexMetadataTests(unittest.TestCase):
+    def test_incremental_writes_do_not_repeat_full_index_scans(self) -> None:
+        store = ProblemStore(":memory:")
+        self.addCleanup(store.close)
+        store.prepare_keyword_writes()
+        identities: list[tuple[str, str, str]] = []
+        with (
+            patch.object(
+                store,
+                "_actual_index_state_locked",
+                side_effect=AssertionError("unexpected full index scan"),
+            ),
+            patch.object(
+                store,
+                "_problem_rows_locked",
+                side_effect=AssertionError("unexpected full problem scan"),
+            ),
+        ):
+            for index in range(250):
+                external_id = f"problem-{index}"
+                content_hash = f"hash-{index}"
+                identities.append(("scale-test", external_id, content_hash))
+                store.add_problem(
+                    source="scale-test",
+                    external_id=external_id,
+                    title="synthetic",
+                    statement="synthetic statement",
+                    content_hash=content_hash,
+                )
+        metadata = store.get_index_metadata()
+        assert metadata is not None
+        self.assertEqual(metadata.problem_count, 250)
+        self.assertEqual(metadata.embedding_rows, 0)
+        self.assertEqual(
+            metadata.corpus_revision,
+            calculate_corpus_revision(identities),
+        )
+
+    def test_preflight_revision_query_never_reads_statements_or_vector_blobs(self) -> None:
+        store = ProblemStore(":memory:")
+        self.addCleanup(store.close)
+        for index in range(3):
+            store.add_problem(
+                source="s",
+                external_id=str(index),
+                title="synthetic title",
+                statement="synthetic statement",
+                content_hash=f"hash-{index}",
+            )
+        traced: list[str] = []
+        store._conn.set_trace_callback(traced.append)  # noqa: SLF001
+        store.prepare_embedding_writes(EmbeddingIndexSpec("model-a", 2))
+        store._conn.set_trace_callback(None)  # noqa: SLF001
+        problem_selects = [
+            " ".join(statement.lower().split())
+            for statement in traced
+            if " from problems" in statement.lower()
+        ]
+        self.assertIn(
+            "select source, external_id, content_hash from problems",
+            problem_selects,
+        )
+        revision_query = next(
+            statement
+            for statement in problem_selects
+            if "source, external_id, content_hash" in statement
+        )
+        self.assertNotIn("embedding", revision_query)
+        self.assertTrue(
+            all("statement" not in statement for statement in problem_selects)
+        )
+        self.assertTrue(
+            all("title" not in statement for statement in problem_selects)
+        )
+
+    def test_health_uses_verified_metadata_and_external_change_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "health.db"
+            spec = EmbeddingIndexSpec("model-a", 2)
+            store = ProblemStore(str(path))
+            try:
+                store.prepare_embedding_writes(spec)
+                store.add_problem(
+                    source="s",
+                    external_id="one",
+                    title="one",
+                    statement="large synthetic statement",
+                    content_hash="h",
+                    embedding=[1.0, 0.0],
+                    index_spec=spec,
+                )
+                traced: list[str] = []
+                store._conn.set_trace_callback(traced.append)  # noqa: SLF001
+                inspection = store.inspect_index(spec)
+                store._conn.set_trace_callback(None)  # noqa: SLF001
+                self.assertTrue(inspection.vector_ready)
+                self.assertIsNotNone(inspection.cache_identity)
+                health_sql = " ".join(traced).lower()
+                self.assertNotIn(" from problems", health_sql)
+                self.assertNotIn("statement", health_sql)
+                self.assertNotIn("select embedding", health_sql)
+
+                external = sqlite3.connect(path)
+                external.execute(
+                    "UPDATE problems SET title = 'changed externally' WHERE id = 1"
+                )
+                external.commit()
+                external.close()
+
+                stale = store.inspect_index(spec)
+                self.assertFalse(stale.metadata_ready)
+                self.assertFalse(stale.vector_ready)
+                self.assertEqual(stale.status, "verification_required")
+                self.assertIsNone(stale.problem_count)
+
+                refreshed = store.search_snapshot(spec)
+                self.assertTrue(refreshed.vector_ready)
+                self.assertTrue(store.inspect_index(spec).vector_ready)
+            finally:
+                store.close()
+
+    def test_commit_to_record_window_keeps_the_observed_data_version(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "record-window.db"
+            spec = EmbeddingIndexSpec("model-a", 2)
+            store = ProblemStore(str(path))
+            try:
+                store.prepare_embedding_writes(spec)
+                store.add_problem(
+                    source="s",
+                    external_id="one",
+                    title="one",
+                    statement="body",
+                    content_hash="h",
+                    embedding=[1.0, 0.0],
+                    index_spec=spec,
+                )
+                original_record = store._record_verification_locked  # noqa: SLF001
+                mutation_done = False
+
+                def mutate_before_record(*args: Any, **kwargs: Any) -> None:
+                    nonlocal mutation_done
+                    if not mutation_done:
+                        mutation_done = True
+                        external = sqlite3.connect(path)
+                        external.execute(
+                            "UPDATE problems SET title = 'commit-window-change' "
+                            "WHERE id = 1"
+                        )
+                        external.commit()
+                        external.close()
+                    original_record(*args, **kwargs)
+
+                with patch.object(
+                    store,
+                    "_record_verification_locked",
+                    side_effect=mutate_before_record,
+                ):
+                    snapshot = store.search_snapshot(spec)
+                self.assertTrue(snapshot.vector_ready)
+                inspection = store.inspect_index(spec)
+                self.assertEqual(inspection.status, "verification_required")
+                self.assertFalse(inspection.vector_ready)
+            finally:
+                store.close()
+
+    def test_metadata_is_machine_generated_and_tracks_actual_rows(self) -> None:
+        store = ProblemStore(":memory:")
+        self.addCleanup(store.close)
+        spec = EmbeddingIndexSpec("model-a", 2)
+        initial = store.prepare_embedding_writes(spec)
+        self.assertEqual(initial.problem_count, 0)
+        self.assertEqual(initial.embedding_rows, 0)
+        self.assertEqual(initial.index_build_revision, INDEX_BUILD_REVISION)
+
+        store.add_problem(
+            source="source-a",
+            external_id="one",
+            title="one",
+            statement="first",
+            content_hash="hash-one",
+            embedding=[1.0, 0.0],
+            index_spec=spec,
+            source_updated_at="2026-01-01T00:00:00.000Z",
+        )
+        inserted = store.get_index_metadata()
+        assert inserted is not None
+        self.assertEqual((inserted.problem_count, inserted.embedding_rows), (1, 1))
+        self.assertEqual(
+            inserted.corpus_revision,
+            calculate_corpus_revision([("source-a", "one", "hash-one")]),
+        )
+
+        store.add_problem(
+            source="source-a",
+            external_id="one",
+            title="one",
+            statement="second",
+            content_hash="hash-two",
+            source_updated_at="2026-01-02T00:00:00.000Z",
+        )
+        cleared = store.get_index_metadata()
+        assert cleared is not None
+        self.assertEqual((cleared.problem_count, cleared.embedding_rows), (1, 0))
+        self.assertEqual(
+            cleared.corpus_revision,
+            calculate_corpus_revision([("source-a", "one", "hash-two")]),
+        )
+
+    def test_keyword_metadata_can_upgrade_only_while_no_vectors_exist(self) -> None:
+        store = ProblemStore(":memory:")
+        self.addCleanup(store.close)
+        keyword_metadata = store.prepare_keyword_writes()
+        self.assertEqual(keyword_metadata.embedding_dimensions, 0)
+        store.add_problem(
+            source="s",
+            external_id="one",
+            title="one",
+            statement="body",
+            content_hash="h",
+        )
+        spec = EmbeddingIndexSpec("model-a", 2)
+        upgraded = store.prepare_embedding_writes(spec)
+        self.assertEqual(upgraded.embedding_model, "model-a")
+        self.assertEqual(upgraded.embedding_dimensions, 2)
+        problem = store.iter_missing_embeddings()[0]
+        self.assertTrue(
+            store.update_embedding(
+                problem.id,
+                [1.0, 0.0],
+                index_spec=spec,
+                expected_content_hash="h",
+            )
+        )
+
+    def test_legacy_vectors_are_preserved_and_cannot_be_adopted(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "legacy-vector.db"
+            connection = sqlite3.connect(path)
+            connection.executescript(
+                """
+                CREATE TABLE problems (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    source TEXT NOT NULL,
+                    external_id TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    url TEXT,
+                    statement TEXT NOT NULL,
+                    embedding BLOB,
+                    content_hash TEXT NOT NULL,
+                    source_updated_at TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(source, external_id)
+                );
+                """
+            )
+            blob = pack_embedding([1.0, 0.0])
+            connection.execute(
+                "INSERT INTO problems VALUES "
+                "(1, 's', 'one', 'one', NULL, 'keyword body', ?, 'h', NULL, ?, ?)",
+                (blob, "2026-01-01T00:00:00.000Z", "2026-01-01T00:00:00.000Z"),
+            )
+            connection.commit()
+            connection.close()
+
+            store = ProblemStore(str(path))
+            try:
+                spec = EmbeddingIndexSpec("model-a", 2)
+                with self.assertRaises(IndexMetadataError) as caught:
+                    store.prepare_embedding_writes(spec)
+                self.assertEqual(caught.exception.status, "legacy_vectors")
+                snapshot = store.search_snapshot(spec)
+                self.assertFalse(snapshot.vector_ready)
+                self.assertEqual(snapshot.vector_status, "legacy_vectors")
+                self.assertIsNone(snapshot.problems[0].embedding)
+            finally:
+                store.close()
+            verification = sqlite3.connect(path)
+            try:
+                self.assertEqual(
+                    verification.execute(
+                        "SELECT embedding FROM problems WHERE id = 1"
+                    ).fetchone()[0],
+                    blob,
+                )
+                self.assertEqual(
+                    verification.execute(
+                        "SELECT COUNT(*) FROM index_metadata"
+                    ).fetchone()[0],
+                    0,
+                )
+            finally:
+                verification.close()
+
+    def test_same_dimension_other_model_and_dimension_change_are_rejected(self) -> None:
+        store = ProblemStore(":memory:")
+        self.addCleanup(store.close)
+        store.prepare_embedding_writes(EmbeddingIndexSpec("model-a", 2))
+        for spec, status in (
+            (EmbeddingIndexSpec("model-b", 2), "model_mismatch"),
+            (EmbeddingIndexSpec("model-a", 3), "dimension_mismatch"),
+        ):
+            with self.subTest(status=status):
+                with self.assertRaises(IndexMetadataError) as caught:
+                    store.prepare_embedding_writes(spec)
+                self.assertEqual(caught.exception.status, status)
+
+    def test_build_revision_change_is_rejected_without_rewriting_vectors(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "build-change.db"
+            store = ProblemStore(str(path))
+            spec = EmbeddingIndexSpec("model-a", 2)
+            store.prepare_embedding_writes(spec)
+            store.add_problem(
+                source="s",
+                external_id="one",
+                title="one",
+                statement="body",
+                content_hash="h",
+                embedding=[1.0, 0.0],
+                index_spec=spec,
+            )
+            store.close()
+            connection = sqlite3.connect(path)
+            connection.execute(
+                "UPDATE index_metadata SET value = 'future-builder' "
+                "WHERE key = 'index_build_revision'"
+            )
+            connection.commit()
+            before = connection.execute(
+                "SELECT embedding FROM problems WHERE external_id = 'one'"
+            ).fetchone()[0]
+            connection.close()
+
+            reopened = ProblemStore(str(path))
+            try:
+                with self.assertRaises(IndexMetadataError) as caught:
+                    reopened.prepare_embedding_writes(spec)
+                self.assertEqual(caught.exception.status, "build_mismatch")
+            finally:
+                reopened.close()
+            verification = sqlite3.connect(path)
+            try:
+                self.assertEqual(
+                    verification.execute(
+                        "SELECT embedding FROM problems WHERE external_id = 'one'"
+                    ).fetchone()[0],
+                    before,
+                )
+            finally:
+                verification.close()
+
+    def test_stale_counts_and_extra_metadata_keys_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "stale-metadata.db"
+            spec = EmbeddingIndexSpec("model-a", 2)
+            store = ProblemStore(str(path))
+            store.prepare_embedding_writes(spec)
+            store.close()
+            connection = sqlite3.connect(path)
+            timestamp = "2026-01-01T00:00:00.000Z"
+            connection.execute(
+                "INSERT INTO problems "
+                "(source, external_id, title, statement, content_hash, "
+                "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                ("s", "one", "one", "body", "h", timestamp, timestamp),
+            )
+            connection.execute(
+                "INSERT INTO index_metadata (key, value) VALUES ('future_key', '1')"
+            )
+            connection.commit()
+            connection.close()
+
+            reopened = ProblemStore(str(path))
+            try:
+                snapshot = reopened.search_snapshot(spec)
+                self.assertFalse(snapshot.vector_ready)
+                self.assertEqual(snapshot.vector_status, "metadata_shape")
+                self.assertEqual(len(snapshot.problems), 1)
+                with self.assertRaises(IndexMetadataError):
+                    reopened.prepare_embedding_writes(spec)
+            finally:
+                reopened.close()
+            connection = sqlite3.connect(path)
+            connection.execute(
+                "DELETE FROM index_metadata WHERE key = 'future_key'"
+            )
+            connection.commit()
+            connection.close()
+            stale = ProblemStore(str(path))
+            try:
+                snapshot = stale.search_snapshot(spec)
+                self.assertFalse(snapshot.vector_ready)
+                self.assertEqual(snapshot.vector_status, "metadata_stale")
+                with self.assertRaises(IndexMetadataError) as caught:
+                    stale.prepare_embedding_writes(spec)
+                self.assertEqual(caught.exception.status, "metadata_stale")
+            finally:
+                stale.close()
+
+    def test_one_corrupt_blob_hides_all_vectors_from_the_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "corrupt-vector.db"
+            spec = EmbeddingIndexSpec("model-a", 2)
+            store = ProblemStore(str(path))
+            store.prepare_embedding_writes(spec)
+            for external_id, vector in (
+                ("good", [1.0, 0.0]),
+                ("bad", [0.0, 1.0]),
+            ):
+                store.add_problem(
+                    source="s",
+                    external_id=external_id,
+                    title=external_id,
+                    statement=f"{external_id} keyword body",
+                    content_hash=f"hash-{external_id}",
+                    embedding=vector,
+                    index_spec=spec,
+                )
+            store.close()
+            connection = sqlite3.connect(path)
+            connection.execute(
+                "UPDATE problems SET embedding = ? WHERE external_id = 'bad'",
+                (pack_embedding([1.0]),),
+            )
+            connection.commit()
+            connection.close()
+
+            reopened = ProblemStore(str(path))
+            try:
+                snapshot = reopened.search_snapshot(spec)
+                self.assertFalse(snapshot.vector_ready)
+                self.assertEqual(snapshot.vector_status, "invalid_vectors")
+                self.assertTrue(
+                    all(problem.embedding is None for problem in snapshot.problems)
+                )
+            finally:
+                reopened.close()
+
+    def test_missing_vector_makes_the_whole_vector_snapshot_incomplete(self) -> None:
+        store = ProblemStore(":memory:")
+        self.addCleanup(store.close)
+        spec = EmbeddingIndexSpec("model-a", 2)
+        store.prepare_embedding_writes(spec)
+        store.add_problem(
+            source="s",
+            external_id="ready",
+            title="ready",
+            statement="ready keyword",
+            content_hash="ready-hash",
+            embedding=[1.0, 0.0],
+            index_spec=spec,
+        )
+        store.add_problem(
+            source="s",
+            external_id="missing",
+            title="missing",
+            statement="missing keyword",
+            content_hash="missing-hash",
+        )
+
+        snapshot = store.search_snapshot(spec)
+
+        self.assertFalse(snapshot.vector_ready)
+        self.assertEqual(snapshot.vector_status, "incomplete_vectors")
+        self.assertTrue(all(problem.embedding is None for problem in snapshot.problems))
+
+        keyword_snapshot = store.search_snapshot(None)
+        self.assertFalse(keyword_snapshot.vector_ready)
+        self.assertEqual(keyword_snapshot.vector_status, "incomplete_vectors")
+        self.assertIsNone(keyword_snapshot.cache_identity)
+        self.assertEqual(store.inspect_index(None).status, "incomplete_vectors")
+
+    def test_concurrent_initialization_allows_only_one_conflicting_spec(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "concurrent-init.db"
+            first = ProblemStore(str(path))
+            second = ProblemStore(str(path))
+            barrier = threading.Barrier(3)
+            successes: list[str] = []
+            failures: list[str] = []
+
+            def prepare(store: ProblemStore, model: str) -> None:
+                barrier.wait()
+                try:
+                    store.prepare_embedding_writes(EmbeddingIndexSpec(model, 2))
+                    successes.append(model)
+                except IndexMetadataError as error:
+                    failures.append(error.status)
+
+            threads = [
+                threading.Thread(target=prepare, args=(first, "model-a")),
+                threading.Thread(target=prepare, args=(second, "model-b")),
+            ]
+            try:
+                for thread in threads:
+                    thread.start()
+                barrier.wait(timeout=2.0)
+                for thread in threads:
+                    thread.join(timeout=3.0)
+                self.assertTrue(all(not thread.is_alive() for thread in threads))
+                self.assertEqual(len(successes), 1)
+                self.assertEqual(failures, ["model_mismatch"])
+            finally:
+                first.close()
+                second.close()
+
+    def test_concurrent_backfill_updates_metadata_once(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "concurrent-backfill.db"
+            first = ProblemStore(str(path))
+            second = ProblemStore(str(path))
+            spec = EmbeddingIndexSpec("model-a", 2)
+            first.prepare_embedding_writes(spec)
+            first.add_problem(
+                source="s",
+                external_id="one",
+                title="one",
+                statement="body",
+                content_hash="h",
+            )
+            second.prepare_embedding_writes(spec)
+            problem_id = first.iter_missing_embeddings()[0].id
+            barrier = threading.Barrier(3)
+            results: list[bool] = []
+            failures: list[str] = []
+
+            def update(store: ProblemStore) -> None:
+                barrier.wait()
+                try:
+                    results.append(
+                        store.update_embedding(
+                            problem_id,
+                            [1.0, 0.0],
+                            index_spec=spec,
+                            expected_content_hash="h",
+                        )
+                    )
+                except IndexMetadataError as error:
+                    failures.append(error.status)
+
+            threads = [
+                threading.Thread(target=update, args=(first,)),
+                threading.Thread(target=update, args=(second,)),
+            ]
+            try:
+                for thread in threads:
+                    thread.start()
+                barrier.wait(timeout=2.0)
+                for thread in threads:
+                    thread.join(timeout=3.0)
+                self.assertEqual(results, [True])
+                self.assertEqual(failures, ["verification_required"])
+                metadata = first.get_index_metadata()
+                assert metadata is not None
+                self.assertEqual(metadata.embedding_rows, 1)
+            finally:
+                first.close()
+                second.close()
+
+    def test_metadata_failure_rolls_back_the_problem_write(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "rollback.db"
+            initial = ProblemStore(str(path))
+            initial.prepare_embedding_writes(EmbeddingIndexSpec("model-a", 2))
+            initial.close()
+            connection = sqlite3.connect(path)
+            connection.executescript(
+                """
+                CREATE TRIGGER reject_problem_count_update
+                BEFORE UPDATE OF value ON index_metadata
+                WHEN NEW.key = 'problem_count'
+                BEGIN
+                    SELECT RAISE(ABORT, 'synthetic metadata failure');
+                END;
+                """
+            )
+            connection.commit()
+            connection.close()
+
+            store = ProblemStore(str(path))
+            try:
+                store.prepare_embedding_writes(
+                    EmbeddingIndexSpec("model-a", 2)
+                )
+                with self.assertRaises(sqlite3.IntegrityError):
+                    store.add_problem(
+                        source="s",
+                        external_id="one",
+                        title="one",
+                        statement="body",
+                        content_hash="h",
+                    )
+                self.assertEqual(store.count(), 0)
+                metadata = store.get_index_metadata()
+                assert metadata is not None
+                self.assertEqual(metadata.problem_count, 0)
+                self.assertEqual(metadata.embedding_rows, 0)
+            finally:
+                store.close()
 
 
 if __name__ == "__main__":

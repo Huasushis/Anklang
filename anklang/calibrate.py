@@ -32,8 +32,18 @@ from .calibration import (
 from .config import AppConfig, ConfigError, load_config
 from .embedding import EmbeddingClient
 from .server import build_backend
-from .store import StoredProblem
-from .vectormath import unpack_embedding
+from .store import (
+    INDEX_BUILD_REVISION,
+    NO_EMBEDDING_MODEL,
+    EmbeddingIndexSpec,
+    IndexMetadata,
+    IndexMetadataError,
+    SearchSnapshot,
+    StoredProblem,
+    calculate_corpus_revision,
+    parse_index_metadata,
+)
+from .vectormath import unpack_embedding, validate_embedding
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -262,31 +272,179 @@ class _ReadOnlyProblemStore:
             "SELECT id, source, external_id, title, url, statement, embedding, "
             "content_hash, source_updated_at, created_at, updated_at FROM problems"
         ).fetchall()
-        problems: list[StoredProblem] = []
-        for row in rows:
-            blob = row["embedding"]
-            problems.append(
-                StoredProblem(
-                    id=int(row["id"]),
-                    source=str(row["source"]),
-                    external_id=str(row["external_id"]),
-                    title=str(row["title"]),
-                    url=str(row["url"]) if row["url"] is not None else None,
-                    statement=str(row["statement"]),
-                    embedding=(
-                        unpack_embedding(blob) if blob is not None else None
-                    ),
-                    content_hash=str(row["content_hash"]),
-                    source_updated_at=(
-                        str(row["source_updated_at"])
-                        if row["source_updated_at"] is not None
-                        else None
-                    ),
-                    created_at=str(row["created_at"]),
-                    updated_at=str(row["updated_at"]),
+        return [_readonly_problem(row, include_embedding=True) for row in rows]
+
+    def search_snapshot(self, spec: EmbeddingIndexSpec | None) -> SearchSnapshot:
+        rows = self._connection.execute(
+            "SELECT id, source, external_id, title, url, statement, embedding, "
+            "content_hash, source_updated_at, created_at, updated_at FROM problems"
+        ).fetchall()
+        keyword = tuple(
+            _readonly_problem(row, include_embedding=False) for row in rows
+        )
+        try:
+            metadata = _read_formal_index_metadata(self._connection)
+            if metadata is None:
+                status = (
+                    "legacy_vectors"
+                    if any(row["embedding"] is not None for row in rows)
+                    else "uninitialized"
                 )
+                return SearchSnapshot(keyword, False, status)
+            if spec is None:
+                validate_vectors = metadata.embedding_model != NO_EMBEDDING_MODEL
+                expected_dimensions = (
+                    metadata.embedding_dimensions if validate_vectors else None
+                )
+            else:
+                if metadata.embedding_model != spec.model:
+                    raise IndexMetadataError("model_mismatch")
+                if metadata.embedding_dimensions != spec.dimensions:
+                    raise IndexMetadataError("dimension_mismatch")
+                if metadata.index_build_revision != spec.build_revision:
+                    raise IndexMetadataError("build_mismatch")
+                validate_vectors = True
+                expected_dimensions = spec.dimensions
+            embedding_rows, corpus_revision = _readonly_actual_index_state(
+                rows,
+                expected_dimensions=expected_dimensions,
+                validate_vectors=validate_vectors,
             )
-        return problems
+            if (
+                spec is None
+                and metadata.index_build_revision != INDEX_BUILD_REVISION
+            ):
+                raise IndexMetadataError("build_mismatch")
+            if (
+                metadata.problem_count != len(rows)
+                or metadata.embedding_rows != embedding_rows
+                or metadata.corpus_revision != corpus_revision
+            ):
+                raise IndexMetadataError("metadata_stale")
+            if spec is None and validate_vectors:
+                try:
+                    EmbeddingIndexSpec(
+                        metadata.embedding_model,
+                        metadata.embedding_dimensions,
+                    )
+                except ValueError as error:
+                    raise IndexMetadataError("metadata_shape") from error
+            status = _readonly_complete_status(metadata, spec)
+            if status != "ready":
+                return SearchSnapshot(keyword, False, status)
+            assert spec is not None
+            problems = tuple(
+                _readonly_problem(
+                    row,
+                    include_embedding=True,
+                    expected_dimensions=spec.dimensions,
+                )
+                for row in rows
+            )
+        except (IndexMetadataError, sqlite3.Error, ValueError) as error:
+            status = (
+                error.status
+                if isinstance(error, IndexMetadataError)
+                else "invalid_vectors"
+            )
+            return SearchSnapshot(keyword, False, status)
+        return SearchSnapshot(problems, True, "ready")
+
+
+def _read_formal_index_metadata(
+    connection: sqlite3.Connection,
+) -> IndexMetadata | None:
+    if not _has_formal_index_metadata_schema(connection):
+        raise IndexMetadataError("metadata_shape")
+    metadata_rows = connection.execute(
+        "SELECT key, value FROM index_metadata"
+    ).fetchall()
+    if not metadata_rows:
+        return None
+    metadata_values = {
+        str(row["key"]): str(row["value"])
+        for row in metadata_rows
+    }
+    if len(metadata_values) != len(metadata_rows):
+        raise IndexMetadataError("metadata_shape")
+    return parse_index_metadata(metadata_values)
+
+
+def _readonly_actual_index_state(
+    rows: list[sqlite3.Row],
+    *,
+    expected_dimensions: int | None,
+    validate_vectors: bool,
+) -> tuple[int, str]:
+    embedding_rows = 0
+    for row in rows:
+        blob = row["embedding"]
+        if blob is None:
+            continue
+        embedding_rows += 1
+        if validate_vectors:
+            validate_embedding(
+                unpack_embedding(blob),
+                expected_dimensions=expected_dimensions,
+            )
+    corpus_revision = calculate_corpus_revision(
+        (
+            str(row["source"]),
+            str(row["external_id"]),
+            str(row["content_hash"]),
+        )
+        for row in rows
+    )
+    return embedding_rows, corpus_revision
+
+
+def _readonly_complete_status(
+    metadata: IndexMetadata,
+    spec: EmbeddingIndexSpec | None,
+) -> str:
+    if metadata.problem_count == 0:
+        return "empty_corpus"
+    if (
+        metadata.embedding_model != NO_EMBEDDING_MODEL
+        and metadata.embedding_rows != metadata.problem_count
+    ):
+        return "incomplete_vectors"
+    if spec is None:
+        return "disabled"
+    return "ready"
+
+
+def _readonly_problem(
+    row: sqlite3.Row,
+    *,
+    include_embedding: bool,
+    expected_dimensions: int | None = None,
+) -> StoredProblem:
+    blob = row["embedding"]
+    embedding = (
+        validate_embedding(
+            unpack_embedding(blob), expected_dimensions=expected_dimensions
+        )
+        if include_embedding and blob is not None
+        else None
+    )
+    return StoredProblem(
+        id=int(row["id"]),
+        source=str(row["source"]),
+        external_id=str(row["external_id"]),
+        title=str(row["title"]),
+        url=str(row["url"]) if row["url"] is not None else None,
+        statement=str(row["statement"]),
+        embedding=embedding,
+        content_hash=str(row["content_hash"]),
+        source_updated_at=(
+            str(row["source_updated_at"])
+            if row["source_updated_at"] is not None
+            else None
+        ),
+        created_at=str(row["created_at"]),
+        updated_at=str(row["updated_at"]),
+    )
 
 
 def _corpus_verifier(
@@ -349,47 +507,75 @@ def _corpus_verifier(
             ):
                 raise CalibrationError("语料快照数据库数量与清单不一致。")
 
-            observed_dimensions: set[int] = set()
-            for row in connection.execute(
-                "SELECT embedding FROM problems WHERE embedding IS NOT NULL"
-            ):
-                vector = unpack_embedding(row[0])
-                observed_dimensions.add(len(vector))
-            if embedding_rows == 0:
-                if verified_artifact is not None:
-                    verified_artifact["contentHash"] = evidence.content_hash
-                return True
-            if observed_dimensions != {evidence.embedding_dimensions}:
-                raise CalibrationError("语料快照向量维度与清单不一致。")
-
-            metadata_table = connection.execute(
-                "SELECT 1 FROM sqlite_master "
-                "WHERE type = 'table' AND name = 'index_metadata'"
-            ).fetchone()
             if verified_artifact is not None:
                 verified_artifact["contentHash"] = evidence.content_hash
-            if metadata_table is None:
-                return False
             try:
-                metadata_rows = connection.execute(
-                    "SELECT key, value FROM index_metadata"
-                ).fetchall()
-            except sqlite3.Error:
+                metadata = _read_formal_index_metadata(connection)
+            except (sqlite3.Error, IndexMetadataError):
                 return False
-            metadata = {
-                str(row["key"]): str(row["value"]) for row in metadata_rows
-            }
-            expected_metadata = {
-                "embedding_model": evidence.embedding_model,
-                "embedding_dimensions": str(evidence.embedding_dimensions),
-                "index_build_revision": evidence.index_build_revision,
-            }
-            if len(metadata) != len(metadata_rows) or metadata != expected_metadata:
+            if metadata is None:
                 return False
+
+            corpus_revision = calculate_corpus_revision(
+                (
+                    str(row["source"]),
+                    str(row["external_id"]),
+                    str(row["content_hash"]),
+                )
+                for row in connection.execute(
+                    "SELECT source, external_id, content_hash FROM problems"
+                )
+            )
+            if (
+                metadata.problem_count != problem_count
+                or metadata.embedding_rows != embedding_rows
+                or metadata.corpus_revision != corpus_revision
+                or metadata.index_build_revision != INDEX_BUILD_REVISION
+            ):
+                return False
+
+            observed_dimensions: set[int] = set()
+            try:
+                for row in connection.execute(
+                    "SELECT embedding FROM problems WHERE embedding IS NOT NULL"
+                ):
+                    vector = validate_embedding(
+                        unpack_embedding(row[0]),
+                        expected_dimensions=metadata.embedding_dimensions,
+                    )
+                    observed_dimensions.add(len(vector))
+            except ValueError as error:
+                raise CalibrationError("语料快照包含无法核对的向量。") from error
+            if embedding_rows == 0:
+                if (
+                    metadata.embedding_model != NO_EMBEDDING_MODEL
+                    or metadata.embedding_dimensions != 0
+                    or any(
+                        value is not None
+                        for value in (
+                            evidence.embedding_model,
+                            evidence.embedding_dimensions,
+                            evidence.index_build_revision,
+                        )
+                    )
+                ):
+                    return False
+            else:
+                if (
+                    embedding_rows != problem_count
+                    or metadata.embedding_model == NO_EMBEDDING_MODEL
+                    or evidence.embedding_model != metadata.embedding_model
+                    or evidence.embedding_dimensions
+                    != metadata.embedding_dimensions
+                    or evidence.index_build_revision
+                    != metadata.index_build_revision
+                    or observed_dimensions != {metadata.embedding_dimensions}
+                ):
+                    return False
             if config.dashscope_base_url and config.dashscope_api_key:
                 if (
-                    evidence.embedding_model != config.dashscope_embedding_model
-                    or evidence.embedding_dimensions != config.dashscope_embedding_dim
+                    metadata.embedding_model != config.dashscope_embedding_model
+                    or metadata.embedding_dimensions != config.dashscope_embedding_dim
                 ):
                     return False
             return True
@@ -404,6 +590,25 @@ def _corpus_verifier(
                 os.close(descriptor)
 
     return verify_local
+
+
+def _has_formal_index_metadata_schema(connection: sqlite3.Connection) -> bool:
+    try:
+        columns = connection.execute("PRAGMA table_info(index_metadata)").fetchall()
+    except sqlite3.Error:
+        return False
+    return [
+        (
+            str(row["name"]),
+            str(row["type"]).upper(),
+            int(row["notnull"]),
+            int(row["pk"]),
+        )
+        for row in columns
+    ] == [
+        ("key", "TEXT", 0, 1),
+        ("value", "TEXT", 1, 0),
+    ]
 
 
 def _build_calibration_backend(

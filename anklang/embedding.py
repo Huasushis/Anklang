@@ -56,6 +56,16 @@ class EmbeddingClient:
         self._timeout = timeout_seconds
         self._opener = opener or urllib.request.urlopen
 
+    @property
+    def model(self) -> str:
+        """返回用于请求且必须由服务端响应确认的模型标识。"""
+
+        return self._model
+
+    @property
+    def dimensions(self) -> int:
+        return self._dimensions
+
     def embed_one(self, text: str) -> list[float]:
         """算一条文本的向量。"""
         return self.embed_batch([text])[0]
@@ -104,7 +114,11 @@ class EmbeddingClient:
             payload = json.loads(raw.decode("utf-8"))
         except (ValueError, UnicodeDecodeError, RecursionError) as error:
             raise EmbeddingError("百炼 embedding 响应不是有效 JSON。") from error
-        data = payload.get("data") if isinstance(payload, dict) else None
+        if not isinstance(payload, dict) or payload.get("model") != self._model:
+            # 不能只相信请求参数：兼容服务若实际换了模型，旧向量即使维度相同也
+            # 不能混入同一个索引。错误信息故意不回显响应或配置值。
+            raise EmbeddingError("百炼 embedding 响应没有确认请求的模型。")
+        data = payload.get("data")
         if not isinstance(data, list) or len(data) != len(chunk):
             raise EmbeddingError("百炼 embedding 响应条数与请求不一致。")
 

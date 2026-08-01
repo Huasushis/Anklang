@@ -9,6 +9,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+from anklang.backfill import backfill_missing_embeddings
 from anklang.ingest import ingest_once, main
 from anklang.sources import (
     RawProblem,
@@ -18,7 +19,7 @@ from anklang.sources import (
 )
 from anklang.sources import example_static as example_static_source
 from anklang.sources.example_static import SOURCE_NAME, fetch_new_problems
-from anklang.store import ProblemStore
+from anklang.store import EmbeddingIndexSpec, IndexMetadataError, ProblemStore
 
 
 class ExampleStaticSourceTests(unittest.TestCase):
@@ -389,7 +390,11 @@ class IngestFrameworkTests(unittest.TestCase):
                     ],
                 )
                 embed_one = Mock(return_value=[1.0, 0.0])
-                embedder = SimpleNamespace(embed_one=embed_one)
+                embedder = SimpleNamespace(
+                    embed_one=embed_one,
+                    model="test-model",
+                    dimensions=2,
+                )
                 self.store.set_cursor(source_name, stored_cursor)
 
                 with patch(
@@ -519,7 +524,11 @@ class IngestFrameworkTests(unittest.TestCase):
         )
         self.store.set_cursor(bad_source_name, bad_cursor)
         embed_one = Mock(return_value=[1.0, 0.0])
-        embedder = SimpleNamespace(embed_one=embed_one)
+        embedder = SimpleNamespace(
+            embed_one=embed_one,
+            model="test-model",
+            dimensions=2,
+        )
         stderr = io.StringIO()
         stdout = io.StringIO()
         config = SimpleNamespace(
@@ -538,6 +547,7 @@ class IngestFrameworkTests(unittest.TestCase):
             patch("anklang.ingest.load_config", return_value=config),
             patch("anklang.ingest.ProblemStore", return_value=self.store),
             patch("anklang.ingest.EmbeddingClient", return_value=embedder),
+            patch.object(self.store, "close"),
             patch("anklang.ingest.sys.stderr", stderr),
             patch("anklang.ingest.sys.stdout", stdout),
         ):
@@ -584,6 +594,8 @@ class IngestFrameworkTests(unittest.TestCase):
         class _CountingEmbedder:
             def __init__(self) -> None:
                 self.calls = 0
+                self.model = "test-model"
+                self.dimensions = 2
 
             def embed_one(self, _text: str) -> list[float]:
                 self.calls += 1
@@ -610,6 +622,45 @@ class IngestFrameworkTests(unittest.TestCase):
         self.assertEqual(first.inserted, 1)
         self.assertEqual(second.unchanged, 1)
         self.assertEqual(embedder.calls, 1)
+
+    def test_ingest_refuses_conflicting_model_before_source_discovery(self) -> None:
+        self.store.prepare_embedding_writes(EmbeddingIndexSpec("model-a", 2))
+        embed_one = Mock(return_value=[1.0, 0.0])
+        embedder = SimpleNamespace(
+            model="model-b",
+            dimensions=2,
+            embed_one=embed_one,
+        )
+        with patch("anklang.ingest.discover_source_modules") as discover:
+            with self.assertRaises(IndexMetadataError) as caught:
+                ingest_once(self.store, embedder=embedder)  # type: ignore[arg-type]
+        self.assertEqual(caught.exception.status, "model_mismatch")
+        discover.assert_not_called()
+        embed_one.assert_not_called()
+
+    def test_backfill_refuses_dimension_change_before_model_call(self) -> None:
+        self.store.prepare_embedding_writes(EmbeddingIndexSpec("model-a", 2))
+        self.store.add_problem(
+            source="s",
+            external_id="one",
+            title="one",
+            statement="body",
+            content_hash="h",
+        )
+        embed_one = Mock(return_value=[1.0, 0.0, 0.0])
+        embedder = SimpleNamespace(
+            model="model-a",
+            dimensions=3,
+            embed_one=embed_one,
+        )
+        with self.assertRaises(IndexMetadataError) as caught:
+            backfill_missing_embeddings(
+                self.store,
+                embedder,  # type: ignore[arg-type]
+            )
+        self.assertEqual(caught.exception.status, "dimension_mismatch")
+        embed_one.assert_not_called()
+        self.assertIsNone(self.store.iter_all()[0].embedding)
 
 
 if __name__ == "__main__":

@@ -11,8 +11,12 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import sqlite3
+import tempfile
 import unittest
+from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 from anklang.backends import BackendSearchResult
 from anklang.backends.local_engine import LocalEngineBackend
@@ -21,7 +25,10 @@ from anklang.cache import ResultCache
 from anklang.config import AppConfig
 from anklang.embedding import EmbeddingClient
 from anklang.server import AnklangService, build_backend, make_handler
-from anklang.store import ProblemStore
+from anklang.store import EmbeddingIndexSpec, ProblemStore
+from anklang.vectormath import pack_embedding
+
+_INDEX_SPEC = EmbeddingIndexSpec("text-embedding-v4", 2)
 
 
 def _config(**overrides: Any) -> AppConfig:
@@ -65,13 +72,18 @@ def _request(content_hash: str | None = None, statement: str = "给定 n 个整�
 class _FakeEmbeddingOpener:
     def __init__(self, vectors_by_text: dict[str, list[float]]) -> None:
         self._vectors_by_text = vectors_by_text
+        self.calls = 0
 
     def __call__(self, request: Any, timeout: float) -> Any:  # noqa: ARG002
+        self.calls += 1
         body = json.loads(request.data.decode("utf-8"))
         raw_input = body["input"]
         texts = raw_input if isinstance(raw_input, list) else [raw_input]
         vectors = [self._vectors_by_text[text] for text in texts]
-        payload = {"data": [{"embedding": vector} for vector in vectors]}
+        payload = {
+            "model": "text-embedding-v4",
+            "data": [{"embedding": vector} for vector in vectors],
+        }
         response_body = json.dumps(payload).encode("utf-8")
 
         class _Response:
@@ -168,6 +180,10 @@ class BuildBackendTests(unittest.TestCase):
         backend = build_backend(config)
         self.assertIsInstance(backend, LocalEngineBackend)
         self.assertIsNone(backend.embedder)  # 没配置 DASHSCOPE_* 时应该优雅降级为 None
+        health = backend.describe_health()
+        self.assertEqual(health["vectorIndexStatus"], "empty_corpus")
+        self.assertFalse(health["indexMetadataReady"])
+        backend.store.close()
 
     def test_local_engine_with_dashscope_credentials_builds_embedder(self) -> None:
         config = _config(
@@ -179,13 +195,84 @@ class BuildBackendTests(unittest.TestCase):
         backend = build_backend(config)
         self.assertIsInstance(backend, LocalEngineBackend)
         self.assertIsNotNone(backend.embedder)
+        health = backend.describe_health()
+        self.assertEqual(health["vectorIndexStatus"], "empty_corpus")
+        self.assertFalse(health["vectorIndexReady"])
+        backend.store.close()
 
 
 class LocalEngineServerFlowTests(unittest.TestCase):
-    def _service(self) -> AnklangService:
-        config = _config(backend="local_engine", local_db_path=":memory:")
-        store = ProblemStore(":memory:")
+    def test_empty_corpus_is_incomplete_with_or_without_embedder(self) -> None:
+        for embedding_enabled in (False, True):
+            with self.subTest(embedding_enabled=embedding_enabled):
+                overrides: dict[str, Any] = {
+                    "backend": "local_engine",
+                    "local_db_path": ":memory:",
+                }
+                if embedding_enabled:
+                    overrides.update(
+                        {
+                            "dashscope_base_url": (
+                                "https://dashscope.test/compatible-mode/v1"
+                            ),
+                            "dashscope_api_key": "test-key",
+                            "dashscope_embedding_model": "text-embedding-v4",
+                            "dashscope_embedding_dim": 2,
+                        }
+                    )
+                config = _config(**overrides)
+                backend = build_backend(config)
+                assert isinstance(backend, LocalEngineBackend)
+                try:
+                    service = AnklangService(
+                        config,
+                        backend,
+                        ResultCache(
+                            config.cache_ttl_seconds,
+                            config.cache_max_entries,
+                        ),
+                        None,
+                    )
+                    harness = _ServerHarness(service)
+                    try:
+                        headers = {
+                            "Authorization": (
+                                "Bearer service-token-abcdef123456"
+                            ),
+                            "Content-Type": "application/json",
+                        }
+                        body = json.dumps(_request()).encode("utf-8")
+                        status, payload = harness.request(
+                            "POST",
+                            "/api/v1/checks/similarity",
+                            body,
+                            headers,
+                        )
+                        self.assertEqual(status, 200)
+                        self.assertEqual(payload["candidates"], [])
+                        self.assertEqual(
+                            payload["recommendation"]["message"],
+                            "本次未能完成原题检索，请稍后重试并由审题人手工核对。",
+                        )
+                        self.assertIsNone(service.cache.get("d" * 64))
+                        health_status, health = harness.request(
+                            "GET", "/api/v1/health"
+                        )
+                        self.assertEqual(health_status, 200)
+                        self.assertEqual(health["status"], "degraded")
+                        self.assertEqual(
+                            health["vectorIndexStatus"], "empty_corpus"
+                        )
+                    finally:
+                        harness.close()
+                finally:
+                    backend.store.close()
+
+    def _service(self, db_path: str = ":memory:") -> AnklangService:
+        config = _config(backend="local_engine", local_db_path=db_path)
+        store = ProblemStore(db_path)
         self.addCleanup(store.close)
+        store.prepare_embedding_writes(_INDEX_SPEC)
         store.add_problem(
             source="unit-test",
             external_id="array-sum",
@@ -193,6 +280,8 @@ class LocalEngineServerFlowTests(unittest.TestCase):
             statement="给定 n 个整数，输出它们的和。",
             content_hash="h1",
             embedding=[1.0, 0.0],
+            index_spec=_INDEX_SPEC,
+            source_updated_at="2026-01-01T00:00:00.000Z",
         )
         opener = _FakeEmbeddingOpener({"给定 n 个整数，输出它们的和。": [1.0, 0.0]})
         embedder = EmbeddingClient(
@@ -208,6 +297,11 @@ class LocalEngineServerFlowTests(unittest.TestCase):
 
     def test_similarity_flow_uses_local_engine(self) -> None:
         service = self._service()
+        backend = service.backend
+        assert isinstance(backend, LocalEngineBackend)
+        assert isinstance(backend.embedder, EmbeddingClient)
+        opener = backend.embedder._opener
+        assert isinstance(opener, _FakeEmbeddingOpener)
         harness = _ServerHarness(service)
         self.addCleanup(harness.close)
         headers = {"Authorization": "Bearer service-token-abcdef123456", "Content-Type": "application/json"}
@@ -219,6 +313,276 @@ class LocalEngineServerFlowTests(unittest.TestCase):
         self.assertEqual(payload["candidates"][0]["externalId"], "array-sum")
         self.assertEqual(payload["candidates"][0]["source"], "unit-test")
 
+        second_status, second_payload = harness.request(
+            "POST", "/api/v1/checks/similarity", body, headers
+        )
+        self.assertEqual(second_status, 200)
+        self.assertEqual(second_payload, payload)
+        self.assertEqual(opener.calls, 1)
+
+    def test_cached_result_is_rejected_after_index_becomes_incomplete(self) -> None:
+        service = self._service()
+        backend = service.backend
+        assert isinstance(backend, LocalEngineBackend)
+        assert isinstance(backend.embedder, EmbeddingClient)
+        opener = backend.embedder._opener
+        assert isinstance(opener, _FakeEmbeddingOpener)
+        harness = _ServerHarness(service)
+        self.addCleanup(harness.close)
+        headers = {
+            "Authorization": "Bearer service-token-abcdef123456",
+            "Content-Type": "application/json",
+        }
+        body = json.dumps(_request()).encode("utf-8")
+
+        first_status, first_payload = harness.request(
+            "POST", "/api/v1/checks/similarity", body, headers
+        )
+        self.assertEqual(first_status, 200)
+        self.assertTrue(first_payload["candidates"])
+        self.assertEqual(opener.calls, 1)
+
+        backend.store.add_problem(
+            source="unit-test",
+            external_id="missing-vector",
+            title="缺少向量的合成候选",
+            statement="合成测试文本",
+            content_hash="missing-vector-hash",
+        )
+        with (
+            patch("anklang.server.evaluate") as evaluate_mock,
+            patch.object(backend, "search", wraps=backend.search) as search_mock,
+        ):
+            for _ in range(2):
+                status, payload = harness.request(
+                    "POST", "/api/v1/checks/similarity", body, headers
+                )
+                self.assertEqual(status, 200)
+                self.assertEqual(payload["candidates"], [])
+                self.assertFalse(payload["recommendation"]["blockSubmission"])
+                self.assertEqual(
+                    payload["recommendation"]["message"],
+                    "本次未能完成原题检索，请稍后重试并由审题人手工核对。",
+                )
+        evaluate_mock.assert_not_called()
+        self.assertEqual(search_mock.call_count, 2)
+        self.assertEqual(opener.calls, 1)
+        self.assertEqual(
+            backend.describe_health()["vectorIndexStatus"],
+            "incomplete_vectors",
+        )
+
+    def test_cache_is_bound_to_corpus_revision(self) -> None:
+        service = self._service()
+        backend = service.backend
+        assert isinstance(backend, LocalEngineBackend)
+        assert isinstance(backend.embedder, EmbeddingClient)
+        opener = backend.embedder._opener
+        assert isinstance(opener, _FakeEmbeddingOpener)
+        harness = _ServerHarness(service)
+        self.addCleanup(harness.close)
+        headers = {
+            "Authorization": "Bearer service-token-abcdef123456",
+            "Content-Type": "application/json",
+        }
+        body = json.dumps(_request()).encode("utf-8")
+
+        first_status, first_payload = harness.request(
+            "POST", "/api/v1/checks/similarity", body, headers
+        )
+        self.assertEqual(first_status, 200)
+        self.assertEqual(len(first_payload["candidates"]), 1)
+        self.assertEqual(opener.calls, 1)
+
+        backend.store.add_problem(
+            source="unit-test",
+            external_id="new-complete-vector",
+            title="新加入的合成候选",
+            statement="给定 n 个整数，输出它们的和。",
+            content_hash="new-complete-vector-hash",
+            embedding=[1.0, 0.0],
+            index_spec=_INDEX_SPEC,
+        )
+        second_status, second_payload = harness.request(
+            "POST", "/api/v1/checks/similarity", body, headers
+        )
+        self.assertEqual(second_status, 200)
+        self.assertEqual(len(second_payload["candidates"]), 2)
+        self.assertEqual(opener.calls, 2)
+
+        third_status, third_payload = harness.request(
+            "POST", "/api/v1/checks/similarity", body, headers
+        )
+        self.assertEqual(third_status, 200)
+        self.assertEqual(third_payload, second_payload)
+        self.assertEqual(opener.calls, 2)
+
+    def test_same_connection_title_and_url_update_advances_cache_identity(
+        self,
+    ) -> None:
+        service = self._service()
+        backend = service.backend
+        assert isinstance(backend, LocalEngineBackend)
+        assert isinstance(backend.embedder, EmbeddingClient)
+        opener = backend.embedder._opener
+        assert isinstance(opener, _FakeEmbeddingOpener)
+        harness = _ServerHarness(service)
+        self.addCleanup(harness.close)
+        headers = {
+            "Authorization": "Bearer service-token-abcdef123456",
+            "Content-Type": "application/json",
+        }
+        body = json.dumps(_request()).encode("utf-8")
+
+        first_status, first_payload = harness.request(
+            "POST", "/api/v1/checks/similarity", body, headers
+        )
+        self.assertEqual(first_status, 200)
+        self.assertEqual(first_payload["candidates"][0]["title"], "数组求和")
+        self.assertEqual(opener.calls, 1)
+
+        self.assertEqual(
+            backend.store.add_problem(
+                source="unit-test",
+                external_id="array-sum",
+                title="更新后的合成标题",
+                url="https://example.invalid/updated-candidate",
+                statement="给定 n 个整数，输出它们的和。",
+                content_hash="h1",
+                source_updated_at="2026-01-02T00:00:00.000Z",
+            ),
+            "updated",
+        )
+        second_status, second_payload = harness.request(
+            "POST", "/api/v1/checks/similarity", body, headers
+        )
+        self.assertEqual(second_status, 200)
+        self.assertEqual(
+            second_payload["candidates"][0]["title"],
+            "更新后的合成标题",
+        )
+        self.assertEqual(
+            second_payload["candidates"][0]["url"],
+            "https://example.invalid/updated-candidate",
+        )
+        self.assertEqual(opener.calls, 2)
+
+        third_status, third_payload = harness.request(
+            "POST", "/api/v1/checks/similarity", body, headers
+        )
+        self.assertEqual(third_status, 200)
+        self.assertEqual(third_payload, second_payload)
+        self.assertEqual(opener.calls, 2)
+
+    def test_cached_result_is_rejected_after_external_metadata_damage(self) -> None:
+        temporary = tempfile.TemporaryDirectory(prefix="anklang-cache-gate-")
+        self.addCleanup(temporary.cleanup)
+        path = Path(temporary.name) / "index.db"
+        service = self._service(str(path))
+        backend = service.backend
+        assert isinstance(backend, LocalEngineBackend)
+        assert isinstance(backend.embedder, EmbeddingClient)
+        opener = backend.embedder._opener
+        assert isinstance(opener, _FakeEmbeddingOpener)
+        harness = _ServerHarness(service)
+        self.addCleanup(harness.close)
+        headers = {
+            "Authorization": "Bearer service-token-abcdef123456",
+            "Content-Type": "application/json",
+        }
+        body = json.dumps(_request()).encode("utf-8")
+
+        first_status, first_payload = harness.request(
+            "POST", "/api/v1/checks/similarity", body, headers
+        )
+        self.assertEqual(first_status, 200)
+        self.assertTrue(first_payload["candidates"])
+        self.assertEqual(opener.calls, 1)
+
+        connection = sqlite3.connect(path)
+        try:
+            connection.execute("DELETE FROM index_metadata")
+            connection.commit()
+        finally:
+            connection.close()
+
+        with (
+            patch("anklang.server.evaluate") as evaluate_mock,
+            patch.object(backend, "search", wraps=backend.search) as search_mock,
+        ):
+            for _ in range(2):
+                status, payload = harness.request(
+                    "POST", "/api/v1/checks/similarity", body, headers
+                )
+                self.assertEqual(status, 200)
+                self.assertEqual(payload["candidates"], [])
+                self.assertEqual(
+                    payload["recommendation"]["message"],
+                    "本次未能完成原题检索，请稍后重试并由审题人手工核对。",
+                )
+        evaluate_mock.assert_not_called()
+        self.assertEqual(search_mock.call_count, 2)
+        self.assertEqual(opener.calls, 1)
+        self.assertFalse(backend.describe_health()["indexMetadataReady"])
+
+    def test_external_vector_change_advances_cache_identity_after_revalidation(
+        self,
+    ) -> None:
+        temporary = tempfile.TemporaryDirectory(prefix="anklang-cache-version-")
+        self.addCleanup(temporary.cleanup)
+        path = Path(temporary.name) / "index.db"
+        service = self._service(str(path))
+        backend = service.backend
+        assert isinstance(backend, LocalEngineBackend)
+        assert isinstance(backend.embedder, EmbeddingClient)
+        opener = backend.embedder._opener
+        assert isinstance(opener, _FakeEmbeddingOpener)
+        harness = _ServerHarness(service)
+        self.addCleanup(harness.close)
+        headers = {
+            "Authorization": "Bearer service-token-abcdef123456",
+            "Content-Type": "application/json",
+        }
+        original_body = json.dumps(_request()).encode("utf-8")
+
+        first_status, _ = harness.request(
+            "POST", "/api/v1/checks/similarity", original_body, headers
+        )
+        self.assertEqual(first_status, 200)
+        self.assertEqual(opener.calls, 1)
+
+        connection = sqlite3.connect(path)
+        try:
+            connection.execute(
+                "UPDATE problems SET embedding = ? WHERE external_id = ?",
+                (pack_embedding([0.0, 1.0]), "array-sum"),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        revalidation_body = json.dumps(
+            _request(content_hash="e" * 64)
+        ).encode("utf-8")
+        revalidation_status, _ = harness.request(
+            "POST", "/api/v1/checks/similarity", revalidation_body, headers
+        )
+        self.assertEqual(revalidation_status, 200)
+        self.assertEqual(opener.calls, 2)
+
+        changed_status, changed_payload = harness.request(
+            "POST", "/api/v1/checks/similarity", original_body, headers
+        )
+        self.assertEqual(changed_status, 200)
+        self.assertEqual(opener.calls, 3)
+
+        repeated_status, repeated_payload = harness.request(
+            "POST", "/api/v1/checks/similarity", original_body, headers
+        )
+        self.assertEqual(repeated_status, 200)
+        self.assertEqual(repeated_payload, changed_payload)
+        self.assertEqual(opener.calls, 3)
+
     def test_embedding_failure_returns_candidates_without_caching(self) -> None:
         submitted_statement = "数组 求和 投题题面不可泄露标记"
         candidate_excerpt = "数组 求和 候选正文不可泄露标记"
@@ -226,6 +590,7 @@ class LocalEngineServerFlowTests(unittest.TestCase):
         config = _config(backend="local_engine", local_db_path=":memory:")
         store = ProblemStore(":memory:")
         self.addCleanup(store.close)
+        store.prepare_embedding_writes(_INDEX_SPEC)
         store.add_problem(
             source="unit-test",
             external_id="keyword-fallback",
@@ -233,6 +598,7 @@ class LocalEngineServerFlowTests(unittest.TestCase):
             statement=candidate_excerpt,
             content_hash="keyword-fallback-hash",
             embedding=[1.0, 0.0],
+            index_spec=_INDEX_SPEC,
         )
         opener = _FailingEmbeddingOpener(external_error)
         embedder = EmbeddingClient(
@@ -264,7 +630,10 @@ class LocalEngineServerFlowTests(unittest.TestCase):
         responses: list[dict[str, Any]] = []
         stderr = io.StringIO()
 
-        with contextlib.redirect_stderr(stderr):
+        with (
+            contextlib.redirect_stderr(stderr),
+            patch("anklang.server.evaluate") as evaluate_mock,
+        ):
             for _ in range(2):
                 status, payload = harness.request(
                     "POST",
@@ -274,13 +643,15 @@ class LocalEngineServerFlowTests(unittest.TestCase):
                 )
                 self.assertEqual(status, 200)
                 self.assertFalse(payload["recommendation"]["blockSubmission"])
+                self.assertEqual(payload["candidates"], [])
                 self.assertEqual(
-                    payload["candidates"][0]["externalId"],
-                    "keyword-fallback",
+                    payload["recommendation"]["message"],
+                    "本次未能完成原题检索，请稍后重试并由审题人手工核对。",
                 )
                 responses.append(payload)
 
         self.assertEqual(opener.calls, 2)
+        evaluate_mock.assert_not_called()
         serialized = json.dumps(responses, ensure_ascii=False)
         captured_stderr = stderr.getvalue()
         for secret in (submitted_statement, candidate_excerpt, external_error):
@@ -298,7 +669,73 @@ class LocalEngineServerFlowTests(unittest.TestCase):
         self.assertEqual(payload["backend"], "local_engine")
         self.assertEqual(payload["localProblemCount"], 1)
         self.assertTrue(payload["embeddingAvailable"])
+        self.assertTrue(payload["indexMetadataReady"])
+        self.assertTrue(payload["vectorIndexReady"])
         self.assertEqual(payload["status"], "ok")
+
+    def test_no_embedder_legacy_vectors_return_fixed_incomplete_result(self) -> None:
+        temporary = tempfile.TemporaryDirectory(prefix="anklang-legacy-index-")
+        self.addCleanup(temporary.cleanup)
+        path = Path(temporary.name) / "legacy.db"
+        spec = EmbeddingIndexSpec("old-model", 2)
+        builder = ProblemStore(str(path))
+        builder.prepare_embedding_writes(spec)
+        builder.add_problem(
+            source="unit-test",
+            external_id="legacy",
+            title="旧索引候选",
+            statement="数组 求和 旧索引候选",
+            content_hash="legacy-hash",
+            embedding=[1.0, 0.0],
+            index_spec=spec,
+        )
+        builder.close()
+        connection = sqlite3.connect(path)
+        connection.execute("DELETE FROM index_metadata")
+        connection.commit()
+        connection.close()
+
+        store = ProblemStore(str(path))
+        self.addCleanup(store.close)
+        config = _config(backend="local_engine", local_db_path=str(path))
+        backend = LocalEngineBackend(store, embedder=None)
+        service = AnklangService(
+            config,
+            backend,
+            ResultCache(config.cache_ttl_seconds, config.cache_max_entries),
+            None,
+        )
+        harness = _ServerHarness(service)
+        self.addCleanup(harness.close)
+        headers = {
+            "Authorization": "Bearer service-token-abcdef123456",
+            "Content-Type": "application/json",
+        }
+        body = json.dumps(_request(statement="数组 求和")).encode("utf-8")
+
+        with patch("anklang.server.evaluate") as evaluate_mock:
+            for _ in range(2):
+                status, payload = harness.request(
+                    "POST",
+                    "/api/v1/checks/similarity",
+                    body,
+                    headers,
+                )
+                self.assertEqual(status, 200)
+                self.assertEqual(payload["candidates"], [])
+                self.assertFalse(payload["recommendation"]["blockSubmission"])
+                self.assertEqual(
+                    payload["recommendation"]["message"],
+                    "本次未能完成原题检索，请稍后重试并由审题人手工核对。",
+                )
+        evaluate_mock.assert_not_called()
+        self.assertIsNone(service.cache.get("d" * 64))
+
+        status, health = harness.request("GET", "/api/v1/health")
+        self.assertEqual(status, 200)
+        self.assertEqual(health["status"], "degraded")
+        self.assertFalse(health["indexMetadataReady"])
+        self.assertEqual(health["vectorIndexStatus"], "legacy_vectors")
 
 
 if __name__ == "__main__":

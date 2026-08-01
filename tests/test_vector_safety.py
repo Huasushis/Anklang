@@ -5,6 +5,7 @@ import contextlib
 import io
 import json
 import math
+from dataclasses import replace
 import struct
 import unittest
 from typing import Any
@@ -14,7 +15,7 @@ from anklang.cache import ResultCache
 from anklang.config import AppConfig
 from anklang.embedding import EmbeddingClient, EmbeddingError
 from anklang.server import AnklangService, make_handler
-from anklang.store import StoredProblem
+from anklang.store import EmbeddingIndexSpec, SearchSnapshot, StoredProblem
 from anklang.vectormath import (
     cosine_similarity,
     pack_embedding,
@@ -78,6 +79,8 @@ def _deep_json(marker: str, depth: int = 2_000) -> bytes:
 
 
 def _embedding_client(payload: Any, *, dimensions: int = 2) -> EmbeddingClient:
+    if isinstance(payload, dict) and "model" not in payload:
+        payload = {**payload, "model": "test-model"}
     return EmbeddingClient(
         base_url="https://embedding.test/compatible-mode/v1",
         api_key="test-key",
@@ -150,8 +153,20 @@ class _ProblemListStore:
     def __init__(self, problems: list[StoredProblem]) -> None:
         self._problems = problems
 
-    def iter_all(self) -> list[StoredProblem]:
-        return self._problems
+    def search_snapshot(self, spec: EmbeddingIndexSpec | None) -> SearchSnapshot:
+        keyword = tuple(replace(problem, embedding=None) for problem in self._problems)
+        if spec is None:
+            return SearchSnapshot(keyword, False, "disabled")
+        try:
+            for problem in self._problems:
+                if problem.embedding is not None:
+                    validate_embedding(
+                        problem.embedding,
+                        expected_dimensions=spec.dimensions,
+                    )
+        except ValueError:
+            return SearchSnapshot(keyword, False, "invalid_vectors")
+        return SearchSnapshot(tuple(self._problems), True, "ready")
 
     def count(self) -> int:
         return len(self._problems)
@@ -160,8 +175,12 @@ class _ProblemListStore:
 class _StaticEmbedder:
     def __init__(self, vector: list[float]) -> None:
         self._vector = vector
+        self.model = "test-model"
+        self.dimensions = len(vector)
+        self.calls = 0
 
     def embed_one(self, _text: str) -> list[float]:
+        self.calls += 1
         return self._vector
 
 
@@ -233,6 +252,27 @@ class EmbeddingResponseSafetyTests(unittest.TestCase):
         with self.assertRaises(EmbeddingError):
             client.embed_batch(["first", "second"])
 
+    def test_requires_response_to_confirm_the_requested_model(self) -> None:
+        for response_model in (None, "same-dimension-other-model"):
+            with self.subTest(response_model=response_model):
+                payload: dict[str, Any] = {
+                    "data": [{"embedding": [1.0, 0.0]}]
+                }
+                if response_model is not None:
+                    payload["model"] = response_model
+                client = EmbeddingClient(
+                    base_url="https://embedding.test/compatible-mode/v1",
+                    api_key="test-key",
+                    model="test-model",
+                    dimensions=2,
+                    opener=_Opener(payload),
+                )
+                with self.assertRaisesRegex(
+                    EmbeddingError,
+                    "响应没有确认请求的模型",
+                ):
+                    client.embed_one("synthetic input")
+
     def test_deeply_nested_json_becomes_fixed_embedding_error(self) -> None:
         marker = "上游深层原文不可泄露标记"
         opener = _RawOpener(_deep_json(marker))
@@ -254,6 +294,7 @@ class EmbeddingResponseSafetyTests(unittest.TestCase):
             {
                 "百炼 embedding 响应不是有效 JSON。",
                 "百炼 embedding 响应条数与请求不一致。",
+                "百炼 embedding 响应没有确认请求的模型。",
             },
         )
         self.assertNotIn(marker, str(caught.exception))
@@ -360,7 +401,7 @@ class VectorStorageSafetyTests(unittest.TestCase):
 
 
 class LocalEngineVectorSafetyTests(unittest.TestCase):
-    def test_skips_damaged_stored_vectors_instead_of_ranking_them(self) -> None:
+    def test_one_damaged_vector_closes_the_whole_vector_path(self) -> None:
         problems = [
             _stored_problem(1, "valid", [1.0, 0.0]),
             _stored_problem(2, "nan", [math.nan, 0.0]),
@@ -369,17 +410,19 @@ class LocalEngineVectorSafetyTests(unittest.TestCase):
             _stored_problem(5, "wrong-dimension", [1.0]),
             _stored_problem(6, "empty", []),
         ]
+        embedder = _StaticEmbedder([1.0, 0.0])
         backend = LocalEngineBackend(
             _ProblemListStore(problems),  # type: ignore[arg-type]
-            _StaticEmbedder([1.0, 0.0]),  # type: ignore[arg-type]
+            embedder,  # type: ignore[arg-type]
             vector_top_k=20,
             keyword_top_k=20,
         )
 
-        results = backend.search("query-only", k=20).candidates
+        result = backend.search("valid candidate", k=20)
 
-        self.assertEqual([item["externalId"] for item in results], ["valid"])
-        self.assertEqual(results[0]["similarity"], 1.0)
+        self.assertTrue(result.degraded)
+        self.assertEqual(embedder.calls, 0)
+        self.assertTrue(result.candidates)
 
     def test_deep_upstream_json_keeps_keyword_results_without_caching(self) -> None:
         submitted_statement = "数组 求和 投题深层原文不可泄露标记"
@@ -427,9 +470,10 @@ class LocalEngineVectorSafetyTests(unittest.TestCase):
                 )
                 self.assertEqual(status, 200)
                 self.assertFalse(payload["recommendation"]["blockSubmission"])
+                self.assertEqual(payload["candidates"], [])
                 self.assertEqual(
-                    payload["candidates"][0]["externalId"],
-                    "keyword-fallback",
+                    payload["recommendation"]["message"],
+                    "本次未能完成原题检索，请稍后重试并由审题人手工核对。",
                 )
                 responses.append(payload)
 
