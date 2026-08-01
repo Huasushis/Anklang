@@ -92,9 +92,44 @@ v2 的顶层和各分支是严格结构，多字段或少字段都不合法：
 python3 -m anklang
 ```
 
-默认监听 `0.0.0.0:8730`。生产环境应由防火墙或反向代理只允许 Urmotiv 和运维健康检查访问；启用
-`ANKLANG_SERVICE_TOKEN` 后，两个 similarity 路径都使用同一 Bearer 令牌。不要用 shell 的
-`source` 或 `.` 读取真实环境文件。
+默认只监听 `127.0.0.1:8730`。非容器部署通常保持这个默认值，再由同机反向代理访问；只有明确的
+容器网络需要把 `ANKLANG_BIND_HOST` 设为 `0.0.0.0`，同时仍应让宿主映射只绑定回环地址。生产环境
+必须设置 `ANKLANG_REQUIRE_SERVICE_TOKEN=true` 和至少 16 字符的 `ANKLANG_SERVICE_TOKEN`；两个
+similarity 路径使用同一 Bearer 令牌。不要用 shell 的 `source` 或 `.` 读取真实环境文件。
+
+生产运行边界由以下变量控制，启动时严格校验；越界或拼写错误会直接拒绝启动：
+
+| 变量 | 默认值 | 允许范围 | 用途 |
+| --- | ---: | ---: | --- |
+| `ANKLANG_MAX_IN_FLIGHT_CHECKS` | 16 | 1..256 | 同时进入鉴权、正文读取和后端检索的查重数 |
+| `ANKLANG_CLIENT_IDLE_TIMEOUT_SECONDS` | 15 | 1..300 秒 | 客户端连续不发送正文数据的最长时间 |
+| `ANKLANG_SHUTDOWN_GRACE_SECONDS` | 30 | 1..300 秒 | 收到 `SIGTERM`/`SIGINT` 后等待在途请求的最长时间 |
+
+达到并发上限或服务正在退出时，v1/v2 查重都会在读取正文、调用检索或模型前固定返回 503
+`SERVICE_BUSY`，并带 `Retry-After: 1` 与 `Cache-Control: no-store`。收到退出信号后服务停止接收新
+查重，关闭监听套接字，并在宽限期内等待已经开始的请求；到期后请求线程不会继续阻止进程退出。
+正文读取连续无数据超时固定返回 408 `CLIENT_TIMEOUT`，这些错误都不包含题面、密钥或异常原文。
+
+## 独立容器部署
+
+`Dockerfile` 基于 Python 3.11 slim，只复制 `anklang/` 运行包和许可证；构建上下文采用默认拒绝清单，
+不会把 `.env`、私有目录、题库、缓存、数据库、报告、测试或 Git 元数据复制进镜像层。镜像中的服务
+使用固定非 root 用户。`compose.yaml` 进一步启用只读根文件系统、移除全部 Linux capabilities
+（进程的额外系统权限）、禁止获取新权限并限制进程数；只有 `/app/problems-data` 命名卷和小型
+`/tmp` 临时文件系统可写。
+
+1. 在仓库根目录创建不进 Git 的 `.env`，权限设为仅当前用户可读写；至少配置一个长度不小于 16 的
+   `ANKLANG_SERVICE_TOKEN`。Compose 会直接读取它，不要 `source`，也不要把展开配置后的输出写入日志。
+2. 运行 `docker compose up --build -d`。容器内显式监听 `0.0.0.0:8730`，宿主端口固定映射到
+   `127.0.0.1:${ANKLANG_PORT:-8730}`，不会直接监听所有宿主网卡。
+3. 用 `GET http://127.0.0.1:8730/api/v1/live` 检查进程存活，再用 `/api/v1/health` 检查后端就绪。
+   Docker 健康检查只调用 `/live`，不会因监控探针触发任何外部请求。
+4. 停止时 Compose 默认给 45 秒，应用内部默认给 30 秒；前者必须始终大于后者。若在 `.env` 修改
+   `ANKLANG_SHUTDOWN_GRACE_SECONDS`，也要把 `ANKLANG_STOP_GRACE_PERIOD` 设为更大的秒数值（例如
+   `75s`），Compose 会把两者分别传给应用和容器运行时。
+
+生产数据只放在 `anklang-problems-data` 卷。备份或替换本地索引时按 README 的非破坏性重建流程
+处理，不把宿主私有目录整体复制进镜像，也不把 Anklang 连接到 Urmotiv 的数据库。
 
 部署前在服务器仓库中运行：
 

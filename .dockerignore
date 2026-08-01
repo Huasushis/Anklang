@@ -1,0 +1,13 @@
+# 默认拒绝整个构建上下文，只放行运行包与许可证。这样新增的 .env、
+# private、problems-data、cache、报告、日志或测试资料也不会意外进入镜像层。
+**
+!anklang/
+!anklang/*.py
+!anklang/backends/
+!anklang/backends/*.py
+!anklang/sources/
+!anklang/sources/*.py
+!anklang/sources/example_static/
+!anklang/sources/example_static/__init__.py
+!anklang/sources/example_static/problems.json
+!LICENSE

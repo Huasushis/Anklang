@@ -5,8 +5,10 @@
 
 > 当前状态（2026-08-01）：仓库已经使用 Python 3.11 标准库完成服务、接口校验、转发检索、
 > 本地检索框架和来源导入框架，不依赖 FastAPI、Pydantic 或其他第三方包。本文件保留最初的取舍、
-> 风险和分阶段安排。当前实现还新增了独立的 v2 完整性/复用契约；本节后面的 v1 流程是历史设计，
-> 当前运行和迁移方式以根目录 `README.md`、`.env.example` 与 `docs/deployment.md` 为准。
+> 风险和分阶段安排。当前实现还新增了独立的 v2 完整性/复用契约、有界并发、慢正文时限、信号退出
+> 和独立的加固容器部署；本节后面的 v1 流程与 FastAPI/Docker
+> 设想是历史设计，当前运行和迁移方式以根目录 `README.md`、`.env.example`、`compose.yaml` 与
+> `docs/deployment.md` 为准。
 
 本文档面向从零开始实现 Anklang 的接手人，配合仓库根目录的 `AGENTS.md`（开发约定与安全红线）和
 `README.md`（项目定位与文档索引）一起阅读。三份文档共同保证：不看 Urmotiv 主仓库的任何其他材料，
@@ -398,6 +400,12 @@ LOG_LEVEL=info
 （已被 `.gitignore` 排除），与 Urmotiv 的 `.env.example` 惯例一致。
 
 ### 2.10 Docker 部署
+
+> 当前实现说明（2026-08-01）：本节最初的 8090/FastAPI 示例已由仓库根目录的正式
+> `Dockerfile` 和 `compose.yaml` 取代。正式容器使用 Python 3.11 标准库服务、容器内
+> `0.0.0.0:8730`、宿主回环地址映射、强制服务令牌、`/api/v1/live` 本地健康检查、非 root 用户、
+> 只读根文件系统、移除全部额外能力并只挂载必要数据卷。停止宽限大于应用内部宽限。精确启动和
+> 安全检查见 `docs/deployment.md`；下面内容只保留为最初设计背景，不应直接复制部署。
 
 - Anklang 自己在仓库根目录提供一份 `compose.yaml`（阶段 1 实现时创建），一个 `anklang` 服务，
   基于 `python:3.11-slim` 构建，暴露 `ANKLANG_HTTP_PORT`，健康检查请求自己的 `/api/v1/health`

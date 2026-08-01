@@ -82,6 +82,23 @@ serviceToken 密钥填成进程收到的同一个令牌即可。`.env.example` �
 加载密钥文件，特殊字符可能导致命令失败并把密钥回显到终端。
 独立部署和从 v1 切换到 v2 的步骤见 [`docs/deployment.md`](docs/deployment.md)。
 
+生产环境应把 `ANKLANG_REQUIRE_SERVICE_TOKEN=true`，否则配置遗漏可能把无鉴权服务启动起来。服务
+会限制同时进行的查重数；满载或进入退出流程后，在读取正文和调用后端前固定返回 503
+`SERVICE_BUSY`。慢客户端正文有连续无数据时限；收到 `SIGTERM` 或 `SIGINT` 后停止接收新查重，
+并只在配置的宽限时间内等待已经开始的请求。具体变量与取值范围见 `.env.example`。
+
+### Docker Compose
+
+仓库根目录提供独立的 `compose.yaml`。先在不进 Git、权限仅当前用户可读的 `.env` 中配置至少
+16 字符的 `ANKLANG_SERVICE_TOKEN`，再运行 `docker compose up --build -d`；不要用 `source` 或
+`.` 加载这个文件，也不要把会展开令牌的 `docker compose config` 输出保存到日志。
+
+容器内明确监听 `0.0.0.0:8730`，宿主端口则固定只绑定 `127.0.0.1`。镜像以非 root 用户运行；
+Compose 使用只读根文件系统、移除全部 Linux capabilities（进程的额外系统权限）、禁止获取新权限，
+且只给 `/app/problems-data` 和临时目录必要的写权限。健康检查只访问本地 `/api/v1/live`；
+默认 45 秒的容器停止宽限大于应用默认的 30 秒宽限。若覆盖任一数值，
+`ANKLANG_STOP_GRACE_PERIOD` 必须始终大于 `ANKLANG_SHUTDOWN_GRACE_SECONDS`。
+
 ### 使用本地检索与来源导入
 
 把 `ANKLANG_BACKEND` 设为 `local_engine` 后，服务会使用本地 SQLite 文件。SQLite 是 Python
