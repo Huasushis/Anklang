@@ -14,9 +14,9 @@ Top-K2，取并集去重后，统一交给 LLM 复核环节做最终判断，不
   逐字照抄"这种字面高度重合的情况——这正是 docs/plan.md 3.5 节里关键词检索要
   补充覆盖的场景。
 
-题库为空、或没配置 embedding 服务时这个后端都能正常工作（分别表现为搜不到东西、
-只做关键词召回），不会因此报错——与阶段 1 的"优雅降级"设计取向一致，这也是它可以
-在没有真实 embedding 凭据的环境里先跑起来、之后再补 embedding 的原因。
+没配置 embedding 服务时，只要目标关键词索引身份完整，就会正常完成关键词召回；空题库、
+索引身份不完整或已配置的 embedding 调用失败会明确返回不可用或部分完成，不能把未检索到
+误报为“没有候选”。
 """
 from __future__ import annotations
 
@@ -66,14 +66,20 @@ class LocalEngineBackend:
             raise BackendError("本地题库读取失败。") from error
 
         problems = snapshot.problems
-        degraded = snapshot.vector_status not in {"ready", "disabled"}
+        complete = snapshot.vector_status in {"ready", "disabled"}
+        partial_retryable = snapshot.vector_status in {
+            "incomplete_vectors",
+            "verification_required",
+        }
         if not problems:
-            return BackendSearchResult(
-                candidates=[],
-                degraded=degraded,
-                cache_identity=(
-                    snapshot.cache_identity if not degraded else None
-                ),
+            if complete:
+                return BackendSearchResult(
+                    candidates=[],
+                    cache_identity=snapshot.cache_identity,
+                )
+            return BackendSearchResult.unavailable(
+                reason_code="search_backend_unavailable",
+                retryable=False,
             )
 
         query_vector: list[float] | None = None
@@ -83,7 +89,8 @@ class LocalEngineBackend:
             except EmbeddingError:
                 # 已配置的文字转数字服务调用失败时仍做关键词检索，但要让服务层知道
                 # 结果不完整，从而不缓存；未配置服务本来就是正常的关键词模式。
-                degraded = True
+                complete = False
+                partial_retryable = True
 
         query_tokens = _tokenize(query_text)
 
@@ -115,10 +122,16 @@ class LocalEngineBackend:
                 merged[key] = _to_candidate(problem, score)
 
         ranked = sorted(merged.values(), key=lambda item: item["similarity"], reverse=True)
-        return BackendSearchResult(
-            candidates=ranked[:k],
-            degraded=degraded,
-            cache_identity=(snapshot.cache_identity if not degraded else None),
+        candidates = ranked[:k]
+        if complete:
+            return BackendSearchResult(
+                candidates=candidates,
+                cache_identity=snapshot.cache_identity,
+            )
+        return BackendSearchResult.partial(
+            candidates,
+            reason_code="search_partial",
+            retryable=partial_retryable,
         )
 
     def current_cache_identity(self) -> str | None:

@@ -27,6 +27,7 @@ from anklang.embedding import EmbeddingClient
 from anklang.server import AnklangService, build_backend, make_handler
 from anklang.store import EmbeddingIndexSpec, ProblemStore
 from anklang.vectormath import pack_embedding
+from anklang.yuantiji import YuantijiSearchResult
 
 _INDEX_SPEC = EmbeddingIndexSpec("text-embedding-v4", 2)
 
@@ -100,16 +101,18 @@ class _FakeEmbeddingOpener:
 
 
 class _FakeYuantijiClient:
-    def search(self, *, query: str, k: int, rerank: bool) -> list[dict[str, Any]]:
+    def search(self, *, query: str, k: int, rerank: bool) -> YuantijiSearchResult:
         self.last_search = (query, k, rerank)
-        return [
-            {
-                "source": "unit-test",
-                "externalId": "one",
-                "title": "示例候选",
-                "similarity": 0.8,
-            }
-        ]
+        return YuantijiSearchResult(
+            candidates=[
+                {
+                    "source": "unit-test",
+                    "externalId": "one",
+                    "title": "示例候选",
+                    "similarity": 0.8,
+                }
+            ]
+        )
 
     def health(self) -> dict[str, Any]:
         return {"ok": True}
@@ -166,7 +169,7 @@ class BuildBackendTests(unittest.TestCase):
         search_result = backend.search("自编测试题面", 3)
 
         self.assertIsInstance(search_result, BackendSearchResult)
-        self.assertFalse(search_result.degraded)
+        self.assertEqual(search_result.status, "complete")
         self.assertEqual(search_result.candidates[0]["externalId"], "one")
         self.assertEqual(client.last_search, ("自编测试题面", 3, False))
 
@@ -248,12 +251,8 @@ class LocalEngineServerFlowTests(unittest.TestCase):
                             body,
                             headers,
                         )
-                        self.assertEqual(status, 200)
-                        self.assertEqual(payload["candidates"], [])
-                        self.assertEqual(
-                            payload["recommendation"]["message"],
-                            "本次未能完成原题检索，请稍后重试并由审题人手工核对。",
-                        )
+                        self.assertEqual(status, 503)
+                        self.assertEqual(payload["error"]["code"], "CHECK_INCOMPLETE")
                         self.assertIsNone(service.cache.get("d" * 64))
                         health_status, health = harness.request(
                             "GET", "/api/v1/health"
@@ -349,22 +348,13 @@ class LocalEngineServerFlowTests(unittest.TestCase):
             statement="合成测试文本",
             content_hash="missing-vector-hash",
         )
-        with (
-            patch("anklang.server.evaluate") as evaluate_mock,
-            patch.object(backend, "search", wraps=backend.search) as search_mock,
-        ):
+        with patch.object(backend, "search", wraps=backend.search) as search_mock:
             for _ in range(2):
                 status, payload = harness.request(
                     "POST", "/api/v1/checks/similarity", body, headers
                 )
-                self.assertEqual(status, 200)
-                self.assertEqual(payload["candidates"], [])
-                self.assertFalse(payload["recommendation"]["blockSubmission"])
-                self.assertEqual(
-                    payload["recommendation"]["message"],
-                    "本次未能完成原题检索，请稍后重试并由审题人手工核对。",
-                )
-        evaluate_mock.assert_not_called()
+                self.assertEqual(status, 503)
+                self.assertEqual(payload["error"]["code"], "CHECK_INCOMPLETE")
         self.assertEqual(search_mock.call_count, 2)
         self.assertEqual(opener.calls, 1)
         self.assertEqual(
@@ -506,21 +496,13 @@ class LocalEngineServerFlowTests(unittest.TestCase):
         finally:
             connection.close()
 
-        with (
-            patch("anklang.server.evaluate") as evaluate_mock,
-            patch.object(backend, "search", wraps=backend.search) as search_mock,
-        ):
+        with patch.object(backend, "search", wraps=backend.search) as search_mock:
             for _ in range(2):
                 status, payload = harness.request(
                     "POST", "/api/v1/checks/similarity", body, headers
                 )
-                self.assertEqual(status, 200)
-                self.assertEqual(payload["candidates"], [])
-                self.assertEqual(
-                    payload["recommendation"]["message"],
-                    "本次未能完成原题检索，请稍后重试并由审题人手工核对。",
-                )
-        evaluate_mock.assert_not_called()
+                self.assertEqual(status, 503)
+                self.assertEqual(payload["error"]["code"], "CHECK_INCOMPLETE")
         self.assertEqual(search_mock.call_count, 2)
         self.assertEqual(opener.calls, 1)
         self.assertFalse(backend.describe_health()["indexMetadataReady"])
@@ -626,32 +608,29 @@ class LocalEngineServerFlowTests(unittest.TestCase):
             "Authorization": "Bearer service-token-abcdef123456",
             "Content-Type": "application/json",
         }
-        body = json.dumps(_request(statement=submitted_statement)).encode("utf-8")
+        request = _request(statement=submitted_statement)
+        request["apiVersion"] = "2"
+        body = json.dumps(request).encode("utf-8")
         responses: list[dict[str, Any]] = []
         stderr = io.StringIO()
 
-        with (
-            contextlib.redirect_stderr(stderr),
-            patch("anklang.server.evaluate") as evaluate_mock,
-        ):
+        with contextlib.redirect_stderr(stderr):
             for _ in range(2):
                 status, payload = harness.request(
                     "POST",
-                    "/api/v1/checks/similarity",
+                    "/api/v2/checks/similarity",
                     body,
                     headers,
                 )
                 self.assertEqual(status, 200)
                 self.assertFalse(payload["recommendation"]["blockSubmission"])
-                self.assertEqual(payload["candidates"], [])
-                self.assertEqual(
-                    payload["recommendation"]["message"],
-                    "本次未能完成原题检索，请稍后重试并由审题人手工核对。",
-                )
+                self.assertEqual(payload["completion"]["status"], "partial")
+                self.assertEqual(payload["completion"]["reasonCode"], "search_partial")
+                self.assertEqual(payload["reuse"], {"policy": "no-store"})
+                self.assertEqual(payload["candidates"][0]["externalId"], "keyword-fallback")
                 responses.append(payload)
 
         self.assertEqual(opener.calls, 2)
-        evaluate_mock.assert_not_called()
         serialized = json.dumps(responses, ensure_ascii=False)
         captured_stderr = stderr.getvalue()
         for secret in (submitted_statement, candidate_excerpt, external_error):
@@ -713,22 +692,15 @@ class LocalEngineServerFlowTests(unittest.TestCase):
         }
         body = json.dumps(_request(statement="数组 求和")).encode("utf-8")
 
-        with patch("anklang.server.evaluate") as evaluate_mock:
-            for _ in range(2):
-                status, payload = harness.request(
-                    "POST",
-                    "/api/v1/checks/similarity",
-                    body,
-                    headers,
-                )
-                self.assertEqual(status, 200)
-                self.assertEqual(payload["candidates"], [])
-                self.assertFalse(payload["recommendation"]["blockSubmission"])
-                self.assertEqual(
-                    payload["recommendation"]["message"],
-                    "本次未能完成原题检索，请稍后重试并由审题人手工核对。",
-                )
-        evaluate_mock.assert_not_called()
+        for _ in range(2):
+            status, payload = harness.request(
+                "POST",
+                "/api/v1/checks/similarity",
+                body,
+                headers,
+            )
+            self.assertEqual(status, 503)
+            self.assertEqual(payload["error"]["code"], "CHECK_INCOMPLETE")
         self.assertIsNone(service.cache.get("d" * 64))
 
         status, health = harness.request("GET", "/api/v1/health")

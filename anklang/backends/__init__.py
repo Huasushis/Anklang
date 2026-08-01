@@ -12,30 +12,153 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, Literal, Protocol, runtime_checkable
+
+
+CompletionStatus = Literal["complete", "partial", "unavailable"]
+CompletionReason = Literal[
+    "complete",
+    "search_timeout",
+    "search_rate_limited",
+    "search_backend_unavailable",
+    "search_backend_invalid",
+    "search_partial",
+    "review_unavailable",
+    "service_unavailable",
+    "service_invalid_response",
+    "internal_error",
+]
+
+_NONCOMPLETE_REASONS = {
+    "search_timeout",
+    "search_rate_limited",
+    "search_backend_unavailable",
+    "search_backend_invalid",
+    "search_partial",
+    "review_unavailable",
+    "service_unavailable",
+    "service_invalid_response",
+    "internal_error",
+}
 
 
 class BackendError(RuntimeError):
-    """检索后端不可用或调用失败。server 捕获这个异常，统一转换成"降级但合法"的
-    响应（候选为空、message 说明情况），不让 Urmotiv 一侧收到无法解释的失败——
-    呼应 docs/plan.md 2.2 节"设计含义"里对降级优先于报错的要求。
+    """后端连一份可信的结构化结果也无法形成。
+
+    异常文本只供进程内调试，HTTP 层绝不回显；固定原因和重试信息才允许进入 v2
+    契约。预期的远程故障通常由后端直接返回 ``BackendSearchResult.unavailable``，
+    这个异常主要兜住本地存储等意外失败。
     """
+
+    def __init__(
+        self,
+        message: str = "检索后端不可用。",
+        *,
+        reason_code: CompletionReason = "service_unavailable",
+        retryable: bool = True,
+        retry_after_seconds: int | None = None,
+    ) -> None:
+        if reason_code not in _NONCOMPLETE_REASONS:
+            raise ValueError("BackendError 必须使用非完整原因码。")
+        if not isinstance(retryable, bool):
+            raise ValueError("BackendError 的重试状态不合法。")
+        if retry_after_seconds is not None and (
+            isinstance(retry_after_seconds, bool)
+            or not isinstance(retry_after_seconds, int)
+            or not 1 <= retry_after_seconds <= 86_400
+        ):
+            raise ValueError("retry_after_seconds 不合法。")
+        if retry_after_seconds is not None and not retryable:
+            raise ValueError("不可重试的错误不能带重试等待时间。")
+        self.reason_code = reason_code
+        self.retryable = retryable
+        self.retry_after_seconds = retry_after_seconds
+        super().__init__(message)
 
 
 @dataclass(frozen=True)
 class BackendSearchResult:
     """一次后端检索的内部结果，不会直接作为 HTTP 响应发送。
 
-    degraded 表示本次检索有一部分没有完成，例如本地文字转数字服务失败后只做了
-    关键词检索。候选只供后端内部诊断测试使用；服务层必须返回固定的“检索未完成”
-    结果，不能据此自动放行、拒绝、调用模型复核或写入缓存。
+    ``status`` 明确区分完整、部分完成和不可用，避免旧 ``degraded`` 布尔值把
+    “仍有可信关键词候选”和“什么都没查到”混在一起。非完整结果绝不进入缓存；
+    部分结果可以展示候选，但不能仅凭相似度阈值自动拦截。
     """
 
     candidates: list[dict[str, Any]]
-    degraded: bool
+    status: CompletionStatus = "complete"
+    reason_code: CompletionReason = "complete"
+    retryable: bool = False
+    retry_after_seconds: int | None = None
     # 本地索引成功结果所属的机器身份摘要；远程后端保持 None。服务层只会在
     # 当前 O(1) 门禁仍返回同一摘要时缓存，避免跨语料或跨模型复用旧判断。
     cache_identity: str | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.candidates, list):
+            raise ValueError("后端候选必须是列表。")
+        if not isinstance(self.retryable, bool):
+            raise ValueError("后端重试状态必须是布尔值。")
+        if self.cache_identity is not None and (
+            not isinstance(self.cache_identity, str) or not self.cache_identity
+        ):
+            raise ValueError("后端缓存身份必须是文本。")
+        if self.status == "complete":
+            if self.reason_code != "complete" or self.retryable:
+                raise ValueError("完整检索必须使用 complete/不可重试状态。")
+            if self.retry_after_seconds is not None:
+                raise ValueError("完整检索不能带重试等待时间。")
+        elif self.status in {"partial", "unavailable"}:
+            if self.reason_code not in _NONCOMPLETE_REASONS:
+                raise ValueError("非完整检索的原因码不合法。")
+            if self.status == "unavailable" and self.candidates:
+                raise ValueError("不可用检索不能携带候选。")
+            if self.cache_identity is not None:
+                raise ValueError("非完整检索不能携带缓存身份。")
+        else:
+            raise ValueError("检索完成状态不合法。")
+        retry_after = self.retry_after_seconds
+        if retry_after is not None and (
+            isinstance(retry_after, bool)
+            or not isinstance(retry_after, int)
+            or not 1 <= retry_after <= 86_400
+        ):
+            raise ValueError("retry_after_seconds 不合法。")
+        if retry_after is not None and not self.retryable:
+            raise ValueError("不可重试的结果不能带重试等待时间。")
+
+    @classmethod
+    def partial(
+        cls,
+        candidates: list[dict[str, Any]],
+        *,
+        reason_code: CompletionReason = "search_partial",
+        retryable: bool = True,
+        retry_after_seconds: int | None = None,
+    ) -> "BackendSearchResult":
+        return cls(
+            candidates=candidates,
+            status="partial",
+            reason_code=reason_code,
+            retryable=retryable,
+            retry_after_seconds=retry_after_seconds,
+        )
+
+    @classmethod
+    def unavailable(
+        cls,
+        *,
+        reason_code: CompletionReason,
+        retryable: bool,
+        retry_after_seconds: int | None = None,
+    ) -> "BackendSearchResult":
+        return cls(
+            candidates=[],
+            status="unavailable",
+            reason_code=reason_code,
+            retryable=retryable,
+            retry_after_seconds=retry_after_seconds,
+        )
 
 
 @runtime_checkable

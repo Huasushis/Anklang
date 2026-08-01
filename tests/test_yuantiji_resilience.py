@@ -103,12 +103,19 @@ class _DelayedLock:
         self.releases += 1
 
 
-def _http_error(status: int) -> urllib.error.HTTPError:
+def _http_error(
+    status: int, *, retry_after_seconds: int | None = None
+) -> urllib.error.HTTPError:
+    headers = (
+        {"Retry-After": str(retry_after_seconds)}
+        if retry_after_seconds is not None
+        else {}
+    )
     return urllib.error.HTTPError(
         "https://yuantiji.test/api/search",
         status,
         "scripted",
-        {},
+        headers,
         io.BytesIO(b""),
     )
 
@@ -179,9 +186,45 @@ class YuantijiResilienceTests(unittest.TestCase):
         opener = _ScriptedOpener([_http_error(503), {"results": []}])
         client = _client(opener, fake_time, max_retries=1)
 
-        self.assertEqual(client.search("test", k=8, rerank=False), [])
+        self.assertEqual(client.search("test", k=8, rerank=False).candidates, [])
         self.assertEqual(len(opener.calls), 2)
         self.assertEqual(fake_time.sleeps, [0.5])
+
+    def test_rate_limit_retry_honors_longer_retry_after(self) -> None:
+        fake_time = _FakeTime()
+        opener = _ScriptedOpener(
+            [_http_error(429, retry_after_seconds=3), {"results": []}]
+        )
+        client = _client(
+            opener,
+            fake_time,
+            max_retries=1,
+            retry_base_delay_seconds=0.5,
+            search_budget_seconds=10.0,
+        )
+
+        self.assertEqual(client.search("test", k=8, rerank=False).candidates, [])
+        self.assertEqual(len(opener.calls), 2)
+        self.assertEqual(fake_time.sleeps, [3.0])
+
+    def test_rate_limit_does_not_retry_early_when_budget_is_short(self) -> None:
+        fake_time = _FakeTime()
+        opener = _ScriptedOpener(
+            [_http_error(429, retry_after_seconds=30), {"results": []}]
+        )
+        client = _client(
+            opener,
+            fake_time,
+            max_retries=1,
+            search_budget_seconds=5.0,
+        )
+
+        with self.assertRaises(YuantijiError) as caught:
+            client.search("test", k=8, rerank=False)
+        self.assertEqual(caught.exception.reason_code, "search_rate_limited")
+        self.assertEqual(caught.exception.retry_after_seconds, 30)
+        self.assertEqual(len(opener.calls), 1)
+        self.assertEqual(fake_time.sleeps, [])
 
     def test_queue_time_reduces_first_network_timeout(self) -> None:
         fake_time = _FakeTime()
@@ -194,7 +237,7 @@ class YuantijiResilienceTests(unittest.TestCase):
             search_budget_seconds=6.0,
         )
 
-        self.assertEqual(client.search("test", k=8, rerank=False), [])
+        self.assertEqual(client.search("test", k=8, rerank=False).candidates, [])
         self.assertEqual(opener.calls[0][1], 2.0)
         self.assertEqual(request_lock.releases, 1)
         self.assertEqual(fake_time.now, 104.0)
@@ -232,7 +275,7 @@ class YuantijiResilienceTests(unittest.TestCase):
             search_budget_seconds=13.5,
         )
 
-        self.assertEqual(client.search("test", k=8, rerank=False), [])
+        self.assertEqual(client.search("test", k=8, rerank=False).candidates, [])
         self.assertEqual([call[1] for call in opener.calls], [12.0, 0.5])
         self.assertEqual(fake_time.sleeps, [12.0, 1.0])
 
@@ -267,7 +310,7 @@ class YuantijiResilienceTests(unittest.TestCase):
             search_budget_seconds=1.0,
         )
 
-        self.assertEqual(client.search("first", k=8, rerank=False), [])
+        self.assertEqual(client.search("first", k=8, rerank=False).candidates, [])
         with self.assertRaises(YuantijiError):
             client.search("second", k=8, rerank=False)
         self.assertEqual(len(opener.calls), 1)
@@ -308,7 +351,7 @@ class YuantijiResilienceTests(unittest.TestCase):
         )
         client = _client(opener, fake_time, max_retries=1)
 
-        self.assertEqual(client.search("test", k=8, rerank=False), [])
+        self.assertEqual(client.search("test", k=8, rerank=False).candidates, [])
         self.assertEqual(len(opener.calls), 2)
 
     def test_huge_json_number_and_score_overflow_are_safe_failures(self) -> None:
@@ -355,7 +398,7 @@ class YuantijiResilienceTests(unittest.TestCase):
         self.assertEqual(len(opener.calls), 2)
 
         fake_time.now += 61.0
-        self.assertEqual(client.search("four", k=8, rerank=False), [])
+        self.assertEqual(client.search("four", k=8, rerank=False).candidates, [])
         self.assertEqual(len(opener.calls), 3)
 
     def test_health_success_and_failure_are_cached(self) -> None:
@@ -450,7 +493,7 @@ class YuantijiResilienceTests(unittest.TestCase):
         )
 
         self.assertFalse(client.health()["ok"])
-        self.assertEqual(client.search("test", k=8, rerank=False), [])
+        self.assertEqual(client.search("test", k=8, rerank=False).candidates, [])
         self.assertEqual(len(opener.calls), 2)
 
     def test_health_can_probe_again_when_search_pause_expires(self) -> None:
@@ -490,8 +533,12 @@ class YuantijiResilienceTests(unittest.TestCase):
             ]
         )
         client = _client(opener, fake_time)
-        candidates = client.search("test", k=8, rerank=False)
-        self.assertEqual([item["externalId"] for item in candidates], ["example/1"])
+        result = client.search("test", k=8, rerank=False)
+        self.assertEqual(
+            [item["externalId"] for item in result.candidates], ["example/1"]
+        )
+        self.assertTrue(result.partial)
+        self.assertEqual(result.reason_code, "search_backend_invalid")
 
     def test_candidate_text_limits_use_javascript_string_length(self) -> None:
         exact = {
@@ -553,9 +600,11 @@ class YuantijiResilienceTests(unittest.TestCase):
         second_result = service.check_similarity(request)
 
         for result in (first_result, second_result):
-            self.assertEqual(result["apiVersion"], "1")
+            self.assertEqual(result["apiVersion"], "2")
             self.assertEqual(result["candidates"], [])
             self.assertFalse(result["recommendation"]["blockSubmission"])
+            self.assertEqual(result["completion"]["status"], "unavailable")
+            self.assertEqual(result["reuse"], {"policy": "no-store"})
             self.assertNotIn(
                 private_marker,
                 json.dumps(result, ensure_ascii=False),
@@ -597,10 +646,12 @@ class YuantijiResilienceTests(unittest.TestCase):
                         "tag_ids": ["test"],
                     }
                 )
-                self.assertEqual(result["apiVersion"], "1")
+                self.assertEqual(result["apiVersion"], "2")
                 self.assertEqual(result["contentHash"], "a" * 64)
                 self.assertEqual(result["candidates"], [])
                 self.assertFalse(result["recommendation"]["blockSubmission"])
+                self.assertEqual(result["completion"]["status"], "unavailable")
+                self.assertEqual(result["reuse"], {"policy": "no-store"})
                 self.assertNotIn(
                     "scripted",
                     json.dumps(result, ensure_ascii=False),
@@ -645,10 +696,11 @@ class YuantijiResilienceTests(unittest.TestCase):
             second_result = service.check_similarity(request)
 
         for result in (first_result, second_result):
-            self.assertEqual(result["apiVersion"], "1")
+            self.assertEqual(result["apiVersion"], "2")
             self.assertEqual(result["contentHash"], "b" * 64)
             self.assertEqual(result["candidates"], [])
             self.assertFalse(result["recommendation"]["blockSubmission"])
+            self.assertEqual(result["completion"]["status"], "unavailable")
             serialized_result = json.dumps(result, ensure_ascii=False)
             self.assertNotIn(submitted_statement, serialized_result)
             self.assertNotIn(upstream_private_text, serialized_result)

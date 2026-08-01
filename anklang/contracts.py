@@ -5,7 +5,7 @@ anklangRequestSchema / anklangResultSchema）。任何不一致都会被 Urmotiv
 拒绝，所以这里宁可自己先报错，也不要发出不合规的响应。
 
 关键约束（容易踩坑）：
-- apiVersion 恒为字符串 "1"；
+- 路径和正文版本必须严格一致；v1 恒为 "1"，v2 恒为 "2"；
 - 响应里 contentHash 必须原样回显请求里的值；
 - checkedAt 必须是带 Z 的 UTC 时间；
 - similarity 在 [0, 1]；candidates 最多 50 条；
@@ -39,22 +39,46 @@ _JS_TRIM_CHARACTERS = (
     "\u2028\u2029\u202f\u205f\u3000\ufeff"
 )
 _PROBLEM_TYPES = {"traditional", "interactive", "submit_answer"}
+_COMPLETION_STATUSES = {"complete", "partial", "unavailable"}
+_NONCOMPLETE_REASON_CODES = {
+    "search_timeout",
+    "search_rate_limited",
+    "search_backend_unavailable",
+    "search_backend_invalid",
+    "search_partial",
+    "review_unavailable",
+    "service_unavailable",
+    "service_invalid_response",
+    "internal_error",
+}
+_MAX_REUSE_SECONDS = 7 * 24 * 60 * 60
 MAX_CANDIDATES = 50
 MAX_RESPONSE_BYTES = 2_000_000
 _REQUEST_KEYS = {"apiVersion", "requestId", "contentHash", "problem"}
 _PROBLEM_KEYS = {"title", "type", "tagIds", "basicStatement"}
+_V2_RESULT_KEYS = {
+    "apiVersion",
+    "contentHash",
+    "checkedAt",
+    "completion",
+    "candidates",
+    "recommendation",
+    "reuse",
+}
 
 
 class ContractError(ValueError):
     """请求或即将发出的响应不符合契约。"""
 
 
-def parse_request(payload: Any) -> dict[str, Any]:
+def parse_request(payload: Any, expected_api_version: str = "1") -> dict[str, Any]:
+    if expected_api_version not in {"1", "2"}:
+        raise ValueError("服务端请求版本配置不合法。")
     if not isinstance(payload, dict):
         raise ContractError("请求正文必须是 JSON 对象。")
     _require_exact_keys(payload, _REQUEST_KEYS, "请求正文")
-    if payload.get("apiVersion") != "1":
-        raise ContractError("apiVersion 必须是字符串 \"1\"。")
+    if payload.get("apiVersion") != expected_api_version:
+        raise ContractError(f"apiVersion 必须是字符串 \"{expected_api_version}\"。")
 
     request_id = payload.get("requestId")
     if not isinstance(request_id, str) or not _is_uuid(request_id):
@@ -109,6 +133,12 @@ def _utc_now_z() -> str:
     return now.strftime("%Y-%m-%dT%H:%M:%S.") + f"{now.microsecond // 1000:03d}Z"
 
 
+def utc_now_z() -> str:
+    """生成契约使用的毫秒精度 UTC 时间。"""
+
+    return _utc_now_z()
+
+
 def build_result(
     content_hash: str,
     candidates: list[dict[str, Any]],
@@ -125,6 +155,113 @@ def build_result(
     if not isinstance(message, str):
         raise ContractError("响应说明必须是文本。")
 
+    normalized = _normalize_candidates(candidates)
+    trimmed_message = _bounded_required(message, 2000, "recommendation.message")
+    normalized_checked_at = checked_at or _utc_now_z()
+    _parse_utc_z(normalized_checked_at, "checkedAt")
+    result = {
+        "apiVersion": "1",
+        "contentHash": content_hash,
+        "checkedAt": normalized_checked_at,
+        "candidates": normalized,
+        "recommendation": {
+            "blockSubmission": block_submission,
+            "message": trimmed_message,
+        },
+    }
+    _validate_response_size(result)
+    return result
+
+
+def build_v2_result(
+    content_hash: str,
+    candidates: list[dict[str, Any]],
+    block_submission: bool,
+    message: str,
+    completion: dict[str, Any],
+    reuse: dict[str, Any],
+    checked_at: str | None = None,
+) -> dict[str, Any]:
+    """构造并交叉校验 v2 响应。
+
+    这里同时执行分支字段和语义约束，避免调用方不慎把“部分检索”包装成可复用的
+    完整放行结论。
+    """
+
+    if not isinstance(content_hash, str) or not _HASH_RE.match(content_hash):
+        raise ContractError("响应的 contentHash 不合法。")
+    if not isinstance(candidates, list):
+        raise ContractError("响应候选必须是数组。")
+    if not isinstance(block_submission, bool):
+        raise ContractError("响应的拦截建议必须是布尔值。")
+    if not isinstance(message, str):
+        raise ContractError("响应说明必须是文本。")
+
+    normalized = _normalize_candidates(candidates)
+    trimmed_message = _bounded_required(message, 2000, "recommendation.message")
+    normalized_checked_at = checked_at or _utc_now_z()
+    checked_datetime = _parse_utc_z(normalized_checked_at, "checkedAt")
+    normalized_completion = _normalize_completion(completion)
+    normalized_reuse = _normalize_reuse(reuse, checked_datetime)
+
+    status = normalized_completion["status"]
+    if status == "unavailable":
+        if normalized or block_submission:
+            raise ContractError("不可用结果不能携带候选或建议拦截。")
+    if status == "partial" and block_submission and not any(
+        candidate.get("sameProblemSuggestion") is True for candidate in normalized
+    ):
+        raise ContractError("部分结果只能由可信的同题复核结论建议拦截。")
+    if status != "complete" and normalized_reuse["policy"] != "no-store":
+        raise ContractError("非完整结果不得复用。")
+
+    result = {
+        "apiVersion": "2",
+        "contentHash": content_hash,
+        "checkedAt": normalized_checked_at,
+        "completion": normalized_completion,
+        "candidates": normalized,
+        "recommendation": {
+            "blockSubmission": block_submission,
+            "message": trimmed_message,
+        },
+        "reuse": normalized_reuse,
+    }
+    _validate_response_size(result)
+    return result
+
+
+def validate_v2_result(payload: Any) -> dict[str, Any]:
+    """重新验证即将发出的或从内部缓存读取的完整 v2 对象。"""
+
+    if not isinstance(payload, dict):
+        raise ContractError("v2 响应必须是对象。")
+    _require_exact_keys(payload, _V2_RESULT_KEYS, "v2 响应")
+    if payload.get("apiVersion") != "2":
+        raise ContractError("v2 响应版本不合法。")
+    recommendation = payload.get("recommendation")
+    if not isinstance(recommendation, dict):
+        raise ContractError("recommendation 必须是对象。")
+    _require_exact_keys(
+        recommendation,
+        {"blockSubmission", "message"},
+        "recommendation",
+    )
+    normalized = build_v2_result(
+        content_hash=payload.get("contentHash"),
+        candidates=payload.get("candidates"),
+        block_submission=recommendation.get("blockSubmission"),
+        message=recommendation.get("message"),
+        completion=payload.get("completion"),
+        reuse=payload.get("reuse"),
+        checked_at=payload.get("checkedAt"),
+    )
+    if normalized != payload:
+        raise ContractError("v2 响应包含非规范字段或值。")
+    return normalized
+
+
+def _normalize_candidates(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
     normalized: list[dict[str, Any]] = []
     for candidate in candidates:
         if len(normalized) >= MAX_CANDIDATES:
@@ -159,24 +296,70 @@ def build_result(
                 explanation, 2000, "candidate.explanation"
             )
         normalized.append(item)
+    return normalized
 
-    trimmed_message = _bounded_required(message, 2000, "recommendation.message")
-    normalized_checked_at = checked_at or _utc_now_z()
-    _validate_utc_z(normalized_checked_at)
-    result = {
-        "apiVersion": "1",
-        "contentHash": content_hash,
-        "checkedAt": normalized_checked_at,
-        "candidates": normalized,
-        "recommendation": {
-            "blockSubmission": block_submission,
-            "message": trimmed_message,
-        },
+
+def _normalize_completion(completion: Any) -> dict[str, Any]:
+    if not isinstance(completion, dict):
+        raise ContractError("completion 必须是对象。")
+    allowed_keys = {"status", "reasonCode", "retryable"}
+    if "retryAfterSeconds" in completion:
+        allowed_keys.add("retryAfterSeconds")
+    _require_exact_keys(completion, allowed_keys, "completion")
+
+    status = completion.get("status")
+    reason = completion.get("reasonCode")
+    retryable = completion.get("retryable")
+    if status not in _COMPLETION_STATUSES:
+        raise ContractError("completion.status 不合法。")
+    if not isinstance(retryable, bool):
+        raise ContractError("completion.retryable 必须是布尔值。")
+    if status == "complete":
+        if reason != "complete" or retryable or "retryAfterSeconds" in completion:
+            raise ContractError("完整结果必须使用固定的完成状态。")
+    elif reason not in _NONCOMPLETE_REASON_CODES:
+        raise ContractError("completion.reasonCode 不合法。")
+
+    normalized: dict[str, Any] = {
+        "status": status,
+        "reasonCode": reason,
+        "retryable": retryable,
     }
+    if "retryAfterSeconds" in completion:
+        retry_after = completion["retryAfterSeconds"]
+        if (
+            isinstance(retry_after, bool)
+            or not isinstance(retry_after, int)
+            or not 1 <= retry_after <= 86_400
+            or not retryable
+        ):
+            raise ContractError("completion.retryAfterSeconds 不合法。")
+        normalized["retryAfterSeconds"] = retry_after
+    return normalized
+
+
+def _normalize_reuse(reuse: Any, checked_at: datetime) -> dict[str, Any]:
+    if not isinstance(reuse, dict):
+        raise ContractError("reuse 必须是对象。")
+    policy = reuse.get("policy")
+    if policy == "no-store":
+        _require_exact_keys(reuse, {"policy"}, "reuse")
+        return {"policy": "no-store"}
+    if policy != "allowed":
+        raise ContractError("reuse.policy 不合法。")
+    _require_exact_keys(reuse, {"policy", "expiresAt"}, "reuse")
+    expires_at = reuse.get("expiresAt")
+    expires_datetime = _parse_utc_z(expires_at, "reuse.expiresAt")
+    lifetime = (expires_datetime - checked_at).total_seconds()
+    if not 0 < lifetime <= _MAX_REUSE_SECONDS:
+        raise ContractError("reuse.expiresAt 必须晚于 checkedAt 且不超过七天。")
+    return {"policy": "allowed", "expiresAt": expires_at}
+
+
+def _validate_response_size(result: dict[str, Any]) -> None:
     body = json.dumps(result, ensure_ascii=False).encode("utf-8")
     if len(body) > MAX_RESPONSE_BYTES:
         raise ContractError("响应内容超过 2MB。")
-    return result
 
 
 def _require_exact_keys(value: dict[str, Any], expected: set[str], path: str) -> None:
@@ -255,15 +438,16 @@ def _safe_hostname(hostname: str) -> bool:
     return all(_HOST_LABEL_RE.fullmatch(label) is not None for label in labels)
 
 
-def _validate_utc_z(value: Any) -> None:
+def _parse_utc_z(value: Any, path: str) -> datetime:
     if not isinstance(value, str) or _UTC_Z_RE.fullmatch(value) is None:
-        raise ContractError("checkedAt 必须是以 Z 结尾的 UTC 时间。")
+        raise ContractError(f"{path} 必须是以 Z 结尾的 UTC 时间。")
     try:
         parsed = datetime.fromisoformat(value[:-1] + "+00:00")
     except ValueError as error:
-        raise ContractError("checkedAt 必须是有效时间。") from error
+        raise ContractError(f"{path} 必须是有效时间。") from error
     if parsed.utcoffset() != timedelta(0):
-        raise ContractError("checkedAt 必须是 UTC 时间。")
+        raise ContractError(f"{path} 必须是 UTC 时间。")
+    return parsed
 
 
 def _utf16_length(value: str) -> int:

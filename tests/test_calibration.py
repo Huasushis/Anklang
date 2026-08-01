@@ -803,7 +803,8 @@ class CalibrateCliTests(unittest.TestCase):
 
             def search(self, statement: str, maximum: int) -> SimpleNamespace:
                 return SimpleNamespace(
-                    candidates=responses[statement][:maximum], degraded=False
+                    candidates=responses[statement][:maximum],
+                    status="complete",
                 )
 
         config = SimpleNamespace(

@@ -373,14 +373,34 @@ class CacheTests(unittest.TestCase):
     def test_expires_and_evicts(self) -> None:
         clock = {"now": 0.0}
         cache = ResultCache(ttl_seconds=10, max_entries=2, clock=lambda: clock["now"])
-        cache.set("h1", {"v": 1})
-        self.assertEqual(cache.get("h1"), {"v": 1})
+        cache.set(
+            "h1",
+            {
+                "v": 1,
+                "completion": {"status": "complete"},
+                "reuse": {"policy": "allowed"},
+            },
+        )
+        self.assertEqual(
+            cache.get("h1"),
+            {
+                "v": 1,
+                "completion": {"status": "complete"},
+                "reuse": {"policy": "allowed"},
+            },
+        )
         clock["now"] = 11.0
         self.assertIsNone(cache.get("h1"))
         clock["now"] = 11.0
-        cache.set("a", {"v": "a"})
-        cache.set("b", {"v": "b"})
-        cache.set("c", {"v": "c"})
+        for key in ("a", "b", "c"):
+            cache.set(
+                key,
+                {
+                    "v": key,
+                    "completion": {"status": "complete"},
+                    "reuse": {"policy": "allowed"},
+                },
+            )
         self.assertIsNone(cache.get("a"))
         self.assertIsNotNone(cache.get("c"))
 
@@ -511,7 +531,7 @@ class ServerTests(unittest.TestCase):
         search_calls_after = [call for call in opener.calls if call.endswith("/api/search")]
         self.assertEqual(len(search_calls_after), 1)
 
-    def test_backend_failure_returns_safe_200_without_caching(self) -> None:
+    def test_backend_failure_returns_fixed_v1_503_without_caching(self) -> None:
         class _FailingBackend:
             calls = 0
 
@@ -542,14 +562,12 @@ class ServerTests(unittest.TestCase):
             status, payload = harness.request(
                 "POST", "/api/v1/checks/similarity", body, headers
             )
-            self.assertEqual(status, 200)
-            self.assertEqual(payload["contentHash"], "a" * 64)
-            self.assertEqual(payload["candidates"], [])
-            self.assertFalse(payload["recommendation"]["blockSubmission"])
+            self.assertEqual(status, 503)
+            self.assertEqual(payload["error"]["code"], "CHECK_INCOMPLETE")
             self.assertNotIn("内部上游信息", json.dumps(payload, ensure_ascii=False))
             self.assertEqual(backend.calls, expected_calls)
 
-    def test_llm_read_failure_returns_safe_200_without_caching(self) -> None:
+    def test_llm_read_failure_returns_v2_partial_without_caching(self) -> None:
         submitted_statement = "投题题面不可泄露标记"
         candidate_excerpt = "候选正文不可泄露标记"
         external_error = "模型服务错误不可泄露标记"
@@ -570,7 +588,6 @@ class ServerTests(unittest.TestCase):
                             "_reviewExcerpt": candidate_excerpt,
                         }
                     ],
-                    degraded=False,
                 )
 
             def describe_health(self) -> dict[str, Any]:
@@ -617,6 +634,7 @@ class ServerTests(unittest.TestCase):
                 )
                 harness = _ServerHarness(service)
                 request = _request()
+                request["apiVersion"] = "2"
                 request["problem"]["basicStatement"] = submitted_statement
                 body = json.dumps(request).encode("utf-8")
                 headers = {
@@ -630,11 +648,18 @@ class ServerTests(unittest.TestCase):
                         for _ in range(2):
                             status, payload = harness.request(
                                 "POST",
-                                "/api/v1/checks/similarity",
+                                "/api/v2/checks/similarity",
                                 body,
                                 headers,
                             )
                             self.assertEqual(status, 200)
+                            self.assertEqual(payload["apiVersion"], "2")
+                            self.assertEqual(payload["completion"]["status"], "partial")
+                            self.assertEqual(
+                                payload["completion"]["reasonCode"],
+                                "review_unavailable",
+                            )
+                            self.assertEqual(payload["reuse"], {"policy": "no-store"})
                             self.assertEqual(payload["contentHash"], "a" * 64)
                             self.assertFalse(
                                 payload["recommendation"]["blockSubmission"]
@@ -661,7 +686,7 @@ class ServerTests(unittest.TestCase):
                 self.assertNotIn("review_failed", serialized)
                 self.assertNotIn("review_failed", captured_stderr)
 
-    def test_llm_json_limits_return_safe_200_without_caching(self) -> None:
+    def test_llm_json_limits_return_v2_partial_without_caching(self) -> None:
         submitted_statement = "深层测试投题题面不可泄露"
         candidate_excerpt = "深层测试候选正文不可泄露"
         deep_payload_text = "深层模型响应原文不可泄露"
@@ -683,7 +708,6 @@ class ServerTests(unittest.TestCase):
                             "_reviewExcerpt": candidate_excerpt,
                         }
                     ],
-                    degraded=False,
                 )
 
             def describe_health(self) -> dict[str, Any]:
@@ -787,6 +811,7 @@ class ServerTests(unittest.TestCase):
                 )
                 harness = _ServerHarness(service)
                 request = _request()
+                request["apiVersion"] = "2"
                 request["problem"]["basicStatement"] = submitted_statement
                 body = json.dumps(request).encode("utf-8")
                 headers = {
@@ -800,11 +825,14 @@ class ServerTests(unittest.TestCase):
                         for _ in range(2):
                             status, payload = harness.request(
                                 "POST",
-                                "/api/v1/checks/similarity",
+                                "/api/v2/checks/similarity",
                                 body,
                                 headers,
                             )
                             self.assertEqual(status, 200)
+                            self.assertEqual(payload["apiVersion"], "2")
+                            self.assertEqual(payload["completion"]["status"], "partial")
+                            self.assertEqual(payload["reuse"], {"policy": "no-store"})
                             self.assertEqual(payload["contentHash"], "a" * 64)
                             self.assertFalse(
                                 payload["recommendation"]["blockSubmission"]
@@ -843,7 +871,6 @@ class ServerTests(unittest.TestCase):
                             "similarity": "not-a-number",
                         }
                     ],
-                    degraded=False,
                 )
 
             def describe_health(self) -> dict[str, Any]:

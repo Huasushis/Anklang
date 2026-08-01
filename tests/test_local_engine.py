@@ -123,7 +123,7 @@ class LocalEngineBackendTests(unittest.TestCase):
         results = search_result.candidates
 
         self.assertTrue(results)
-        self.assertFalse(search_result.degraded)
+        self.assertEqual(search_result.status, "complete")
         self.assertEqual(results[0]["externalId"], "array-sum")
         ranked_ids = [item["externalId"] for item in results]
         self.assertLess(ranked_ids.index("array-sum-2"), ranked_ids.index("graph"))
@@ -153,7 +153,7 @@ class LocalEngineBackendTests(unittest.TestCase):
         search_result = backend.search("数组求和 给定 n 个整数 输出它们的和", k=5)
         results = search_result.candidates
         self.assertTrue(results)
-        self.assertFalse(search_result.degraded)
+        self.assertEqual(search_result.status, "complete")
         self.assertEqual(self.opener.calls, 0)
 
     def test_embedding_failure_marks_keyword_fallback_as_degraded(self) -> None:
@@ -164,7 +164,9 @@ class LocalEngineBackendTests(unittest.TestCase):
         search_result = backend.search("数组求和 给定 n 个整数 输出它们的和", k=5)
         results = search_result.candidates
         self.assertTrue(results)
-        self.assertTrue(search_result.degraded)
+        self.assertEqual(search_result.status, "partial")
+        self.assertEqual(search_result.reason_code, "search_partial")
+        self.assertTrue(search_result.retryable)
         self.assertEqual(opener.calls, 1)
 
     def test_respects_k_limit(self) -> None:
@@ -178,7 +180,7 @@ class LocalEngineBackendTests(unittest.TestCase):
         backend = LocalEngineBackend(empty_store, self.embedder)
         search_result = backend.search(_QUERY_TEXT, k=5)
         self.assertEqual(search_result.candidates, [])
-        self.assertTrue(search_result.degraded)
+        self.assertEqual(search_result.status, "unavailable")
         self.assertEqual(self.opener.calls, 0)
 
     def test_describe_health_reports_count_and_embedding_availability(self) -> None:
@@ -207,7 +209,8 @@ class LocalEngineBackendTests(unittest.TestCase):
 
         result = backend.search("数组 求和", k=5)
 
-        self.assertTrue(result.degraded)
+        self.assertEqual(result.status, "partial")
+        self.assertFalse(result.retryable)
         self.assertEqual(result.candidates[0]["externalId"], "keyword-only")
         self.assertEqual(opener.calls, 0)
         health = backend.describe_health()
@@ -235,7 +238,8 @@ class LocalEngineBackendTests(unittest.TestCase):
 
         result = backend.search("数组 求和", k=5)
 
-        self.assertTrue(result.degraded)
+        self.assertEqual(result.status, "partial")
+        self.assertFalse(result.retryable)
         self.assertEqual(result.candidates[0]["externalId"], "keyword-only")
         self.assertEqual(opener.calls, 0)
 

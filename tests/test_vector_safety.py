@@ -204,7 +204,7 @@ class _ServerHarness:
         try:
             connection.request(
                 "POST",
-                "/api/v1/checks/similarity",
+                f"/api/v{payload['apiVersion']}/checks/similarity",
                 body=body,
                 headers={
                     "Authorization": "Bearer service-token-abcdef123456",
@@ -420,7 +420,7 @@ class LocalEngineVectorSafetyTests(unittest.TestCase):
 
         result = backend.search("valid candidate", k=20)
 
-        self.assertTrue(result.degraded)
+        self.assertEqual(result.status, "partial")
         self.assertEqual(embedder.calls, 0)
         self.assertTrue(result.candidates)
 
@@ -465,15 +465,17 @@ class LocalEngineVectorSafetyTests(unittest.TestCase):
 
         with contextlib.redirect_stderr(stderr):
             for _ in range(2):
+                request = _similarity_request(submitted_statement)
+                request["apiVersion"] = "2"
                 status, payload = harness.post(
-                    _similarity_request(submitted_statement)
+                    request
                 )
                 self.assertEqual(status, 200)
                 self.assertFalse(payload["recommendation"]["blockSubmission"])
-                self.assertEqual(payload["candidates"], [])
+                self.assertEqual(payload["completion"]["status"], "partial")
+                self.assertEqual(payload["reuse"], {"policy": "no-store"})
                 self.assertEqual(
-                    payload["recommendation"]["message"],
-                    "本次未能完成原题检索，请稍后重试并由审题人手工核对。",
+                    payload["candidates"][0]["externalId"], "keyword-fallback"
                 )
                 responses.append(payload)
 

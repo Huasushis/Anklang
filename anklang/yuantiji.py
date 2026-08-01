@@ -18,7 +18,10 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from dataclasses import dataclass
 from typing import Any
+
+from .backends import CompletionReason
 
 _MAX_RESPONSE_BYTES = 4_000_000
 _MAX_QUERY_CHARACTERS = 16_000
@@ -34,12 +37,70 @@ DEFAULT_REQUEST_QUEUE_SECONDS = 5.0
 _USER_AGENT = "Anklang/0.1"
 
 
-class _RetryableRequestError(RuntimeError):
+class YuantijiError(RuntimeError):
+    """不携带上游正文的固定分类错误。异常文本不得进入 HTTP 响应。"""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        reason_code: CompletionReason,
+        retryable: bool,
+        retry_after_seconds: int | None = None,
+    ) -> None:
+        if reason_code == "complete":
+            raise ValueError("上游错误不能使用 complete 原因。")
+        if not isinstance(retryable, bool):
+            raise ValueError("上游错误的重试状态不合法。")
+        if retry_after_seconds is not None and (
+            isinstance(retry_after_seconds, bool)
+            or not isinstance(retry_after_seconds, int)
+            or not 1 <= retry_after_seconds <= 86_400
+            or not retryable
+        ):
+            raise ValueError("上游错误的重试等待时间不合法。")
+        self.reason_code = reason_code
+        self.retryable = retryable
+        self.retry_after_seconds = retry_after_seconds
+        super().__init__(message)
+
+
+class _RetryableRequestError(YuantijiError):
     """一次可能是暂时故障的上游调用失败，可以在有限次数内重试。"""
 
 
-class YuantijiError(RuntimeError):
-    pass
+@dataclass(frozen=True)
+class YuantijiSearchResult:
+    candidates: list[dict[str, Any]]
+    partial: bool = False
+    reason_code: CompletionReason = "complete"
+    retryable: bool = False
+    retry_after_seconds: int | None = None
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.candidates, list)
+            or not isinstance(self.partial, bool)
+            or not isinstance(self.retryable, bool)
+        ):
+            raise ValueError("上游结果状态不合法。")
+        if self.partial:
+            if self.reason_code == "complete":
+                raise ValueError("部分上游结果必须说明固定原因。")
+        elif (
+            self.reason_code != "complete"
+            or self.retryable
+            or self.retry_after_seconds is not None
+        ):
+            raise ValueError("完整上游结果必须使用固定完成状态。")
+        retry_after = self.retry_after_seconds
+        if retry_after is not None and (
+            isinstance(retry_after, bool)
+            or not isinstance(retry_after, int)
+            or not 1 <= retry_after <= 86_400
+            or not self.retryable
+        ):
+            raise ValueError("上游重试等待时间不合法。")
 
 
 def calculate_search_budget_seconds(
@@ -166,7 +227,7 @@ class YuantijiClient:
         finally:
             self._health_refresh_lock.release()
 
-    def search(self, query: str, k: int, rerank: bool) -> list[dict[str, Any]]:
+    def search(self, query: str, k: int, rerank: bool) -> YuantijiSearchResult:
         deadline = self._clock() + self._search_budget_seconds
         body = json.dumps(
             {
@@ -181,7 +242,11 @@ class YuantijiClient:
             }
         ).encode("utf-8")
         if not self._acquire_request_slot(deadline):
-            raise YuantijiError("yuantiji 当前请求较多，请稍后重试。")
+            raise YuantijiError(
+                "yuantiji 当前请求较多，请稍后重试。",
+                reason_code="search_timeout",
+                retryable=True,
+            )
         try:
             self._ensure_time_remaining(deadline)
             self._ensure_circuit_closed()
@@ -189,22 +254,44 @@ class YuantijiClient:
                 payload = self._post(self._search_url, body, deadline)
                 results = payload.get("results")
                 if not isinstance(results, list):
-                    raise YuantijiError("yuantiji 返回内容缺少 results 列表。")
+                    raise YuantijiError(
+                        "yuantiji 返回内容缺少 results 列表。",
+                        reason_code="search_backend_invalid",
+                        retryable=False,
+                    )
                 candidates: list[dict[str, Any]] = []
+                invalid_candidates = 0
                 for item in results:
                     if not isinstance(item, dict):
+                        invalid_candidates += 1
                         continue
                     candidate = self._map_candidate(item)
                     if candidate is not None:
                         candidates.append(candidate)
+                    else:
+                        invalid_candidates += 1
                 if results and not candidates:
-                    raise YuantijiError("yuantiji 返回的候选内容不符合约定。")
+                    raise YuantijiError(
+                        "yuantiji 返回的候选内容不符合约定。",
+                        reason_code="search_backend_invalid",
+                        retryable=False,
+                    )
                 self._ensure_time_remaining(deadline)
             except YuantijiError:
                 self._record_search_failure()
                 raise
+            if invalid_candidates:
+                # 混合响应仍保留可信候选，但结构漂移应计入熔断，不能把它登记成
+                # 一次完全健康的上游调用。
+                self._record_search_failure()
+                return YuantijiSearchResult(
+                    candidates=candidates,
+                    partial=True,
+                    reason_code="search_backend_invalid",
+                    retryable=False,
+                )
             self._record_search_success()
-            return candidates
+            return YuantijiSearchResult(candidates=candidates)
         finally:
             self._request_lock.release()
 
@@ -295,7 +382,7 @@ class YuantijiClient:
     def _perform(
         self, request: urllib.request.Request, deadline: float
     ) -> dict[str, Any]:
-        last_error: Exception | None = None
+        last_error: _RetryableRequestError | None = None
         for attempt in range(self._max_retries + 1):
             self._throttle(deadline)
             try:
@@ -305,6 +392,12 @@ class YuantijiClient:
                 last_error = error
                 if attempt < self._max_retries:
                     delay = self._retry_base_delay * (2**attempt)
+                    if error.retry_after_seconds is not None:
+                        delay = max(delay, float(error.retry_after_seconds))
+                        if delay >= self._remaining_time(deadline):
+                            # 没有足够预算完整遵守上游等待时间时，不提前重试，
+                            # 也不把明确的 429 错报成普通超时。
+                            break
                     self._sleep_with_budget(delay, deadline)
                     continue
                 break
@@ -314,7 +407,13 @@ class YuantijiClient:
             self._last_call_monotonic = self._clock()
             return parsed
 
-        raise YuantijiError("yuantiji 服务暂时不可用。") from last_error
+        assert last_error is not None
+        raise YuantijiError(
+            "yuantiji 服务暂时不可用。",
+            reason_code=last_error.reason_code,
+            retryable=True,
+            retry_after_seconds=last_error.retry_after_seconds,
+        ) from last_error
 
     def _perform_once(
         self, request: urllib.request.Request, deadline: float
@@ -324,26 +423,64 @@ class YuantijiClient:
             with self._opener(request, timeout=timeout) as response:
                 raw = response.read(_MAX_RESPONSE_BYTES + 1)
         except urllib.error.HTTPError as error:
-            if error.code == 429 or error.code >= 500:
-                raise _RetryableRequestError("yuantiji 暂时拒绝请求。") from error
-            raise YuantijiError("yuantiji 拒绝了本次请求。") from error
+            if error.code == 429:
+                raise _RetryableRequestError(
+                    "yuantiji 暂时限制请求频率。",
+                    reason_code="search_rate_limited",
+                    retryable=True,
+                    retry_after_seconds=_safe_retry_after_seconds(error.headers),
+                ) from error
+            if error.code >= 500:
+                raise _RetryableRequestError(
+                    "yuantiji 服务暂时不可用。",
+                    reason_code="search_backend_unavailable",
+                    retryable=True,
+                ) from error
+            raise YuantijiError(
+                "yuantiji 拒绝了本次请求。",
+                reason_code="search_backend_unavailable",
+                retryable=False,
+            ) from error
+        except TimeoutError as error:
+            raise _RetryableRequestError(
+                "yuantiji 请求超时。",
+                reason_code="search_timeout",
+                retryable=True,
+            ) from error
         except (
             urllib.error.URLError,
-            TimeoutError,
             OSError,
             http.client.HTTPException,
         ) as error:
-            raise _RetryableRequestError("无法连接 yuantiji 服务。") from error
+            raise _RetryableRequestError(
+                "无法连接 yuantiji 服务。",
+                reason_code=(
+                    "search_timeout" if _is_timeout_error(error) else "search_backend_unavailable"
+                ),
+                retryable=True,
+            ) from error
 
         self._ensure_time_remaining(deadline)
         if len(raw) > _MAX_RESPONSE_BYTES:
-            raise YuantijiError("yuantiji 返回内容过大。")
+            raise YuantijiError(
+                "yuantiji 返回内容过大。",
+                reason_code="search_backend_invalid",
+                retryable=False,
+            )
         try:
             parsed = json.loads(raw.decode("utf-8"))
         except (ValueError, UnicodeDecodeError, RecursionError) as error:
-            raise YuantijiError("yuantiji 返回内容不是有效 JSON。") from error
+            raise YuantijiError(
+                "yuantiji 返回内容不是有效 JSON。",
+                reason_code="search_backend_invalid",
+                retryable=False,
+            ) from error
         if not isinstance(parsed, dict):
-            raise YuantijiError("yuantiji 返回内容不是 JSON 对象。")
+            raise YuantijiError(
+                "yuantiji 返回内容不是 JSON 对象。",
+                reason_code="search_backend_invalid",
+                retryable=False,
+            )
         self._ensure_time_remaining(deadline)
         return parsed
 
@@ -353,7 +490,11 @@ class YuantijiClient:
     def _ensure_time_remaining(self, deadline: float) -> float:
         remaining = self._remaining_time(deadline)
         if remaining <= 0:
-            raise YuantijiError("yuantiji 本次检索已达到等待上限。")
+            raise YuantijiError(
+                "yuantiji 本次检索已达到等待上限。",
+                reason_code="search_timeout",
+                retryable=True,
+            )
         return remaining
 
     def _sleep_with_budget(self, seconds: float, deadline: float) -> None:
@@ -363,12 +504,20 @@ class YuantijiClient:
         if sleep_seconds > 0:
             self._sleeper(sleep_seconds)
         if sleep_seconds < requested or self._remaining_time(deadline) <= 0:
-            raise YuantijiError("yuantiji 本次检索已达到等待上限。")
+            raise YuantijiError(
+                "yuantiji 本次检索已达到等待上限。",
+                reason_code="search_timeout",
+                retryable=True,
+            )
 
     def _ensure_circuit_closed(self) -> None:
         with self._state_lock:
             if self._circuit_open_until > self._clock():
-                raise YuantijiError("yuantiji 服务连续失败，当前已暂停调用。")
+                raise YuantijiError(
+                    "yuantiji 服务连续失败，当前已暂停调用。",
+                    reason_code="search_backend_unavailable",
+                    retryable=True,
+                )
 
     def _record_search_success(self) -> None:
         with self._state_lock:
@@ -402,6 +551,31 @@ def _finite_score(value: Any) -> float | None:
     except (OverflowError, ValueError):
         return None
     return number if math.isfinite(number) else None
+
+
+def _safe_retry_after_seconds(headers: Any) -> int | None:
+    """只接受简单整数秒，避免把上游日期或任意文本带入公开契约。"""
+
+    if headers is None:
+        return None
+    try:
+        raw = headers.get("Retry-After")
+    except (AttributeError, TypeError):
+        return None
+    if not isinstance(raw, str) or not raw.isascii() or not raw.isdigit():
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        return None
+    return value if 1 <= value <= 86_400 else None
+
+
+def _is_timeout_error(error: BaseException) -> bool:
+    if isinstance(error, TimeoutError):
+        return True
+    reason = getattr(error, "reason", None)
+    return isinstance(reason, TimeoutError)
 
 
 def _candidate_text(value: Any, max_utf16_units: int) -> str | None:

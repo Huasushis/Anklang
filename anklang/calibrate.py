@@ -680,7 +680,7 @@ def main(argv: list[str] | None = None) -> int:
             # 使用线上配置的候选数量运行，再由证据层裁剪到登记的最大 K；某些上游
             # 会根据 k 改变检索过程，不能用另一个 k 冒充线上行为。
             result = backend.search(statement, config.search_k)
-            if result.degraded:
+            if result.status != "complete":
                 # 部分检索失败不能作为完整标定样本；固定错误由核心层转换成 error。
                 raise RuntimeError("标定检索结果不完整。")
             return result.candidates
