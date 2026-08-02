@@ -89,15 +89,20 @@ serviceToken 密钥填成进程收到的同一个令牌即可。`.env.example` �
 
 ### Docker Compose
 
-仓库根目录提供独立的 `compose.yaml`。先在不进 Git、权限仅当前用户可读的 `.env` 中配置至少
-16 字符的 `ANKLANG_SERVICE_TOKEN`，再运行 `docker compose up --build -d`；不要用 `source` 或
-`.` 加载这个文件，也不要把会展开令牌的 `docker compose config` 输出保存到日志。
+仓库根目录提供独立的 `compose.yaml`。先把 `.env.example` 复制为被 Git 整体忽略、权限仅当前用户
+可读的 `private/anklang.env`，配置至少 16 字符的 `ANKLANG_SERVICE_TOKEN`，再用
+`docker compose --env-file private/anklang.env up --build -d` 启动。不要用 `source` 或 `.` 加载
+这个文件，也不要把会展开令牌的 `docker compose config` 输出保存到日志。
 
 容器内明确监听 `0.0.0.0:8730`，宿主端口则固定只绑定 `127.0.0.1`。镜像以非 root 用户运行；
 Compose 使用只读根文件系统、移除全部 Linux capabilities（进程的额外系统权限）、禁止获取新权限，
 且只给 `/app/problems-data` 和临时目录必要的写权限。健康检查只访问本地 `/api/v1/live`；
 默认 45 秒的容器停止宽限大于应用默认的 30 秒宽限。若覆盖任一数值，
 `ANKLANG_STOP_GRACE_PERIOD` 必须始终大于 `ANKLANG_SHUTDOWN_GRACE_SECONDS`。
+
+Urmotiv 同级仓库的 `compose.yaml` 也提供默认关闭的 `anklang` profile。该组合方式仍读取同一个
+`Anklang/private/anklang.env`，容器内地址为 `http://anklang:8730`，宿主只绑定
+`127.0.0.1:8730`；不要为了组合部署把服务令牌或外部密钥复制进 Urmotiv 的主环境文件。
 
 ### 使用本地检索与来源导入
 

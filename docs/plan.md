@@ -412,37 +412,14 @@ LOG_LEVEL=info
   （不是 yuantiji.ac 的）。这样接手人可以在不依赖 Urmotiv 仓库的情况下单独 `docker compose up`
   验证 Anklang。
 
-- **与 Urmotiv compose 的衔接**：Urmotiv 的 `compose.yaml`（`E:\Huasushis\program\Urmotiv\compose.yaml`）
-  目前只有 `postgres`、`redis`、`minio`、`migrate`、`api`、`worker`、`web` 七个服务，还没有
-  Anklang / Fermata 的 profile（Docker Compose 的 "profile" 是一种给服务打标签、默认不启动、
-  只有显式指定 `--profile <名字>` 才会启动该服务的机制）。这符合 Urmotiv `docs/spec.md` 第 12 节
-  "Docker Compose 提供基础服务与可选的 Anklang、Fermata 组合配置"这个既定计划，但**目前尚未实现**。
-
-  给 Urmotiv 侧接手人的建议片段（**这段改动属于 Urmotiv 仓库，不在 Anklang 仓库执行**，这里只给
-  参考，方便复制）：
-
-  ```yaml
-  # 建议追加到 Urmotiv 的 compose.yaml 的 services 下（仅供参考，不在本仓库生效）
-  anklang:
-    profiles: ["anklang"]
-    build:
-      context: ../Anklang
-    restart: unless-stopped
-    environment:
-      ANKLANG_API_TOKEN: ${ANKLANG_API_TOKEN:?请在私有环境文件中设置 ANKLANG_API_TOKEN}
-      YUANTIJI_BASE_URL: ${YUANTIJI_BASE_URL:-https://yuantiji.ac}
-    ports:
-      - "127.0.0.1:${ANKLANG_HTTP_PORT:-8090}:8090"
-    healthcheck:
-      test: ["CMD", "python3", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8090/api/v1/health').status==200 else 1)"]
-      interval: 10s
-      timeout: 5s
-      retries: 12
-      start_period: 10s
-  ```
-
-  Urmotiv 侧 `plugins/anklang` 插件设置里的 `baseUrl` 配置为这个内部服务地址即可
-  （例如 `http://anklang:8090`，与 Docker Compose 内部服务发现的命名一致）。
+- **与 Urmotiv compose 的衔接（当前已实现）**：Urmotiv 的 `compose.yaml` 已提供默认关闭的
+  `anklang` 和 `fermata` profile（Docker Compose 的 profile 是给可选服务打标签，只有显式指定
+  `--profile <名字>` 才启动）。Anklang profile 复用本仓库正式的 8730 端口、非 root 用户、只读
+  根文件系统、最小权限、独立数据卷、`/api/v1/live` 健康检查和停止宽限；宿主只绑定
+  `127.0.0.1:8730`。服务令牌和外部密钥只从本仓库被 Git 忽略的
+  `private/anklang.env` 注入，不进入 Urmotiv 主环境文件。插件内部地址固定为
+  `http://anklang:8730`。精确步骤以当前 `README.md` 和 `docs/deployment.md` 为准，不再使用本规划
+  早期的 8090、FastAPI 或 `ANKLANG_API_TOKEN` 示例。
 
 ### 2.11 测试清单
 
@@ -697,6 +674,6 @@ FTS_ENABLED=true
    对应的成本倍增**（第 3.4 节）。
 6. **阶段 3 vjudge 源是否/何时真正实施，需要协会内部先做法律与运营评估，不是纯技术决定**
    （第 4.2 节）。
-7. **Anklang 与 Urmotiv compose 的最终衔接方式**（profile、`include`，还是完全独立部署）由
-   Urmotiv 仓库维护者决定，本文档只给出参考片段（第 2.10 节）。
+7. **Anklang 与 Urmotiv compose 的衔接已经采用可选 profile**；独立 Compose 仍保留用于单独部署。
+   两种方式不能同时占用相同宿主端口，且都读取 Anklang 自己的私有环境文件（第 2.10 节）。
 8. **缓存命中时是否刷新 `checkedAt`**（第 2.6 节第 2 步）——本规划给出建议但不强制。

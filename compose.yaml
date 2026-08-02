@@ -15,13 +15,12 @@ services:
     ports:
       - "127.0.0.1:${ANKLANG_PORT:-8730}:8730"
     env_file:
-      - path: .env
-        required: false
+      - path: private/anklang.env
+        required: true
     environment:
       ANKLANG_BIND_HOST: "0.0.0.0"
       ANKLANG_PORT: "8730"
       ANKLANG_REQUIRE_SERVICE_TOKEN: "true"
-      ANKLANG_SERVICE_TOKEN: "${ANKLANG_SERVICE_TOKEN:?请配置至少 16 个字符的 ANKLANG_SERVICE_TOKEN}"
       ANKLANG_MAX_IN_FLIGHT_CHECKS: "${ANKLANG_MAX_IN_FLIGHT_CHECKS:-16}"
       ANKLANG_CLIENT_IDLE_TIMEOUT_SECONDS: "${ANKLANG_CLIENT_IDLE_TIMEOUT_SECONDS:-15}"
       ANKLANG_SHUTDOWN_GRACE_SECONDS: "${ANKLANG_SHUTDOWN_GRACE_SECONDS:-30}"

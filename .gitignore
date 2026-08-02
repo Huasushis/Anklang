@@ -5,6 +5,7 @@
 *.pem
 *.key
 secrets/
+private/
 
 # Problem data and caches — never committed.
 # Candidate problem text, any locally-built corpus, and cached similarity

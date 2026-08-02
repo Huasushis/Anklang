@@ -114,9 +114,10 @@ class ContainerDeploymentTests(unittest.TestCase):
             "cap_drop:\n      - ALL",
             "no-new-privileges:true",
             '"127.0.0.1:${ANKLANG_PORT:-8730}:8730"',
+            "path: private/anklang.env",
+            "required: true",
             'ANKLANG_BIND_HOST: "0.0.0.0"',
             'ANKLANG_REQUIRE_SERVICE_TOKEN: "true"',
-            "${ANKLANG_SERVICE_TOKEN:?",
             'ANKLANG_MAX_IN_FLIGHT_CHECKS: "${ANKLANG_MAX_IN_FLIGHT_CHECKS:-16}"',
             'ANKLANG_CLIENT_IDLE_TIMEOUT_SECONDS: "${ANKLANG_CLIENT_IDLE_TIMEOUT_SECONDS:-15}"',
             'ANKLANG_SHUTDOWN_GRACE_SECONDS: "${ANKLANG_SHUTDOWN_GRACE_SECONDS:-30}"',
@@ -130,6 +131,7 @@ class ContainerDeploymentTests(unittest.TestCase):
                 self.assertIn(fragment, compose)
         for unsafe in ("privileged: true", "network_mode: host", "/var/run/docker.sock"):
             self.assertNotIn(unsafe, compose)
+        self.assertNotIn("ANKLANG_SERVICE_TOKEN:", compose)
 
         app_grace_match = re.search(
             r'ANKLANG_SHUTDOWN_GRACE_SECONDS:\s*"\$\{[^:]+:-(\d+)\}"',
@@ -167,11 +169,17 @@ class ContainerDeploymentTests(unittest.TestCase):
             (temporary_root / "compose.yaml").write_text(
                 compose_source, encoding="utf-8"
             )
-            (temporary_root / ".env").write_text("", encoding="utf-8")
+            private_directory = temporary_root / "private"
+            private_directory.mkdir(mode=0o700)
+            environment_file = private_directory / "anklang.env"
+            environment_file.write_text(
+                "ANKLANG_SERVICE_TOKEN=synthetic-compose-token\n",
+                encoding="utf-8",
+            )
+            environment_file.chmod(0o600)
             environment = os.environ.copy()
             environment.update(
                 {
-                    "ANKLANG_SERVICE_TOKEN": "synthetic-compose-token",
                     "ANKLANG_MAX_IN_FLIGHT_CHECKS": "7",
                     "ANKLANG_CLIENT_IDLE_TIMEOUT_SECONDS": "9",
                     "ANKLANG_SHUTDOWN_GRACE_SECONDS": "11",
@@ -183,7 +191,7 @@ class ContainerDeploymentTests(unittest.TestCase):
                     docker,
                     "compose",
                     "--env-file",
-                    str(temporary_root / ".env"),
+                    str(environment_file),
                     "-f",
                     str(temporary_root / "compose.yaml"),
                     "config",
@@ -200,6 +208,10 @@ class ContainerDeploymentTests(unittest.TestCase):
         parsed = json.loads(rendered.stdout)
         service = parsed["services"]["anklang"]
         service_environment = service["environment"]
+        self.assertEqual(
+            service_environment["ANKLANG_SERVICE_TOKEN"],
+            "synthetic-compose-token",
+        )
         self.assertEqual(service_environment["ANKLANG_MAX_IN_FLIGHT_CHECKS"], "7")
         self.assertEqual(service_environment["ANKLANG_CLIENT_IDLE_TIMEOUT_SECONDS"], "9")
         self.assertEqual(service_environment["ANKLANG_SHUTDOWN_GRACE_SECONDS"], "11")

@@ -118,18 +118,46 @@ similarity 路径使用同一 Bearer 令牌。不要用 shell 的 `source` 或 `
 （进程的额外系统权限）、禁止获取新权限并限制进程数；只有 `/app/problems-data` 命名卷和小型
 `/tmp` 临时文件系统可写。
 
-1. 在仓库根目录创建不进 Git 的 `.env`，权限设为仅当前用户可读写；至少配置一个长度不小于 16 的
-   `ANKLANG_SERVICE_TOKEN`。Compose 会直接读取它，不要 `source`，也不要把展开配置后的输出写入日志。
-2. 运行 `docker compose up --build -d`。容器内显式监听 `0.0.0.0:8730`，宿主端口固定映射到
+1. 创建被 Git 整体忽略的 `private/` 目录，把 `.env.example` 复制成权限仅当前用户可读写的
+   `private/anklang.env`；至少配置一个长度不小于 16 的 `ANKLANG_SERVICE_TOKEN`：
+
+   ```sh
+   install -d -m 700 private
+   cp .env.example private/anklang.env
+   chmod 600 private/anklang.env
+   ```
+
+   Compose 会直接读取它，不要 `source`，也不要把展开配置后的输出写入日志。
+2. 运行 `docker compose --env-file private/anklang.env up --build -d`。容器内显式监听
+   `0.0.0.0:8730`，宿主端口固定映射到
    `127.0.0.1:${ANKLANG_PORT:-8730}`，不会直接监听所有宿主网卡。
 3. 用 `GET http://127.0.0.1:8730/api/v1/live` 检查进程存活，再用 `/api/v1/health` 检查后端就绪。
    Docker 健康检查只调用 `/live`，不会因监控探针触发任何外部请求。
-4. 停止时 Compose 默认给 45 秒，应用内部默认给 30 秒；前者必须始终大于后者。若在 `.env` 修改
-   `ANKLANG_SHUTDOWN_GRACE_SECONDS`，也要把 `ANKLANG_STOP_GRACE_PERIOD` 设为更大的秒数值（例如
-   `75s`），Compose 会把两者分别传给应用和容器运行时。
+4. 停止时 Compose 默认给 45 秒，应用内部默认给 30 秒；前者必须始终大于后者。若在
+   `private/anklang.env` 修改 `ANKLANG_SHUTDOWN_GRACE_SECONDS`，也要把
+   `ANKLANG_STOP_GRACE_PERIOD` 设为更大的秒数值（例如 `75s`），Compose 会把两者分别传给应用和
+   容器运行时。
 
 生产数据只放在 `anklang-problems-data` 卷。备份或替换本地索引时按 README 的非破坏性重建流程
 处理，不把宿主私有目录整体复制进镜像，也不把 Anklang 连接到 Urmotiv 的数据库。
+
+### 作为 Urmotiv 的可选 profile 运行
+
+Urmotiv 同级仓库的 `compose.yaml` 已提供默认关闭的 `anklang` profile。它使用 Anklang 正式镜像
+边界和同一个 `Anklang/private/anklang.env`，固定容器端口 8730、非 root 用户、只读根文件系统、
+`cap_drop: ALL`、`no-new-privileges`、进程数限制、小型 `/tmp`、独立数据卷、`/api/v1/live`
+健康检查以及 45 秒容器停止宽限。宿主只绑定 `127.0.0.1:8730`。
+
+在 Urmotiv 仓库运行：
+
+```sh
+docker compose --env-file <Urmotiv 私有主环境文件> --profile anklang up -d anklang
+```
+
+Urmotiv 插件的 `baseUrl` 使用 `http://anklang:8730`，服务令牌与
+`Anklang/private/anklang.env` 中的值一致。Anklang 令牌、yuantiji 地址、DashScope 和可选复核模型
+密钥都不得复制进 Urmotiv 主环境文件。默认 profile 不会创建 Anklang 容器；也不要与独立 Compose
+同时占用同一宿主端口。
 
 部署前在服务器仓库中运行：
 
