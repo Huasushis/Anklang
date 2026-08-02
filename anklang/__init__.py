@@ -31,4 +31,5 @@ __all__ = [
     "sources",
     "ingest",
     "backfill",
+    "review_flow_capture",
 ]

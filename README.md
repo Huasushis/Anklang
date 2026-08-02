@@ -178,6 +178,12 @@ python3 -m anklang.calibrate \
   --label public-baseline-20260801
 ```
 
+Fermata 的审题流程标定还需要一批逐请求、逐响应绑定的 Anklang v2 证据。正式采集必须使用干净的
+Git 提交和 Git 已忽略的私有 manifest；采集器对每个外部请求只调用一次，任何取消、缺失、HTTP
+错误、非完整响应或批次前后健康状态变化都会拒绝生成完成标记。manifest 字段、权限要求、恢复语义
+和安全输出格式见 [`docs/review-flow-capture.md`](docs/review-flow-capture.md)。交给 Fermata 前再运行
+其中的只读 `verify-capture`，从私有原始文件完整重放证明；它不会联网或修复失败批次。
+
 上面这条命令只适用于不外发题面的本地关键词模式，而且
 `ANKLANG_LOCAL_DB_PATH` 必须正好指向清单绑定的只读 SQLite 快照。默认反向代理或已配置外部
 embedding 时，程序默认拒绝发送；确认当前这一次允许外发后，还必须显式添加
