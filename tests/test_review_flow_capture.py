@@ -6,6 +6,7 @@ import importlib.util
 import io
 import json
 import os
+import py_compile
 import stat
 import subprocess
 import sys
@@ -928,7 +929,13 @@ class CaptureCliTests(unittest.TestCase):
         self.assertIsNotNone(spec)
         self.assertIsNotNone(spec.loader)
         module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
+        previous_dont_write_bytecode = sys.dont_write_bytecode
+        previous_pycache_prefix = sys.pycache_prefix
+        try:
+            spec.loader.exec_module(module)
+        finally:
+            sys.dont_write_bytecode = previous_dont_write_bytecode
+            sys.pycache_prefix = previous_pycache_prefix
         expected = b'{"synthetic":"attestation"}\n'
 
         class BinaryStdout:
@@ -1012,6 +1019,147 @@ class CaptureCliTests(unittest.TestCase):
             ]
             self.assertEqual(generated_project_bytecode, [])
         self.assertEqual(project_bytecode_state(), before)
+
+    def test_direct_runner_ignores_unchecked_hash_project_pyc(self) -> None:
+        source_script = (
+            Path(__file__).resolve().parents[1]
+            / "scripts"
+            / "capture-review-flow-calibration.py"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            repository = Path(directory) / "Anklang"
+            scripts = repository / "scripts"
+            package = repository / "anklang"
+            scripts.mkdir(parents=True)
+            package.mkdir()
+            runner = scripts / "capture-review-flow-calibration.py"
+            runner.write_bytes(source_script.read_bytes())
+            (package / "__init__.py").write_text("", encoding="utf-8")
+            dependency = package / "review_flow_capture.py"
+            dependency.write_text(
+                "\n".join(
+                    [
+                        "from pathlib import Path",
+                        "class CaptureError(Exception):",
+                        "    def __init__(self, code: str):",
+                        "        self.code = code",
+                        "def run_capture(**_kwargs):",
+                        "    raise CaptureError('SYNTHETIC_RUN_FORBIDDEN')",
+                        "def verify_capture(**kwargs) -> bytes:",
+                        "    return (Path(kwargs['workspace']) / 'attestation.json').read_bytes()",
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            workspace = Path(directory) / "private-workspace"
+            workspace.mkdir()
+            expected = b'{"source":"attestation"}\n'
+            (workspace / "attestation.json").write_bytes(expected)
+            manifest = workspace / "manifest.json"
+            manifest.write_text("{}\n", encoding="utf-8")
+            marker = Path(directory) / "malicious.marker"
+            malicious_source = Path(directory) / "malicious.py"
+            malicious_source.write_text(
+                "\n".join(
+                    [
+                        "from pathlib import Path",
+                        f"Path({str(marker)!r}).write_text('executed', encoding='utf-8')",
+                        "class CaptureError(Exception):",
+                        "    def __init__(self, code: str):",
+                        "        self.code = code",
+                        "def run_capture(**_kwargs):",
+                        "    raise CaptureError('SYNTHETIC_RUN_FORBIDDEN')",
+                        "def verify_capture(**kwargs) -> bytes:",
+                        "    return (Path(kwargs['workspace']) / 'attestation.json').read_bytes()",
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            previous_pycache_prefix = sys.pycache_prefix
+            try:
+                sys.pycache_prefix = None
+                pyc_path = Path(importlib.util.cache_from_source(str(dependency)))
+            finally:
+                sys.pycache_prefix = previous_pycache_prefix
+            pyc_path.parent.mkdir(parents=True)
+            py_compile.compile(
+                str(malicious_source),
+                cfile=str(pyc_path),
+                dfile=str(dependency),
+                doraise=True,
+                invalidation_mode=py_compile.PycInvalidationMode.UNCHECKED_HASH,
+            )
+            malicious_source.unlink()
+
+            environment = dict(os.environ)
+            for key in (
+                "PYTHONPYCACHEPREFIX",
+                "PYTHONDONTWRITEBYTECODE",
+                "PYTHONPATH",
+            ):
+                environment.pop(key, None)
+            control = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    (
+                        "import sys; "
+                        "sys.path.insert(0, sys.argv[1]); "
+                        "import anklang.review_flow_capture"
+                    ),
+                    str(repository),
+                ],
+                cwd=repository,
+                env=environment,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            self.assertEqual(control.returncode, 0, control.stderr)
+            self.assertTrue(marker.is_file())
+            marker.unlink()
+
+            def project_bytecode_state() -> dict[str, tuple[int, str]]:
+                return {
+                    path.relative_to(repository).as_posix(): (
+                        path.stat().st_mtime_ns,
+                        _sha256(path.read_bytes()),
+                    )
+                    for path in repository.rglob("*.pyc")
+                }
+
+            before = project_bytecode_state()
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(runner),
+                    "verify-capture",
+                    "--workspace",
+                    str(workspace),
+                    "--manifest",
+                    str(manifest),
+                    "--verifier-code-version",
+                    "1" * 40,
+                    "--verifier-runner-sha256",
+                    "2" * 64,
+                    "--verifier-dependency-code-sha256",
+                    "3" * 64,
+                ],
+                cwd=repository,
+                env=environment,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertEqual(completed.stdout, expected)
+            self.assertEqual(completed.stderr, b"")
+            self.assertFalse(marker.exists())
+            self.assertEqual(project_bytecode_state(), before)
 
 
 if __name__ == "__main__":
