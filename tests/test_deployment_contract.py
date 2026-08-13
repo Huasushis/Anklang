@@ -101,6 +101,31 @@ class _Harness:
         finally:
             connection.close()
 
+    def request(
+        self,
+        method: str,
+        path: str,
+        body: bytes | str | None = None,
+        *,
+        headers: dict[str, str] | None = None,
+        timeout: float = 5.0,
+    ) -> tuple[int, dict[str, Any], dict[str, str]]:
+        if isinstance(body, str):
+            body = body.encode("utf-8")
+        connection = HTTPConnection("127.0.0.1", self.port, timeout=timeout)
+        try:
+            connection.request(method, path, body=body, headers=headers or {})
+            response = connection.getresponse()
+            raw = response.read()
+            decoded = json.loads(raw.decode("utf-8")) if raw else {}
+            return (
+                response.status,
+                decoded,
+                {name.lower(): value for name, value in response.getheaders()},
+            )
+        finally:
+            connection.close()
+
     def close(self) -> None:
         self.server.shutdown()
         self.server.server_close()
@@ -321,6 +346,194 @@ class NoBackendTransportProofTests(unittest.TestCase):
         finally:
             server.shutdown()
             server.server_close()
+
+class LoadConfigWiringTests(unittest.TestCase):
+    """load_config() 将 ANKLANG_REVISION 环境变量正确映射到 AppConfig.revision。"""
+
+    def test_revision_unset_means_none(self) -> None:
+        """ANKLANG_REVISION 未设置时 load_config 返回 revision=None。"""
+        from anklang.config import load_config
+
+        env = {k: v for k, v in os.environ.items() if k != "ANKLANG_REVISION"}
+        with patch.dict(os.environ, env, clear=True):
+            config = load_config()
+        self.assertIsNone(config.revision)
+
+    def test_revision_empty_means_none(self) -> None:
+        """ANKLANG_REVISION 设为空字符串时 load_config 返回 revision=None。"""
+        from anklang.config import load_config
+
+        with patch.dict(os.environ, {"ANKLANG_REVISION": ""}, clear=True):
+            config = load_config()
+        self.assertIsNone(config.revision)
+
+    def test_revision_set_means_value(self) -> None:
+        """ANKLANG_REVISION 设为有效值时 load_config 返回该值。"""
+        from anklang.config import load_config
+
+        with patch.dict(
+            os.environ, {"ANKLANG_REVISION": "v2.0.1-rc3"}, clear=True
+        ):
+            config = load_config()
+        self.assertEqual(config.revision, "v2.0.1-rc3")
+
+    def test_revision_invalid_raises_config_error(self) -> None:
+        """ANKLANG_REVISION 包含非法字符时 load_config 抛出 ConfigError。"""
+        from anklang.config import load_config
+
+        with patch.dict(
+            os.environ, {"ANKLANG_REVISION": "bad/revision"}, clear=True
+        ):
+            with self.assertRaises(ConfigError):
+                load_config()
+
+    def test_revision_too_long_raises_config_error(self) -> None:
+        """ANKLANG_REVISION 超过 200 字符时 load_config 抛出 ConfigError。"""
+        from anklang.config import load_config
+
+        with patch.dict(
+            os.environ, {"ANKLANG_REVISION": "a" * 201}, clear=True
+        ):
+            with self.assertRaises(ConfigError):
+                load_config()
+
+    def test_revision_whitespace_only_means_none(self) -> None:
+        """ANKLANG_REVISION 只含空白时 load_config 返回 revision=None。"""
+        from anklang.config import load_config
+
+        with patch.dict(os.environ, {"ANKLANG_REVISION": "  "}, clear=True):
+            config = load_config()
+        self.assertIsNone(config.revision)
+
+
+class RevisionHeaderOnErrorPathsTests(unittest.TestCase):
+    """X-Anklang-Revision 出现在 401/400/503/405/408 等错误路径的响应上。"""
+
+    _REVISION = "err-rev-001"
+    _TOKEN = "service-token-abcdef123456"
+    _V1 = "/api/v1/checks/similarity"
+    _V2 = "/api/v2/checks/similarity"
+
+    def _make_harness(self, **overrides: Any) -> _Harness:
+        backend = _NoCallBackend()
+        cfg = _config(revision=self._REVISION, **overrides)
+        return _Harness(backend, cfg)
+
+    def test_header_on_401_unauthenticated(self) -> None:
+        """缺少令牌的 POST 返回 401 且带 X-Anklang-Revision。"""
+        harness = self._make_harness()
+        self.addCleanup(harness.close)
+        status, _payload, headers = harness.request(
+            "POST",
+            self._V2,
+            body=json.dumps({"apiVersion": "2", "problems": []}),
+            headers={"Content-Type": "application/json"},
+        )
+        self.assertEqual(status, 401)
+        self.assertEqual(headers["x-anklang-revision"], self._REVISION)
+
+    def test_header_on_400_invalid_request(self) -> None:
+        """请求正文不符合契约时返回 400 且带 X-Anklang-Revision。"""
+        harness = self._make_harness()
+        self.addCleanup(harness.close)
+        status, _payload, headers = harness.request(
+            "POST",
+            self._V2,
+            body=json.dumps({"apiVersion": "2", "problems": "not-a-list"}),
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {self._TOKEN}",
+            },
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(headers["x-anklang-revision"], self._REVISION)
+
+    def test_header_on_400_bad_content_length(self) -> None:
+        """Content-Length 非法时返回 400 且带 X-Anklang-Revision。"""
+        harness = self._make_harness()
+        self.addCleanup(harness.close)
+        status, _payload, headers = harness.request(
+            "POST",
+            self._V2,
+            body=b"{}",
+            headers={
+                "Content-Type": "application/json",
+                "Content-Length": "not-a-number",
+                "Authorization": f"Bearer {self._TOKEN}",
+            },
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(headers["x-anklang-revision"], self._REVISION)
+
+    def test_header_on_503_service_busy(self) -> None:
+        """满载时返回 503 且带 X-Anklang-Revision。"""
+        harness = self._make_harness(max_in_flight_checks=1)
+        self.addCleanup(harness.close)
+        # 占满唯一的并发名额
+        harness.runtime._in_flight = 1  # type: ignore[attr-defined]
+        status, _payload, headers = harness.request(
+            "POST",
+            self._V2,
+            body=json.dumps({"apiVersion": "2", "problems": []}),
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {self._TOKEN}",
+            },
+        )
+        self.assertEqual(status, 503)
+        self.assertEqual(headers["x-anklang-revision"], self._REVISION)
+
+    def test_header_on_405_method_not_allowed(self) -> None:
+        """不允许的方法返回 405 且带 X-Anklang-Revision。"""
+        harness = self._make_harness()
+        self.addCleanup(harness.close)
+        status, _payload, headers = harness.request(
+            "PUT",
+            self._V1,
+            body=b"",
+        )
+        self.assertEqual(status, 405)
+        self.assertEqual(headers["x-anklang-revision"], self._REVISION)
+
+    def test_header_on_408_client_timeout(self) -> None:
+        """请求正文超时返回 408 且带 X-Anklang-Revision。
+
+        使用极短的 client_idle_timeout_seconds，通过原始 socket 发送
+        Content-Length 但不发送正文，触发服务端读取超时。
+        """
+        import socket
+
+        harness = self._make_harness(client_idle_timeout_seconds=0.3)
+        self.addCleanup(harness.close)
+        sock = socket.create_connection(("127.0.0.1", harness.port), timeout=5)
+        try:
+            # 发送 POST 请求头，声明 Content-Length: 100 但不发送正文
+            request_line = (
+                f"POST {self._V2} HTTP/1.1\r\n"
+                f"Host: 127.0.0.1:{harness.port}\r\n"
+                "Authorization: Bearer " + self._TOKEN + "\r\n"
+                "Content-Type: application/json\r\n"
+                "Content-Length: 100\r\n"
+                "\r\n"
+            )
+            sock.sendall(request_line.encode("utf-8"))
+            # 等待服务端超时后返回 408
+            sock.settimeout(5)
+            raw = b""
+            while b"\r\n\r\n" not in raw:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                raw += chunk
+        finally:
+            sock.close()
+        # 解析状态行和响应头
+        self.assertTrue(raw, "server did not send a 408 response")
+        status_line = raw.split(b"\r\n", 1)[0].decode("ascii")
+        self.assertIn("408", status_line)
+        header_block = raw.split(b"\r\n\r\n", 1)[0]
+        header_text = header_block.decode("utf-8")
+        self.assertIn("X-Anklang-Revision: " + self._REVISION, header_text)
 
 
 if __name__ == "__main__":

@@ -16,10 +16,12 @@ Anklang 必须作为独立服务部署，不连接 Urmotiv 数据库。运行时
 - `POST /api/v2/checks/similarity`：新接口。请求 `apiVersion` 必须为 `"2"`。可信的完整、部分完成、
   不可用结果均返回严格 200 结构，并通过 `completion` 说明状态。
 
-所有成功和错误响应都会带 `Cache-Control: no-store`。若部署时注入了 `ANKLANG_REVISION` 环境变量
+所有成功和错误响应都会带 `Cache-Control: no-store`。若部署时通过构建参数注入了 `ANKLANG_REVISION`
 （如 `docker compose build --build-arg ANKLANG_REVISION=$(git rev-parse --short HEAD)`），则每个
 响应还会带 `X-Anklang-Revision` 头，供发布观测区分部署版本；留空则不输出。该值只允许字母、数字、
-点、下划线和连字符，不泄露路径或密钥。
+点、下划线和连字符，不泄露路径或密钥。Compose 的 `build.args` 注入的值会写入镜像 `ENV`，作为
+可靠默认值；`environment` 中不再重复设置该变量，避免空插值覆盖构建注入。如需运行时覆盖，在
+`private/anklang.env` 中设置 `ANKLANG_REVISION` 即可（`env_file` 优先于镜像 `ENV`）。
 
 路径和正文版本不匹配时固定返回 400。Anklang 的全部 HTTP 响应都带
 `Cache-Control: no-store`。反向代理不得覆盖或删除这个响应头，也不得自行缓存请求或响应正文。
