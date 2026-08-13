@@ -12,9 +12,29 @@ from urllib.parse import urlsplit
 
 from .yuantiji import calculate_search_budget_seconds
 
-
 class ConfigError(RuntimeError):
     pass
+
+_MAX_REVISION_LENGTH = 200
+_REVISION_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+
+
+def _read_revision(name: str) -> str | None:
+    """读取部署构建时注入的代码修订标识（如 Git 短哈希）。
+
+    修订标识由构建/部署流水线通过环境变量注入，而不是在请求时读取 Git 仓库，
+    因此只读环境变量。留空返回 None，表示部署未注入修订标识；非空时只允许
+    字母、数字、点、下划线和连字符，长度不超过 200，避免把路径、密钥或
+    控制字符伪装成修订标识写入响应头。
+    """
+    raw = os.environ.get(name, "").strip()
+    if raw == "":
+        return None
+    if len(raw) > _MAX_REVISION_LENGTH or _REVISION_RE.fullmatch(raw) is None:
+        raise ConfigError(
+            f"{name} 只能包含字母、数字、点、下划线和连字符，且不超过 200 个字符。"
+        )
+    return raw
 
 
 _MAX_REQUEST_WAIT_SECONDS = 100.0
@@ -246,6 +266,9 @@ class AppConfig:
     max_in_flight_checks: int = 16
     client_idle_timeout_seconds: float = 15.0
     shutdown_grace_seconds: float = 30.0
+    # 部署构建时注入的代码修订标识；留空表示未注入。由流水线通过环境变量提供，
+    # 不在请求时读取 Git 仓库。出现在每个 HTTP 响应头，用于区分部署版本。
+    revision: str | None = None
 
 
 def load_config() -> AppConfig:
@@ -361,4 +384,5 @@ def load_config() -> AppConfig:
         shutdown_grace_seconds=_read_float(
             "ANKLANG_SHUTDOWN_GRACE_SECONDS", 30.0, 1.0, 300.0
         ),
+        revision=_read_revision("ANKLANG_REVISION"),
     )

@@ -1,5 +1,7 @@
 """Anklang HTTP 服务：暴露 Urmotiv 插件调用的查重接口与健康检查。
 
+- GET  /api/v1/live                存活检查（无需令牌），固定返回，不做任何外部调用；
+- GET  /api/v1/ready               就绪检查（无需令牌），只验证本地状态，不做后端/网络调用；
 - GET  /api/v1/health              健康检查（无需令牌），透传当前检索后端的公开信息；
 - POST /api/v1/checks/similarity   旧版查重；只有完整结果返回 200；
 - POST /api/v2/checks/similarity   显式返回完整性和复用策略。
@@ -49,6 +51,7 @@ _MAX_REQUEST_BYTES = 4_000_000
 _V1_SIMILARITY_PATH = "/api/v1/checks/similarity"
 _V2_SIMILARITY_PATH = "/api/v2/checks/similarity"
 _LIVE_PATH = "/api/v1/live"
+_READY_PATH = "/api/v1/ready"
 _CACHE_SCHEMA_REVISION = "similarity-outcome-v2"
 _BUSY_RETRY_AFTER_SECONDS = 1
 
@@ -466,6 +469,8 @@ def make_handler(
                     200,
                     {"status": "ok", "service": "anklang", "apiVersion": "1"},
                 )
+            elif self.path == _READY_PATH:
+                self._handle_ready()
             elif self.path == "/api/v1/health":
                 self._handle_health()
             elif self.path in {_V1_SIMILARITY_PATH, _V2_SIMILARITY_PATH}:
@@ -631,6 +636,26 @@ def make_handler(
                 suppress_body=suppress_body,
             )
 
+        def _handle_ready(self) -> None:
+            """提供方无关的就绪检查：只验证本地服务/配置不变量，不调用任何
+            后端、不发起任何网络请求，也不读取题库。与 /api/v1/live（仅存活）
+            和 /api/v1/health（会透传上游后端状态）保持语义区分。"""
+            if runtime.accepting:
+                self._send(
+                    200,
+                    {"status": "ok", "service": "anklang", "apiVersion": "1", "ready": True},
+                )
+            else:
+                self._send(
+                    503,
+                    {
+                        "status": "not_ready",
+                        "service": "anklang",
+                        "apiVersion": "1",
+                        "ready": False,
+                    },
+                )
+
         def _handle_health(self) -> None:
             info: dict[str, Any] = {
                 "status": "ok",
@@ -731,6 +756,10 @@ def make_handler(
                 # Anklang 的任何响应都不应由浏览器或中间代理保存；健康信息和错误
                 # 也保持同一条简单、不可被调用方配置绕过的规则。
                 self.send_header("Cache-Control", "no-store")
+                # 每个响应都带部署修订标识，供发布观测区分版本；由构建/部署流水线
+                # 注入（ANKLANG_REVISION），请求时不做任何 Git 或文件系统访问。
+                if service.config.revision is not None:
+                    self.send_header("X-Anklang-Revision", service.config.revision)
                 if close_connection:
                     self.send_header("Connection", "close")
                 if (

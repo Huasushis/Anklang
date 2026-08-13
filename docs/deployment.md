@@ -7,11 +7,19 @@ Anklang 必须作为独立服务部署，不连接 Urmotiv 数据库。运行时
 ## 接口
 
 - `GET /api/v1/live`：无需令牌、固定本地完成的进程存活检查；不读取题库，不访问任何外部服务。
+- `GET /api/v1/ready`：无需令牌、提供方无关的就绪检查；只验证本地服务状态，不调用任何后端、
+  不发起任何网络请求，也不读取题库，返回 `Cache-Control: no-store`。与 `/live`（仅存活）和
+  `/api/v1/health`（透传上游后端状态）语义区分。
 - `GET /api/v1/health`：无需令牌的健康检查，只返回固定状态和安全计数。
 - `POST /api/v1/checks/similarity`：旧接口。请求 `apiVersion` 必须为 `"1"`。只有完整检查返回旧版
   200 成功结构；部分完成或不可用固定返回 503。
 - `POST /api/v2/checks/similarity`：新接口。请求 `apiVersion` 必须为 `"2"`。可信的完整、部分完成、
   不可用结果均返回严格 200 结构，并通过 `completion` 说明状态。
+
+所有成功和错误响应都会带 `Cache-Control: no-store`。若部署时注入了 `ANKLANG_REVISION` 环境变量
+（如 `docker compose build --build-arg ANKLANG_REVISION=$(git rev-parse --short HEAD)`），则每个
+响应还会带 `X-Anklang-Revision` 头，供发布观测区分部署版本；留空则不输出。该值只允许字母、数字、
+点、下划线和连字符，不泄露路径或密钥。
 
 路径和正文版本不匹配时固定返回 400。Anklang 的全部 HTTP 响应都带
 `Cache-Control: no-store`。反向代理不得覆盖或删除这个响应头，也不得自行缓存请求或响应正文。
@@ -131,7 +139,7 @@ similarity 路径使用同一 Bearer 令牌。不要用 shell 的 `source` 或 `
 2. 运行 `docker compose --env-file private/anklang.env up --build -d`。容器内显式监听
    `0.0.0.0:8730`，宿主端口固定映射到
    `127.0.0.1:${ANKLANG_PORT:-8730}`，不会直接监听所有宿主网卡。
-3. 用 `GET http://127.0.0.1:8730/api/v1/live` 检查进程存活，再用 `/api/v1/health` 检查后端就绪。
+3. 用 `GET http://127.0.0.1:8730/api/v1/live` 检查进程存活，用 `/api/v1/ready` 检查本地就绪，再用 `/api/v1/health` 检查后端就绪。
    Docker 健康检查只调用 `/live`，不会因监控探针触发任何外部请求。
 4. 停止时 Compose 默认给 45 秒，应用内部默认给 30 秒；前者必须始终大于后者。若在
    `private/anklang.env` 修改 `ANKLANG_SHUTDOWN_GRACE_SECONDS`，也要把
