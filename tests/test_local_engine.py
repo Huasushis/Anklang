@@ -136,16 +136,15 @@ class LocalEngineBackendTests(unittest.TestCase):
         search_result = backend.search(_QUERY_TEXT, k=5)
         results = search_result.candidates
         top = results[0]
-        self.assertEqual(top["source"], "unit-test")
-        self.assertIn("similarity", top)
+        self.assertEqual(
+            set(top),
+            {"source", "externalId", "title", "similarity"},
+        )
         self.assertTrue(0.0 <= top["similarity"] <= 1.0)
-        self.assertTrue(top["url"].startswith("http") if "url" in top else True)
-        self.assertIn("_reviewExcerpt", top)
 
-        result = build_result("a" * 64, [top], False, "已完成")
+        result = build_result("a" * 64, [top])
         serialized = json.dumps(result, ensure_ascii=False)
-        self.assertNotIn("_reviewExcerpt", result["candidates"][0])
-        self.assertNotIn("degraded", serialized)
+        self.assertEqual(set(result["candidates"][0]), set(top))
         self.assertNotIn("输出它们的和", serialized)
 
     def test_falls_back_to_keyword_when_embedding_unavailable(self) -> None:
@@ -156,7 +155,7 @@ class LocalEngineBackendTests(unittest.TestCase):
         self.assertEqual(search_result.status, "complete")
         self.assertEqual(self.opener.calls, 0)
 
-    def test_embedding_failure_marks_keyword_fallback_as_degraded(self) -> None:
+    def test_embedding_failure_marks_keyword_fallback_as_partial(self) -> None:
         # 注册的表里没有这个 query 文本，_FakeEmbeddingOpener 会抛 KeyError，
         # EmbeddingClient 应该把它当成失败，LocalEngineBackend 捕获后降级为关键词召回。
         broken_embedder, opener = _make_embedder({})

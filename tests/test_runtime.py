@@ -19,7 +19,7 @@ from unittest.mock import patch
 
 from anklang.__main__ import main
 from anklang.backends import BackendSearchResult
-from anklang.cache import ResultCache
+
 from anklang.config import AppConfig
 from anklang.server import (
     AnklangHTTPServer,
@@ -33,21 +33,9 @@ def _config(**overrides: Any) -> AppConfig:
     values = dict(
         port=8730,
         service_token="synthetic-service-token",
-        yuantiji_base_url="https://upstream.example.invalid",
-        yuantiji_timeout_seconds=12.0,
-        yuantiji_minimum_interval_seconds=0.0,
         search_k=8,
-        use_rerank=False,
         minimum_similarity=0.1,
-        block_threshold=0.9,
-        cache_ttl_seconds=3_600,
-        cache_max_entries=100,
-        llm_review_enabled=False,
-        llm_base_url=None,
-        llm_api_key=None,
-        llm_model="synthetic-review-model",
-        llm_review_top_n=2,
-        llm_timeout_seconds=10.0,
+        backend="local_engine",
         max_in_flight_checks=1,
         client_idle_timeout_seconds=0.15,
         shutdown_grace_seconds=0.15,
@@ -100,11 +88,6 @@ class _Harness:
         self.service = AnklangService(
             self.config,
             backend,
-            ResultCache(
-                self.config.cache_ttl_seconds,
-                self.config.cache_max_entries,
-            ),
-            None,
         )
         self.server = AnklangHTTPServer(
             ("127.0.0.1", 0), make_handler(self.service, self.runtime)
@@ -292,7 +275,6 @@ class ProcessSignalTests(unittest.TestCase):
             "ANKLANG_PORT": str(port),
             "ANKLANG_SHUTDOWN_GRACE_SECONDS": "1",
             "ANKLANG_CLIENT_IDLE_TIMEOUT_SECONDS": "1",
-            "YUANTIJI_MINIMUM_INTERVAL_SECONDS": "0",
         }
         process = subprocess.Popen(
             [sys.executable, "-m", "anklang"],

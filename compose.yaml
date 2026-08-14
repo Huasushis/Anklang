@@ -3,8 +3,6 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-      args:
-        ANKLANG_REVISION: "${ANKLANG_REVISION:-}"
     restart: unless-stopped
     init: true
     user: "10001:10001"
@@ -26,8 +24,6 @@ services:
       ANKLANG_MAX_IN_FLIGHT_CHECKS: "${ANKLANG_MAX_IN_FLIGHT_CHECKS:-16}"
       ANKLANG_CLIENT_IDLE_TIMEOUT_SECONDS: "${ANKLANG_CLIENT_IDLE_TIMEOUT_SECONDS:-15}"
       ANKLANG_SHUTDOWN_GRACE_SECONDS: "${ANKLANG_SHUTDOWN_GRACE_SECONDS:-30}"
-      # ANKLANG_REVISION 不在 environment 中列出：构建时通过 build args 注入的
-      # Dockerfile ENV 是可靠默认值；若需运行时覆盖，在 private/anklang.env 中设置。
     volumes:
       - anklang-problems-data:/app/problems-data
     tmpfs:

@@ -46,7 +46,7 @@ _NONCOMPLETE_REASON_CODES = {
     "search_backend_unavailable",
     "search_backend_invalid",
     "search_partial",
-    "review_unavailable",
+
     "service_unavailable",
     "service_invalid_response",
     "internal_error",
@@ -62,7 +62,6 @@ _V2_RESULT_KEYS = {
     "checkedAt",
     "completion",
     "candidates",
-    "recommendation",
     "reuse",
 }
 
@@ -142,21 +141,16 @@ def utc_now_z() -> str:
 def build_result(
     content_hash: str,
     candidates: list[dict[str, Any]],
-    block_submission: bool,
-    message: str,
     checked_at: str | None = None,
 ) -> dict[str, Any]:
+    """构造严格的 v1 查询结果；不携带判定、拦截或复核字段。"""
+
     if not isinstance(content_hash, str) or not _HASH_RE.match(content_hash):
         raise ContractError("响应的 contentHash 不合法。")
     if not isinstance(candidates, list):
         raise ContractError("响应候选必须是数组。")
-    if not isinstance(block_submission, bool):
-        raise ContractError("响应的拦截建议必须是布尔值。")
-    if not isinstance(message, str):
-        raise ContractError("响应说明必须是文本。")
 
     normalized = _normalize_candidates(candidates)
-    trimmed_message = _bounded_required(message, 2000, "recommendation.message")
     normalized_checked_at = checked_at or _utc_now_z()
     _parse_utc_z(normalized_checked_at, "checkedAt")
     result = {
@@ -164,10 +158,6 @@ def build_result(
         "contentHash": content_hash,
         "checkedAt": normalized_checked_at,
         "candidates": normalized,
-        "recommendation": {
-            "blockSubmission": block_submission,
-            "message": trimmed_message,
-        },
     }
     _validate_response_size(result)
     return result
@@ -176,42 +166,26 @@ def build_result(
 def build_v2_result(
     content_hash: str,
     candidates: list[dict[str, Any]],
-    block_submission: bool,
-    message: str,
     completion: dict[str, Any],
     reuse: dict[str, Any],
     checked_at: str | None = None,
 ) -> dict[str, Any]:
-    """构造并交叉校验 v2 响应。
-
-    这里同时执行分支字段和语义约束，避免调用方不慎把“部分检索”包装成可复用的
-    完整放行结论。
-    """
+    """构造并交叉校验 v2 查询结果。"""
 
     if not isinstance(content_hash, str) or not _HASH_RE.match(content_hash):
         raise ContractError("响应的 contentHash 不合法。")
     if not isinstance(candidates, list):
         raise ContractError("响应候选必须是数组。")
-    if not isinstance(block_submission, bool):
-        raise ContractError("响应的拦截建议必须是布尔值。")
-    if not isinstance(message, str):
-        raise ContractError("响应说明必须是文本。")
 
     normalized = _normalize_candidates(candidates)
-    trimmed_message = _bounded_required(message, 2000, "recommendation.message")
     normalized_checked_at = checked_at or _utc_now_z()
     checked_datetime = _parse_utc_z(normalized_checked_at, "checkedAt")
     normalized_completion = _normalize_completion(completion)
     normalized_reuse = _normalize_reuse(reuse, checked_datetime)
 
     status = normalized_completion["status"]
-    if status == "unavailable":
-        if normalized or block_submission:
-            raise ContractError("不可用结果不能携带候选或建议拦截。")
-    if status == "partial" and block_submission and not any(
-        candidate.get("sameProblemSuggestion") is True for candidate in normalized
-    ):
-        raise ContractError("部分结果只能由可信的同题复核结论建议拦截。")
+    if status == "unavailable" and normalized:
+        raise ContractError("不可用结果不能携带候选。")
     if status != "complete" and normalized_reuse["policy"] != "no-store":
         raise ContractError("非完整结果不得复用。")
 
@@ -221,10 +195,6 @@ def build_v2_result(
         "checkedAt": normalized_checked_at,
         "completion": normalized_completion,
         "candidates": normalized,
-        "recommendation": {
-            "blockSubmission": block_submission,
-            "message": trimmed_message,
-        },
         "reuse": normalized_reuse,
     }
     _validate_response_size(result)
@@ -232,26 +202,16 @@ def build_v2_result(
 
 
 def validate_v2_result(payload: Any) -> dict[str, Any]:
-    """重新验证即将发出的或从内部缓存读取的完整 v2 对象。"""
+    """重新验证即将发出的完整 v2 查询结果。"""
 
     if not isinstance(payload, dict):
         raise ContractError("v2 响应必须是对象。")
     _require_exact_keys(payload, _V2_RESULT_KEYS, "v2 响应")
     if payload.get("apiVersion") != "2":
         raise ContractError("v2 响应版本不合法。")
-    recommendation = payload.get("recommendation")
-    if not isinstance(recommendation, dict):
-        raise ContractError("recommendation 必须是对象。")
-    _require_exact_keys(
-        recommendation,
-        {"blockSubmission", "message"},
-        "recommendation",
-    )
     normalized = build_v2_result(
         content_hash=payload.get("contentHash"),
         candidates=payload.get("candidates"),
-        block_submission=recommendation.get("blockSubmission"),
-        message=recommendation.get("message"),
         completion=payload.get("completion"),
         reuse=payload.get("reuse"),
         checked_at=payload.get("checkedAt"),
@@ -285,16 +245,6 @@ def _normalize_candidates(candidates: list[dict[str, Any]]) -> list[dict[str, An
         url = _safe_http_url(candidate.get("url"))
         if url is not None:
             item["url"] = url
-        same_problem = candidate.get("sameProblemSuggestion")
-        if same_problem is not None:
-            if not isinstance(same_problem, bool):
-                raise ContractError("candidate.sameProblemSuggestion 必须是布尔值。")
-            item["sameProblemSuggestion"] = same_problem
-        explanation = candidate.get("explanation")
-        if explanation is not None:
-            item["explanation"] = _bounded_required(
-                explanation, 2000, "candidate.explanation"
-            )
         normalized.append(item)
     return normalized
 

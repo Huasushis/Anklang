@@ -11,7 +11,7 @@ import unittest
 from typing import Any
 
 from anklang.backends.local_engine import LocalEngineBackend
-from anklang.cache import ResultCache
+
 from anklang.config import AppConfig
 from anklang.embedding import EmbeddingClient, EmbeddingError
 from anklang.server import AnklangService, make_handler
@@ -94,21 +94,8 @@ def _service_config() -> AppConfig:
     return AppConfig(
         port=8730,
         service_token="service-token-abcdef123456",
-        yuantiji_base_url="https://yuantiji.test",
-        yuantiji_timeout_seconds=30.0,
-        yuantiji_minimum_interval_seconds=0.0,
         search_k=8,
-        use_rerank=False,
         minimum_similarity=0.1,
-        block_threshold=0.9,
-        cache_ttl_seconds=3_600,
-        cache_max_entries=100,
-        llm_review_enabled=False,
-        llm_base_url=None,
-        llm_api_key=None,
-        llm_model="test-model",
-        llm_review_top_n=2,
-        llm_timeout_seconds=30.0,
         backend="local_engine",
     )
 
@@ -455,8 +442,6 @@ class LocalEngineVectorSafetyTests(unittest.TestCase):
         service = AnklangService(
             config,
             backend,
-            ResultCache(config.cache_ttl_seconds, config.cache_max_entries),
-            None,
         )
         harness = _ServerHarness(service)
         self.addCleanup(harness.close)
@@ -471,7 +456,6 @@ class LocalEngineVectorSafetyTests(unittest.TestCase):
                     request
                 )
                 self.assertEqual(status, 200)
-                self.assertFalse(payload["recommendation"]["blockSubmission"])
                 self.assertEqual(payload["completion"]["status"], "partial")
                 self.assertEqual(payload["reuse"], {"policy": "no-store"})
                 self.assertEqual(

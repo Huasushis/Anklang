@@ -114,8 +114,8 @@ def ingest_once(store: ProblemStore, embedder: EmbeddingClient | None) -> Ingest
                         expected_dimensions=index_spec.dimensions,
                     )
                 except (EmbeddingError, ValueError):
-                    # embedding 服务暂不可用时先存 embedding=None，之后用
-                    # anklang.backfill 补算，不影响这道题先入库。
+                    # 向量服务暂不可用时仍写入题目；关键词检索立即可用。
+                    # 来源后续再次返回该题时，会重试缺失向量。
                     summary.embedding_failures += 1
                     embedding = None
             write_result = store.add_problem(

@@ -1,22 +1,14 @@
-"""阶段 2 本地检索后端：对自建题库做"向量召回 + 关键词召回"的混合检索。
+"""本地检索后端：对本地题库做"向量召回 + 关键词召回"的混合检索。
 
-设计对应 docs/plan.md 3.5 节的结论："分别取向量召回的 Top-K1 和关键词召回的
-Top-K2，取并集去重后，统一交给 LLM 复核环节做最终判断，不要自己再设计一套复杂的
-分数融合公式"——这里的合并策略就是"同一候选取两路分数中较高的一个"，不做加权求和
-之类更复杂的融合，融合之后的候选和阶段 1 一样交给 anklang.review.evaluate 判定。
-
-- 向量召回：把待查题面也算一次 embedding，和题库里每道已经算过向量的题目计算余弦
-  相似度（"向量检索"：把文字转换成一串数字组成的"向量"，越相似的文字向量在数学上
-  越"靠近"，通过比较向量距离找出相似题目）。
-- 关键词召回：没有依赖 SQLite 的 FTS5 全文检索扩展（部署环境的 SQLite 是否编译了
-  FTS5 不确定，为了不引入不确定的依赖，这里改用一个不需要任何扩展、纯 Python 的
-  字符/词粒度重合度打分，见本文件末尾的 _keyword_score），足以捕捉"整段题面几乎
-  逐字照抄"这种字面高度重合的情况——这正是 docs/plan.md 3.5 节里关键词检索要
-  补充覆盖的场景。
+向量召回把待查题面也转换成 embedding，和题库里每道已经算过向量的题目计算余弦相似度；
+关键词召回用纯 Python 的字符/词粒度重合度打分，覆盖"整段题面几乎逐字照抄"的情况。
+两路结果取并集去重，同一候选取两路分数中较高的一个。
 
 没配置 embedding 服务时，只要目标关键词索引身份完整，就会正常完成关键词召回；空题库、
 索引身份不完整或已配置的 embedding 调用失败会明确返回不可用或部分完成，不能把未检索到
-误报为“没有候选”。
+误报为"没有候选"。
+
+Anklang 是 is-my-problem-new（MIT，Copyright (c) 2023 Ziqian Zhong）的最小直接改编。
 """
 from __future__ import annotations
 
@@ -61,8 +53,7 @@ class LocalEngineBackend:
         try:
             snapshot = self.store.search_snapshot(self.index_spec)
         except Exception as error:
-            # 存储层读取失败时不让整个请求崩溃，转换成 BackendError 交给 server
-            # 降级处理，和阶段 1 反代后端遇到 YuantijiError 时的处理方式保持一致。
+            # 存储层读取失败时不让整个请求崩溃，转换成稳定的后端错误。
             raise BackendError("本地题库读取失败。") from error
 
         problems = snapshot.problems
@@ -75,7 +66,6 @@ class LocalEngineBackend:
             if complete:
                 return BackendSearchResult(
                     candidates=[],
-                    cache_identity=snapshot.cache_identity,
                 )
             return BackendSearchResult.unavailable(
                 reason_code="search_backend_unavailable",
@@ -88,7 +78,7 @@ class LocalEngineBackend:
                 query_vector = self.embedder.embed_one(query_text)
             except EmbeddingError:
                 # 已配置的文字转数字服务调用失败时仍做关键词检索，但要让服务层知道
-                # 结果不完整，从而不缓存；未配置服务本来就是正常的关键词模式。
+                # 结果不完整；未配置服务本来就是正常的关键词模式。
                 complete = False
                 partial_retryable = True
 
@@ -126,21 +116,12 @@ class LocalEngineBackend:
         if complete:
             return BackendSearchResult(
                 candidates=candidates,
-                cache_identity=snapshot.cache_identity,
             )
         return BackendSearchResult.partial(
             candidates,
             reason_code="search_partial",
             retryable=partial_retryable,
         )
-
-    def current_cache_identity(self) -> str | None:
-        """O(1) 核对当前索引是否仍可复用缓存，并返回不含配置原文的身份摘要。"""
-
-        try:
-            return self.store.inspect_index(self.index_spec).cache_identity
-        except Exception:
-            return None
 
     def describe_health(self) -> dict[str, Any]:
         try:
@@ -166,7 +147,6 @@ class LocalEngineBackend:
 
 
 def _to_candidate(problem: StoredProblem, similarity: float) -> dict[str, Any]:
-    snippet = " ".join(problem.statement.split())[:400]
     if isinstance(similarity, bool) or not isinstance(similarity, (int, float)):
         numeric_similarity = 0.0
     else:
@@ -178,14 +158,9 @@ def _to_candidate(problem: StoredProblem, similarity: float) -> dict[str, Any]:
         "externalId": problem.external_id,
         "title": problem.title,
         "similarity": max(0.0, min(1.0, numeric_similarity)),
-        "explanation": "该候选由本地题库的文字含义或字面重合信号找到，请人工核对来源记录。",
     }
     if problem.url:
         candidate["url"] = problem.url
-    if snippet:
-        # 仅供当前请求里的可选模型复核使用。contracts.build_result 不会把这个
-        # 内部字段写进返回结果，ResultCache 也只缓存已经清理过的契约结果。
-        candidate["_reviewExcerpt"] = snippet
     return candidate
 
 

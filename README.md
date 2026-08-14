@@ -1,228 +1,135 @@
 # Anklang
 
-Anklang 是 USTC 算法竞赛协会命题系统 Urmotiv 的配套服务，负责判断一道新题是不是"原题"
-（已经在某个公开题库出现过的题目）。
+Anklang 是公开项目 [is-my-problem-new](https://github.com/fjzzq2002/is-my-problem-new) 的小型直接改编：输入一道算法题的题面，返回按相似度排序的已知题目候选。
 
-## 定位
+上游作者为 Ziqian Zhong，许可证为 MIT；原版权声明和本项目声明都保存在 [`LICENSE`](LICENSE)。
 
-Anklang 是完全独立的服务：独立仓库、独立部署、独立数据库，只通过带版本号的 HTTP 接口
-（旧版 `POST /api/v1/checks/similarity` 和新版 `POST /api/v2/checks/similarity`）与 Urmotiv 通信。Urmotiv 不会把候选题的正文或 Anklang 的
-公开题库复制进自己的数据库；Anklang 也不读取、不连接 Urmotiv 的数据库。这样设计是为了让
-"抓取和检索公开题库"带来的合规风险、维护成本和模型密钥，都不落在 Urmotiv 主系统上。
+## 与上游的对应关系
 
-## 当前状态
+上游核心流程是“题面 → embedding（把文字转成向量）→ 余弦相似度检索 → 候选排序”。Anklang 保留该流程：
 
-- **阶段 1 已实现并默认启用。** 这是转发模式：把 Urmotiv 的请求交给 yuantiji.ac 检索，
-  再把结果整理成双方约定的数据结构。它只缓存完整结果，也可以调用大语言模型复核最相似的
-  候选是否为同一道题。阶段 1 已完成真实联调。
-- **阶段 2 的本地检索主体已实现，但默认关闭。** 它把题面转换成数字列表，再比较这些数字找出
-  含义相近的题目，同时用字面重合补充搜索；在转换服务不可用时内部仍可做字面搜索，但整次请求
-  会明确标成未完成，不能据此自动放行、拒绝或缓存。当前仓库没有
-  正式公开题库数据，因此它还不能替代默认转发模式。
-- **阶段 3 的来源接口、导入调度和示例来源已实现。** “来源接口”是让不同题目来源按同一组函数
-  提供数据的约定。仓库只包含读取本地示例数据的 `example_static`，不包含真实爬虫；vjudge 来源
-  仍因规模、合规、账号和代理维护风险而推迟。
+- 上游 `src/embedder.py` / v2 embedding 调用对应 `anklang/embedding.py`；
+- 上游 `src/ui.py` / v2 `ui/server.py` 的查询和向量搜索对应 `anklang/server.py` 与 `anklang/backends/local_engine.py`；
+- 上游静态题库索引改为 `anklang/store.py` 的 SQLite 当前快照；
+- 新增 `anklang/sources/` 与 `anklang/ingest.py`，让来源数据增量进入同一索引。
 
-全部代码使用 Python 3.11+ 标准库实现。部署服务器没有 pip/venv，因此不需要、也不应该为了运行
-本项目安装 FastAPI、Pydantic、numpy 等第三方包。
+改动范围只包括可配置的百炼 embedding 提供方、运行时增量来源插件和供 Urmotiv 调用的版本化 HTTP 查询接口。没有 LLM 复核、通过/拦截政策、准确率标定、流程采集、yuantiji 代理或结果缓存。
 
-### 判定和失败处理
+## 数据流
 
-相似度数字还没有用足够大的人工标注题集校准，因此服务默认只展示候选，不会只凭这个数字建议拦截
-投稿。只有完成标定并明确设置 `ANKLANG_SIMILARITY_BLOCK_ENABLED=true` 后，
-`ANKLANG_BLOCK_THRESHOLD` 才会参与拦截判断。可选的模型复核若明确判断为同题，仍会建议先核实再
-提交；界面只显示固定结论，不会把候选题面片段或模型生成的原话写入响应、缓存或日志。
+```text
+来源插件 ──增量题目/更新时间──> ingest_once ──幂等写入──> SQLite 当前索引
+                                                               │
+查询题面 ──可选百炼 embedding──> 向量 + 关键词召回 ──排序──────┘
+                                                               │
+                                                               └─> 候选列表
+```
 
-v2 会明确区分三种完成状态：`complete` 表示本次检索和已配置的复核全部完成；`partial` 表示仍有
-可信候选可供人工查看，但有一路搜索或复核没有完成；`unavailable` 表示无法形成可信候选。部分结果
-不能只凭相似度阈值自动拦截，只有本次成功的模型复核明确给出同题结论时才可建议拦截。不可用结果
-固定为空候选且不建议拦截。两种非完整结果都带固定原因和是否适合重试，不进入内部缓存。
+新增或更新题目写入后，下一个查询从当前 SQLite 快照读取，服务无需重启，也不需要离线全量重建。
 
-v1 的成功响应形状保持不变，但它无法表达“部分完成”。因此只有完整结果返回旧版 200；任何
-`partial` 或 `unavailable` 都返回固定 503，绝不再用“空候选 200”伪装检查成功。v2 的三种可信
-结构都返回 200；只有服务连契约结构也无法安全形成时才返回固定 500/503。请求不合法返回 400，
-令牌缺失或错误返回 401。两个相似度接口的所有响应都带 `Cache-Control: no-store`，避免 HTTP
-代理或浏览器保存题目相关结果；健康检查和固定错误同样使用 `no-store`，服务没有可由调用方绕过的
-HTTP 缓存分支。
+## HTTP 查询接口
 
-`GET /api/v1/live` 是只检查当前进程仍能响应的存活探针，固定在本地完成，不读取题库，也不调用
-yuantiji、文字转数字服务或模型。`GET /api/v1/ready` 是提供方无关的就绪探针，只验证本地服务
-状态（是否仍在接受请求），同样不调用任何后端、不发起任何网络请求，也不读取题库，返回
-`Cache-Control: no-store`。容器编排判断进程是否存活时应使用 `/live`；判断服务是否准备好
-接受查重请求且不需要依赖外部后端可用时，可使用 `/ready`。`GET /api/v1/health` 继续提供后端
-就绪状态，可能访问外部搜索后端；它与 `/live` 和 `/ready` 保持语义区分。
-部署构建时注入的 `ANKLANG_REVISION` 环境变量（如 Git 短哈希）会作为 `X-Anklang-Revision`
-响应头出现在每个成功和错误响应上，供发布观测区分部署版本；留空则不输出该头。该值由构建/
-部署流水线注入，请求时不做任何 Git 或文件系统访问，且只允许字母、数字、点、下划线和连字符，
-不会泄露路径或密钥。
+- `POST /api/v1/checks/similarity`：兼容的完整查询接口；查询不完整时返回固定 503。
+- `POST /api/v2/checks/similarity`：返回完整、部分完成或不可用状态。
+- `GET /api/v1/live`：进程存活。
+- `GET /api/v1/ready`：本地就绪状态，不调用后端或网络。
+- `GET /api/v1/health`：本地索引和 embedding 可用状态，不返回密钥。
 
-v2 的 `reuse` 只描述调用方是否可以在业务层复用这次判断：只有完整结果可能是
-`{"policy":"allowed","expiresAt":"...Z"}`，且有效期最多七天；其他情况都是
-`{"policy":"no-store"}`。`checkedAt` 是实际计算完成的原始时间，缓存命中不会刷新它或
-`expiresAt`。内部缓存键同时绑定规范化请求摘要、接口版本、判断配置和本地索引身份；调用方即使
-错误复用同一个 `contentHash` 发送不同题面，也不会命中旧结果。
+v1 成功响应严格为：
 
-转发模式只把题面的前 16,000 个字符送给上游。暂时性失败默认只再试一次；连续失败三次后暂停访问
-60 秒，再允许一次恢复尝试。健康检查结果保留 60 秒，避免监控请求反过来频繁访问上游。这些数值
-都可在 `.env.example` 中调整，但上游等待、再次尝试、请求间隔、本地文字转数字和可选模型复核
-合计最多配置为 100 秒。调用方的超时必须设置为至少 120 秒，给处理与传输留出时间；Urmotiv 插件
-应设置为它允许的 120,000 毫秒。默认反代组合按配置计算约 33 秒。
+```json
+{
+  "apiVersion": "1",
+  "contentHash": "64 位小写十六进制",
+  "checkedAt": "2026-08-14T00:00:00.000Z",
+  "candidates": [
+    {
+      "source": "example",
+      "externalId": "problem-1",
+      "title": "示例标题",
+      "similarity": 0.82,
+      "url": "https://example.invalid/problem-1"
+    }
+  ]
+}
+```
 
-一次上游检索从进入服务时就共用同一份等待时间：本地排队最多 5 秒，之后的请求间隔、再次尝试前
-等待和每次网络调用都会先检查还剩多少时间，每次网络调用也只会拿到剩余时间。这里限制的是配置值
-和正常网络操作；Python 标准库的超时不能保证在对方故意持续、极慢地传输少量数据时，于某个墙钟
-时刻强制切断连接。
+v2 只增加检索完整性和复用状态：
 
-### 运行
+```json
+{
+  "apiVersion": "2",
+  "contentHash": "64 位小写十六进制",
+  "checkedAt": "2026-08-14T00:00:00.000Z",
+  "completion": {
+    "status": "complete",
+    "reasonCode": "complete",
+    "retryable": false
+  },
+  "candidates": [],
+  "reuse": {"policy": "no-store"}
+}
+```
 
-```sh
-# 需要 Python 3.11+，无第三方依赖
-# 先由部署平台或进程管理器传入 ANKLANG_SERVICE_TOKEN，再启动：
+接口只返回检索候选。是否重复、是否可作参考以及后续流程均由 Urmotiv 决定。
+
+## 运行
+
+本机只使用 Python 3.11 标准库：
+
+```bash
+export PYTHONPATH=.
 python3 -m anklang
-# 默认只监听 127.0.0.1:8730；提供 /api/v1/live、/api/v1/ready、/api/v1/health，
-# 以及 v1/v2 两个 similarity 接口
 ```
 
-在 Urmotiv 管理后台启用"原题相似度检查"插件，把 baseUrl 指向本服务地址、
-serviceToken 密钥填成进程收到的同一个令牌即可。`.env.example` 只是一份字段与默认值参考，
-程序不会自动读取它。真实密钥应由部署平台或进程管理器传入；不要用 shell 的 `source` 或 `.`
-加载密钥文件，特殊字符可能导致命令失败并把密钥回显到终端。
-独立部署和从 v1 切换到 v2 的步骤见 [`docs/deployment.md`](docs/deployment.md)。
+程序不自动读取 `.env`。不要用 shell 的 `source` 或 `.` 加载真实环境文件。配置字段见 [`.env.example`](.env.example)。
 
-生产环境应把 `ANKLANG_REQUIRE_SERVICE_TOKEN=true`，否则配置遗漏可能把无鉴权服务启动起来。服务
-会限制同时进行的查重数；满载或进入退出流程后，在读取正文和调用后端前固定返回 503
-`SERVICE_BUSY`。慢客户端正文有连续无数据时限；收到 `SIGTERM` 或 `SIGINT` 后停止接收新查重，
-并只在配置的宽限时间内等待已经开始的请求。具体变量与取值范围见 `.env.example`。
+关键配置：
 
-### Docker Compose
+- `ANKLANG_BIND_HOST`、`ANKLANG_PORT`：监听地址和端口；
+- `ANKLANG_SERVICE_TOKEN`、`ANKLANG_REQUIRE_SERVICE_TOKEN`：服务鉴权；
+- `ANKLANG_LOCAL_DB_PATH`：SQLite 索引路径；
+- `ANKLANG_SEARCH_K`、`ANKLANG_MINIMUM_SIMILARITY`：候选数量和显示下限；
+- `DASHSCOPE_BASE_URL`、`DASHSCOPE_API_KEY`、`DASHSCOPE_EMBEDDING_MODEL`、`DASHSCOPE_EMBEDDING_DIM`：OpenAI 兼容的百炼 embedding；
+- `ANKLANG_INGEST_ENABLED`、`ANKLANG_INGEST_INTERVAL_SECONDS`：运行时增量抓取。
 
-仓库根目录提供独立的 `compose.yaml`。先把 `.env.example` 复制为被 Git 整体忽略、权限仅当前用户
-可读的 `private/anklang.env`，配置至少 16 字符的 `ANKLANG_SERVICE_TOKEN`，再用
-`docker compose --env-file private/anklang.env up --build -d` 启动。不要用 `source` 或 `.` 加载
-这个文件，也不要把会展开令牌的 `docker compose config` 输出保存到日志。
+没有 embedding 配置时，服务正常使用关键词召回。已配置提供方调用失败时，v2 返回 `partial` 和仍可用的关键词候选；不会把失败说成完整空结果。
 
-容器内明确监听 `0.0.0.0:8730`，宿主端口则固定只绑定 `127.0.0.1`。镜像以非 root 用户运行；
-Compose 使用只读根文件系统、移除全部 Linux capabilities（进程的额外系统权限）、禁止获取新权限，
-且只给 `/app/problems-data` 和临时目录必要的写权限。健康检查只访问本地 `/api/v1/live`；
-默认 45 秒的容器停止宽限大于应用默认的 30 秒宽限。若覆盖任一数值，
-`ANKLANG_STOP_GRACE_PERIOD` 必须始终大于 `ANKLANG_SHUTDOWN_GRACE_SECONDS`。
+## 来源插件
 
-Urmotiv 同级仓库的 `compose.yaml` 也提供默认关闭的 `anklang` profile。该组合方式仍读取同一个
-`Anklang/private/anklang.env`，容器内地址为 `http://anklang:8730`，宿主只绑定
-`127.0.0.1:8730`；不要为了组合部署把服务令牌或外部密钥复制进 Urmotiv 的主环境文件。
+在 `anklang/sources/<name>/` 添加包，并提供：
 
-### 使用本地检索与来源导入
-
-把 `ANKLANG_BACKEND` 设为 `local_engine` 后，服务会使用本地 SQLite 文件。SQLite 是 Python
-自带的单文件数据库，不需要另起数据库服务。路径、搜索数量、文字转数字服务和定时导入开关见
-`.env.example`。所有这些变量同样由部署平台或进程管理器传入。
-
-```sh
-# 跑一轮来源导入；当前公开仓库只会发现 example_static 示例来源。
-python3 -m anklang.ingest
-
-# 给已经入库、但还没有数字列表的题目补算；需要配置 DASHSCOPE_* 变量。
-python3 -m anklang.backfill
+```text
+SOURCE_NAME: str
+fetch_new_problems(since: str | None) -> list[RawProblem]
 ```
 
-新增来源时，在 `anklang/sources/<名称>/` 中实现 `SOURCE_NAME` 和
-`fetch_new_problems(since)`。自行编写的公开题目抓取代码不能进入公开仓库；应优先使用明确允许
-程序访问的官方接口，并在接入前核对来源网站规则和许可证。
+`since` 是该来源上次成功推进的 UTC 时间游标。来源返回新增或更新题目；框架负责字段校验、题面规范化、内容哈希、可选 embedding、`(source, external_id)` 幂等写入和游标比较交换。完整约束见 [`docs/plan.md`](docs/plan.md)。
 
-来源给出的题目更新时间必须使用统一的 UTC 格式，例如 `2026-01-01T00:00:00.000Z`。同一来源
-再次给出同一题号时，只有明确较新的版本才能更新题面、标题或链接；时间缺失、旧版本或同一时间却
-内容冲突时都会保留原记录并报告跳过，不按到达顺序猜测新旧。题面变化时会清掉旧的文字含义数字
-列表，后台补算也只会在题面摘要没变且向量仍为空时写回。游标更新会核对本轮开始时读到的旧值，
-并发的旧任务不能把新游标倒退；重复全量导入也会先比较内容，避免为未变化题目重复调用付费服务。
+手工执行一轮：
 
-本地向量不能只靠“维度相同”判断可以混用。程序会在 SQLite 的 `index_metadata` 表中机器登记并
-严格核对模型、维度、当前代码支持的索引构建版本、由实际 `(来源, 题号, 题面摘要)` 集合计算的
-语料修订值、题目行数和向量行数。向量服务的响应还必须明确声明它实际使用了请求中的模型；缺少
-声明、同维但模型不同、维度变化、旧库已有向量却没有正式元数据、元数据多键少键或计数不符时，
-程序都不会写入或使用任何向量。后端仍可做字面搜索；v2 会把可信字面候选作为 `partial` 返回，
-明确要求人工核对且不缓存，v1 则返回固定 503；健康检查也只给出固定状态，不输出题面、模型标识、
-服务地址或密钥。
-空题库以及正式向量索引中只有部分题目带向量也属于未完成，不能把没有召回误报为“可以继续提交”。
-语料修订值把每行三个字段按长度前缀规范编码并加域标记做 SHA-256，再对所有不重复题目身份的摘要
-逐字节异或；`problem_count` 与数据库唯一键共同防止重复项抵消。该算法版本由
-`index_build_revision` 约束，算法改变必须使用新数据库重建，不能沿用旧修订值。
-每轮 ingest/backfill 的门禁会从实际身份/摘要和向量各流式核对一次；通过后，每行写入只在同一事务
-增量切换旧/新行摘要并调整计数，不会为每道题重扫全库。健康检查也不会读取题面或解包向量：它只
-核对最近完整验证留下的 `PRAGMA data_version`（SQLite 的连接外变更版本）和七行元数据；其他连接一旦
-提交任何变化，就先返回 `verification_required`，等下一次正式 preflight 或搜索完整复核后再恢复。
-本地完整结果的内存缓存还会绑定一份不含配置原文的索引身份摘要，其中包括上述模型/维度/构建状态、
-语料修订值、完整性状态、已验证的 `data_version` 和当前进程的正式写入代际。每次缓存命中前只用
-`data_version` 与七行元数据做 O(1) 门禁；题目标题、链接、题面或向量经正式路径改变，或语料新增、
-索引变为部分完成或元数据被外部连接改动后，旧结果不会跨身份复用。远程后端同样只缓存完整结果，
-并绑定本次请求和判断配置的摘要。
-
-模型、维度或索引构建方式变化时必须非破坏性重建，不能在原文件上试图“修复”元数据：
-
-1. 保留旧数据库和旧部署配置，不删除、不清空旧向量。
-2. 把 `ANKLANG_LOCAL_DB_PATH` 指向一个新的、尚不存在的项目内数据库文件，并使用目标模型和维度；
-   从已经完成许可证核对的来源重新运行 `python3 -m anklang.ingest`，再运行 backfill。
-3. 核对健康检查中的 `localProblemCount`、`indexMetadataReady`、`vectorIndexReady` 和
-   `vectorIndexStatus`，并按下节用这份数据库的只读快照完成标定。`vectorIndexStatus=ready` 才表示
-   向量路径身份和内容均通过核对。
-4. 验证完成后再把服务切换到新路径。需要回滚时，同时恢复旧数据库路径及其原模型/维度配置；旧
-   文件仍在，因此不需要覆盖新库或把旧向量复制回来。
-
-没有旧向量的关键词库可以由程序安全登记元数据后继续补算；已有未知向量的旧库会被明确拒绝。
-`ingest` 和 `backfill` 都会在发现来源、读取题面或调用外部模型之前执行这道门禁。
-纯字面索引会登记固定的“未使用向量”状态；只有在向量行数仍为零时，backfill 才能把它显式升级为
-当前模型和维度，随后同样不能原地换模型。
-
-### 相似度标定
-
-工程测试通过只说明服务按接口运行，不代表原题判断准确。仓库提供一个只产证据的本地标定入口；它
-不会修改线上配置、不会打开自动拦截，也不会调用 LLM 复核：
-
-```sh
-python3 -m anklang.calibrate \
-  --workspace problems-data/calibration \
-  --dataset problems-data/calibration/dataset.json \
-  --corpus-manifest problems-data/calibration/corpus.json \
-  --label public-baseline-20260801
+```bash
+PYTHONPATH=. python3 -m anklang.ingest
 ```
 
-Fermata 的审题流程标定还需要一批逐请求、逐响应绑定的 Anklang v2 证据。正式采集必须使用干净的
-Git 提交和 Git 已忽略的私有 manifest；采集器对每个外部请求只调用一次，任何取消、缺失、HTTP
-错误、非完整响应或批次前后健康状态变化都会拒绝生成完成标记。manifest 字段、权限要求、恢复语义
-和安全输出格式见 [`docs/review-flow-capture.md`](docs/review-flow-capture.md)。交给 Fermata 前再运行
-其中的只读 `verify-capture`，从私有原始文件完整重放证明；它不会联网或修复失败批次。
+生产服务设置 `ANKLANG_INGEST_ENABLED=true` 后在进程内周期执行同一入口。
 
-上面这条命令只适用于不外发题面的本地关键词模式，而且
-`ANKLANG_LOCAL_DB_PATH` 必须正好指向清单绑定的只读 SQLite 快照。默认反向代理或已配置外部
-embedding 时，程序默认拒绝发送；确认当前这一次允许外发后，还必须显式添加
-`--allow-external-statements`，该许可会进入报告的后端摘要。
+## 容器部署
 
-真实题面、人工答案、检查点和报告全部留在被 Git 忽略且权限受限的
-`problems-data/calibration/`。程序把数据、设置、代码、后端和实际语料快照绑定到报告；标签不能覆盖，
-同标签由独占锁保护。每条检索前会同步登记进行中样本；若此时中断，恢复会把它记为取消且绝不自动
-重发，防止重复付费调用。任何异常、取消、缺失或跳过都会让报告判为不完整。
-
-完整也不等于足以推荐阈值：每个 calibration/holdout 分组至少各有 100 个正例和 100 个反例，召回率
-和假拦截率的 95% 保守区间都达标，并且 SQLite 内容、向量模型、维度和索引构建版本可由实际快照核对
-时，才可能提供建议；无法证明实际远端语料的反向代理报告不会推荐阈值。该入口从不修改运行时阈值或
-自动拦截开关。数据格式、指标定义、权限要求和基线/候选对比流程见
-[`docs/calibration.md`](docs/calibration.md)。
-
-### 测试
-
-```sh
-python3 -m unittest discover -s tests
+```bash
+docker compose config -q
+docker compose build
 ```
 
-## 文档索引
+Compose 只把 `127.0.0.1:${ANKLANG_PORT:-8730}` 暴露到宿主机，并以非 root、只读根文件系统运行。部署步骤和检查见 [`docs/deployment.md`](docs/deployment.md)。
 
-- [`AGENTS.md`](AGENTS.md)：开发约定，包括与 Urmotiv 的接口契约、安全红线、开发顺序建议和
-  测试要求。第一次接手这个项目，从这份文件开始读。
-- [`docs/plan.md`](docs/plan.md)：从零设计时留下的分阶段规划和决策记录。文档顶部说明了当前
-  标准库实现与最初技术设想的差异；来源合规、vjudge 暂缓原因和待人工决定事项仍可作为背景。
-- [`docs/calibration.md`](docs/calibration.md)：相似度标定的私有数据格式、不可覆盖检查点、安全
-  汇总指标与恢复方法。
-- [`docs/deployment.md`](docs/deployment.md)：独立部署、v1/v2 行为差异和安全迁移检查单。
+## 验证
 
-## 许可证
+```bash
+PYTHONPATH=. python3 -m unittest discover -s tests
+python3 -m compileall -q anklang tests
+docker compose config -q
+docker build -t anklang:verify .
+```
 
-MIT License，见 [`LICENSE`](LICENSE)。
+测试只使用合成数据、注入的 embedding 响应和回环 HTTP，不发起真实外部请求。旧的 32/32 标定记录属于已废止范围的历史实验，不是 Anklang 当前实现或验收证据。

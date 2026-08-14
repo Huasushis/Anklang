@@ -9,7 +9,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from anklang.backfill import backfill_missing_embeddings
+
+from anklang.backends.local_engine import LocalEngineBackend
 from anklang.ingest import ingest_once, main
 from anklang.sources import (
     RawProblem,
@@ -114,8 +115,7 @@ class IngestFrameworkTests(unittest.TestCase):
         problems = self.store.iter_all()
         sources = {p.source for p in problems}
         self.assertIn(SOURCE_NAME, sources)
-        # 没有传 embedder，走的是"embedding 服务暂不可用"的降级分支，不应该报错，
-        # 也不应该产生向量——留给之后的 backfill 补算。
+        # 未配置向量服务是受支持的关键词检索模式，不应产生向量。
         self.assertTrue(all(p.embedding is None for p in problems if p.source == SOURCE_NAME))
 
     def test_cursor_prevents_refetch_of_same_items(self) -> None:
@@ -234,13 +234,23 @@ class IngestFrameworkTests(unittest.TestCase):
             SOURCE_NAME="updating-example",
             fetch_new_problems=fetch_new_problems,
         )
+        backend = LocalEngineBackend(
+            self.store,
+            embedder=None,
+            vector_top_k=10,
+            keyword_top_k=10,
+        )
         with patch("anklang.ingest.discover_source_modules", return_value=[source]):
             first = ingest_once(self.store, embedder=None)
+            first_query = backend.search("first content", 5)
             second = ingest_once(self.store, embedder=None)
+            second_query = backend.search("second content", 5)
             third = ingest_once(self.store, embedder=None)
 
         self.assertEqual(first.inserted, 1)
+        self.assertEqual(first_query.candidates[0]["title"], "version 1")
         self.assertEqual(second.updated, 1)
+        self.assertEqual(second_query.candidates[0]["title"], "version 2")
         self.assertEqual(third.fetched, 0)
         problem = self.store.iter_all()[0]
         self.assertEqual(problem.title, "version 2")
@@ -637,30 +647,6 @@ class IngestFrameworkTests(unittest.TestCase):
         self.assertEqual(caught.exception.status, "model_mismatch")
         discover.assert_not_called()
         embed_one.assert_not_called()
-
-    def test_backfill_refuses_dimension_change_before_model_call(self) -> None:
-        self.store.prepare_embedding_writes(EmbeddingIndexSpec("model-a", 2))
-        self.store.add_problem(
-            source="s",
-            external_id="one",
-            title="one",
-            statement="body",
-            content_hash="h",
-        )
-        embed_one = Mock(return_value=[1.0, 0.0, 0.0])
-        embedder = SimpleNamespace(
-            model="model-a",
-            dimensions=3,
-            embed_one=embed_one,
-        )
-        with self.assertRaises(IndexMetadataError) as caught:
-            backfill_missing_embeddings(
-                self.store,
-                embedder,  # type: ignore[arg-type]
-            )
-        self.assertEqual(caught.exception.status, "dimension_mismatch")
-        embed_one.assert_not_called()
-        self.assertIsNone(self.store.iter_all()[0].embedding)
 
 
 if __name__ == "__main__":

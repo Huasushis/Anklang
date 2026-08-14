@@ -3,11 +3,6 @@ FROM python:3.11-slim
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
-# 部署修订标识由构建流水线注入（如 git rev-parse --short HEAD），运行时只从
-# 环境变量读取，不做任何 Git 访问；未注入时保持未设置，服务端不输出该响应头。
-ARG ANKLANG_REVISION=
-ENV ANKLANG_REVISION=${ANKLANG_REVISION}
-
 WORKDIR /app
 
 RUN groupadd --system --gid 10001 anklang \

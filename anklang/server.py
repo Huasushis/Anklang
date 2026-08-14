@@ -8,15 +8,14 @@
 
 鉴权用常量时间比较；错误响应只给出稳定的中文说明，不泄露上游细节或密钥。
 
-"检索后端"（SearchBackend，见 anklang/backends/__init__.py）是可切换的：默认
-reverse_proxy（转发给 yuantiji.ac，阶段 1，生产默认），可选 local_engine（阶段 2
-的本地题库向量+关键词混合检索）。AnklangService 本身不关心具体是哪一种，只调用
-统一接口，两种后端切换不影响缓存、契约校验、LLM 复核这些通用逻辑。
+检索后端只有 local_engine（本地 SQLite 题库向量+关键词混合检索）。AnklangService
+本身不关心后端内部实现，只调用统一接口。
+
+Anklang 是 is-my-problem-new（MIT，Copyright (c) 2023 Ziqian Zhong）的最小直接改编。
 """
 from __future__ import annotations
 
 import hmac
-import hashlib
 import json
 import signal
 import socket
@@ -27,8 +26,6 @@ from typing import Any
 
 from .backends import BackendError, BackendSearchResult, CompletionReason, SearchBackend
 from .backends.local_engine import LocalEngineBackend
-from .backends.reverse_proxy import ReverseProxyBackend
-from .cache import ResultCache
 from .config import AppConfig
 from .contracts import (
     ContractError,
@@ -40,19 +37,13 @@ from .contracts import (
 )
 from .embedding import EmbeddingClient
 from .ingest import ingest_once
-from .llm import LlmClient
-from .review import evaluate
 from .store import IndexMetadataError, ProblemStore
-from .yuantiji import YuantijiClient
 
-# 合法题面最多 500,000 个 UTF-16 单元；控制字符经 JSON 转义后一个单元可能
-# 占 6 字节，因此请求上限要高于 3MB。2MB 只用于响应上限。
 _MAX_REQUEST_BYTES = 4_000_000
 _V1_SIMILARITY_PATH = "/api/v1/checks/similarity"
 _V2_SIMILARITY_PATH = "/api/v2/checks/similarity"
 _LIVE_PATH = "/api/v1/live"
 _READY_PATH = "/api/v1/ready"
-_CACHE_SCHEMA_REVISION = "similarity-outcome-v2"
 _BUSY_RETRY_AFTER_SECONDS = 1
 
 
@@ -132,14 +123,9 @@ class AnklangService:
         self,
         config: AppConfig,
         backend: SearchBackend,
-        cache: ResultCache,
-        llm_client: LlmClient | None,
     ) -> None:
         self.config = config
         self.backend = backend
-        self.cache = cache
-        self.llm_client = llm_client
-        self._pipeline_identity = _pipeline_identity(config)
 
     def check_similarity(
         self,
@@ -147,31 +133,11 @@ class AnklangService:
         *,
         api_version: str = "2",
     ) -> dict[str, Any]:
-        """返回一份经过严格校验的 v2 结果，供两个 HTTP 版本安全投影。
-
-        ``api_version`` 只参与缓存命名空间，防止未来两个入口处理步骤分化后跨版本
-        复用；结果本身始终是信息更完整的 v2 内部形状。
-        """
+        """返回一份经过严格校验的 v2 结果，供两个 HTTP 版本安全投影。"""
 
         if api_version not in {"1", "2"}:
             raise ValueError("服务端 API 版本不合法。")
         content_hash = request["content_hash"]
-        cache_lookup = self._current_cache_lookup(request, api_version)
-        if cache_lookup is not None:
-            cache_key, initial_backend_identity = cache_lookup
-            cached = self.cache.get(cache_key)
-            if cached is not None:
-                if not isinstance(self.backend, LocalEngineBackend):
-                    return cached
-                # cache.get() 与返回结果之间，后台 ingest 或另一个 SQLite 连接
-                # 仍可能改变索引。再次做 O(1) 身份门禁；身份包含 data_version
-                # 和当前进程写入代际，所以内容被改回原值的 ABA 窗口也会失配。
-                confirmed_identity = self.backend.current_cache_identity()
-                if (
-                    confirmed_identity is not None
-                    and confirmed_identity == initial_backend_identity
-                ):
-                    return cached
 
         try:
             search_result = self.backend.search(
@@ -199,14 +165,9 @@ class AnklangService:
                 retryable=search_result.retryable,
                 retry_after_seconds=search_result.retry_after_seconds,
             )
+
         try:
-            decision = evaluate(
-                self.config,
-                request,
-                search_result.candidates,
-                self.llm_client,
-                search_complete=search_result.status == "complete",
-            )
+            candidates = _rank_candidates(self.config, search_result.candidates)
         except (ContractError, KeyError, TypeError, ValueError, OverflowError):
             return self._build_unavailable_result(
                 content_hash,
@@ -214,84 +175,18 @@ class AnklangService:
                 retryable=False,
             )
 
-        try:
-            review_failed = decision["review_failed"]
-            trusted_same_problem = decision["trusted_same_problem"]
-            if not isinstance(review_failed, bool) or not isinstance(
-                trusted_same_problem, bool
-            ):
-                raise TypeError("内部复核状态必须是布尔值。")
-        except (KeyError, TypeError):
-            return self._build_unavailable_result(
-                content_hash,
-                reason_code="service_invalid_response",
-                retryable=False,
-            )
-
-        status = search_result.status
-        reason_code = search_result.reason_code
-        retryable = search_result.retryable
-        retry_after_seconds = search_result.retry_after_seconds
-        if review_failed:
-            status = "partial"
-            if search_result.status == "complete":
-                reason_code = "review_unavailable"
-                retryable = True
-                retry_after_seconds = None
-
-        if (
-            status != "complete"
-            and decision.get("block_submission") is True
-            and not trusted_same_problem
-        ):
-            return self._build_unavailable_result(
-                content_hash,
-                reason_code="service_invalid_response",
-                retryable=False,
-            )
-
         completion = _completion(
-            status=status,
-            reason_code=reason_code,
-            retryable=retryable,
-            retry_after_seconds=retry_after_seconds,
+            status=search_result.status,
+            reason_code=search_result.reason_code,
+            retryable=search_result.retryable,
+            retry_after_seconds=search_result.retry_after_seconds,
         )
         checked_at = utc_now_z()
-
-        if status == "complete":
-            result_cache_key = self._result_cache_key(
-                request,
-                api_version,
-                search_result,
-            )
-            if result_cache_key is not None:
-                try:
-                    expires_at = self.cache.expires_at_for(checked_at)
-                    result = build_v2_result(
-                        content_hash=content_hash,
-                        candidates=decision["candidates"],
-                        block_submission=decision["block_submission"],
-                        message=decision["message"],
-                        completion=completion,
-                        reuse={"policy": "allowed", "expiresAt": expires_at},
-                        checked_at=checked_at,
-                    )
-                    self.cache.set(
-                        result_cache_key,
-                        result,
-                        checked_at=checked_at,
-                    )
-                    return result
-                except (ContractError, ValueError, TypeError, OverflowError):
-                    # 缓存故障不改变已经完成的检索，只把本次结果标为不可复用。
-                    pass
 
         try:
             return build_v2_result(
                 content_hash=content_hash,
-                candidates=decision["candidates"],
-                block_submission=decision["block_submission"],
-                message=decision["message"],
+                candidates=candidates,
                 completion=completion,
                 reuse={"policy": "no-store"},
                 checked_at=checked_at,
@@ -302,67 +197,6 @@ class AnklangService:
                 reason_code="service_invalid_response",
                 retryable=False,
             )
-
-    def _current_cache_lookup(
-        self,
-        request: dict[str, Any],
-        api_version: str,
-    ) -> tuple[str, str] | None:
-        if not isinstance(self.backend, LocalEngineBackend):
-            identity = "remote"
-        else:
-            identity = self.backend.current_cache_identity()
-            if identity is None:
-                return None
-        return self._make_cache_key(request, api_version, identity), identity
-
-    def _make_cache_key(
-        self,
-        request: dict[str, Any],
-        api_version: str,
-        backend_identity: str,
-    ) -> str:
-        request_payload = {
-            "contentHash": request["content_hash"],
-            "title": request["title"],
-            "type": request["type"],
-            "tagIds": request["tag_ids"],
-            "basicStatement": request["basic_statement"],
-        }
-        request_digest = hashlib.sha256(
-            json.dumps(
-                request_payload,
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-            ).encode("utf-8")
-        ).hexdigest()
-        return (
-            f"{_CACHE_SCHEMA_REVISION}:{api_version}:{self._pipeline_identity}:"
-            f"{backend_identity}:{request_digest}"
-        )
-
-    def _result_cache_key(
-        self,
-        request: dict[str, Any],
-        api_version: str,
-        search_result: BackendSearchResult,
-    ) -> str | None:
-        if search_result.status != "complete":
-            return None
-        if not isinstance(self.backend, LocalEngineBackend):
-            return self._make_cache_key(request, api_version, "remote")
-        identity = self.backend.current_cache_identity()
-        if identity is None:
-            return None
-        search_identity = search_result.cache_identity
-        if (
-            search_identity is None
-            or identity != search_identity
-        ):
-            # 检索后索引已变化，旧快照的判断不能登记到新索引身份下。
-            return None
-        return self._make_cache_key(request, api_version, identity)
 
     @staticmethod
     def _build_unavailable_result(
@@ -375,8 +209,6 @@ class AnklangService:
         return build_v2_result(
             content_hash=content_hash,
             candidates=[],
-            block_submission=False,
-            message="本次未能完成原题检索，请稍后重试并由审题人手工核对。",
             completion=_completion(
                 status="unavailable",
                 reason_code=reason_code,
@@ -385,6 +217,24 @@ class AnklangService:
             ),
             reuse={"policy": "no-store"},
         )
+
+
+def _rank_candidates(
+    config: AppConfig,
+    raw_candidates: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """过滤低于显示下限的候选，并按相似度降序返回。
+
+    是否重复、如何使用候选由调用方决定；Anklang 不形成判定或流程建议。
+    """
+
+    visible = [
+        dict(candidate)
+        for candidate in raw_candidates
+        if candidate["similarity"] >= config.minimum_similarity
+    ]
+    visible.sort(key=lambda candidate: candidate["similarity"], reverse=True)
+    return visible
 
 
 def _completion(
@@ -404,38 +254,10 @@ def _completion(
     return result
 
 
-def _pipeline_identity(config: AppConfig) -> str:
-    """只把会改变判断的非密钥配置做成摘要，不在缓存键中保留配置原文。"""
-
-    relevant = {
-        "backend": config.backend,
-        "yuantijiBaseUrl": config.yuantiji_base_url,
-        "searchK": config.search_k,
-        "rerank": config.use_rerank,
-        "minimumSimilarity": config.minimum_similarity,
-        "blockThreshold": config.block_threshold,
-        "similarityBlockEnabled": config.similarity_block_enabled,
-        "llmReviewEnabled": config.llm_review_enabled,
-        "llmBaseUrl": config.llm_base_url,
-        "llmModel": config.llm_model,
-        "llmTopN": config.llm_review_top_n,
-        "localVectorTopK": config.local_vector_top_k,
-        "localKeywordTopK": config.local_keyword_top_k,
-        "embeddingBaseUrl": config.dashscope_base_url,
-        "embeddingModel": config.dashscope_embedding_model,
-        "embeddingDimensions": config.dashscope_embedding_dim,
-    }
-    return hashlib.sha256(
-        json.dumps(relevant, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    ).hexdigest()
-
-
 def _v1_result_from_v2(result: dict[str, Any]) -> dict[str, Any]:
     return build_result(
         content_hash=result["contentHash"],
         candidates=result["candidates"],
-        block_submission=result["recommendation"]["blockSubmission"],
-        message=result["recommendation"]["message"],
         checked_at=result["checkedAt"],
     )
 
@@ -451,7 +273,7 @@ def make_handler(
 
         def setup(self) -> None:
             super().setup()
-            # socket timeout 是“连续多久没有收到/发出任何字节”的上限，能阻止
+            # socket timeout 是"连续多久没有收到/发出任何字节"的上限，能阻止
             # 声明超长正文后停住的客户端永久占用一个查重名额。
             self.connection.settimeout(service.config.client_idle_timeout_seconds)
 
@@ -600,7 +422,7 @@ def make_handler(
                         {
                             "error": {
                                 "code": "CHECK_INCOMPLETE",
-                                "message": "本次未能完成原题检索，请稍后重试并人工核对。",
+                                "message": "本次未能完成原题检索，请稍后重试。",
                             }
                         },
                         retry_after_seconds=retry_after,
@@ -637,9 +459,8 @@ def make_handler(
             )
 
         def _handle_ready(self) -> None:
-            """提供方无关的就绪检查：只验证本地服务/配置不变量，不调用任何
-            后端、不发起任何网络请求，也不读取题库。与 /api/v1/live（仅存活）
-            和 /api/v1/health（会透传上游后端状态）保持语义区分。"""
+            """就绪检查：只验证本地服务/配置不变量，不调用任何后端、不发起任何
+            网络请求，也不读取题库。"""
             if runtime.accepting:
                 self._send(
                     200,
@@ -664,15 +485,14 @@ def make_handler(
                 "backend": service.config.backend,
             }
             # describe_health() 约定不抛异常，各后端把自己的失败情况体现成状态字段
-            # （例如 upstreamReady=False），这里统一根据这些字段判断是否整体降级。
+            # （例如 localStoreReady=False），这里统一根据这些字段判断是否整体降级。
             try:
                 info.update(service.backend.describe_health())
             except Exception:
                 # 健康检查也不传播外部服务的异常原文。
                 info["status"] = "degraded"
             if (
-                info.get("upstreamReady") is False
-                or info.get("localStoreReady") is False
+                info.get("localStoreReady") is False
                 or info.get("indexMetadataReady") is False
                 or (
                     info.get("embeddingAvailable") is True
@@ -756,10 +576,6 @@ def make_handler(
                 # Anklang 的任何响应都不应由浏览器或中间代理保存；健康信息和错误
                 # 也保持同一条简单、不可被调用方配置绕过的规则。
                 self.send_header("Cache-Control", "no-store")
-                # 每个响应都带部署修订标识，供发布观测区分版本；由构建/部署流水线
-                # 注入（ANKLANG_REVISION），请求时不做任何 Git 或文件系统访问。
-                if service.config.revision is not None:
-                    self.send_header("X-Anklang-Revision", service.config.revision)
                 if close_connection:
                     self.send_header("Connection", "close")
                 if (
@@ -779,62 +595,45 @@ def make_handler(
 
 
 def build_backend(config: AppConfig) -> SearchBackend:
-    """按 ANKLANG_BACKEND 配置构造检索后端。生产环境默认走 reverse_proxy 分支，
-    与阶段 1 完全一致；local_engine 分支是阶段 2 新增的可选路径。"""
-    if config.backend == "local_engine":
-        store = ProblemStore(config.local_db_path)
-        embedder: EmbeddingClient | None = None
-        if config.dashscope_api_key and config.dashscope_base_url:
-            embedder = EmbeddingClient(
-                base_url=config.dashscope_base_url,
-                api_key=config.dashscope_api_key,
-                model=config.dashscope_embedding_model,
-                dimensions=config.dashscope_embedding_dim,
-            )
-        backend = LocalEngineBackend(
-            store=store,
-            embedder=embedder,
-            vector_top_k=config.local_vector_top_k,
-            keyword_top_k=config.local_keyword_top_k,
+    """构造本地检索后端。"""
+    store = ProblemStore(config.local_db_path)
+    embedder: EmbeddingClient | None = None
+    if config.dashscope_api_key and config.dashscope_base_url:
+        embedder = EmbeddingClient(
+            base_url=config.dashscope_base_url,
+            api_key=config.dashscope_api_key,
+            model=config.dashscope_embedding_model,
+            dimensions=config.dashscope_embedding_dim,
         )
-        try:
-            # 新库或没有旧向量的关键词库可安全登记；旧向量身份未知或规格
-            # 冲突时保留原库并由后端降级，不让启动过程破坏数据。
-            if backend.index_spec is not None:
-                store.prepare_embedding_writes(backend.index_spec)
-            else:
-                store.prepare_keyword_writes()
-        except IndexMetadataError:
-            pass
-        return backend
-    yuantiji = YuantijiClient(
-        base_url=config.yuantiji_base_url,
-        timeout_seconds=config.yuantiji_timeout_seconds,
-        minimum_interval_seconds=config.yuantiji_minimum_interval_seconds,
-        max_retries=config.yuantiji_max_retries,
-        retry_base_delay_seconds=config.yuantiji_retry_base_delay_seconds,
-        circuit_failure_threshold=config.yuantiji_circuit_failure_threshold,
-        circuit_open_seconds=config.yuantiji_circuit_open_seconds,
-        health_cache_seconds=config.yuantiji_health_cache_seconds,
+    backend = LocalEngineBackend(
+        store=store,
+        embedder=embedder,
+        vector_top_k=config.local_vector_top_k,
+        keyword_top_k=config.local_keyword_top_k,
     )
-    return ReverseProxyBackend(yuantiji, use_rerank=config.use_rerank)
+    try:
+        # 新库或没有旧向量的关键词库可安全登记；旧向量身份未知或规格
+        # 冲突时保留原库并由后端降级，不让启动过程破坏数据。
+        if backend.index_spec is not None:
+            store.prepare_embedding_writes(backend.index_spec)
+        else:
+            store.prepare_keyword_writes()
+    except IndexMetadataError:
+        pass
+    return backend
 
 
 def build_service(config: AppConfig) -> AnklangService:
     backend = build_backend(config)
-    cache = ResultCache(ttl_seconds=config.cache_ttl_seconds, max_entries=config.cache_max_entries)
-    llm_client: LlmClient | None = None
-    if config.llm_review_enabled and config.llm_base_url and config.llm_api_key:
-        llm_client = LlmClient(base_url=config.llm_base_url, api_key=config.llm_api_key)
-    return AnklangService(config, backend, cache, llm_client)
+    return AnklangService(config, backend)
 
 
 def _start_background_ingest(
     backend: LocalEngineBackend, config: AppConfig, stop_event: threading.Event
 ) -> threading.Thread:
     """按 ANKLANG_INGEST_INTERVAL_SECONDS 周期性调用 ingest_once()，实现"源插件
-    实时监控"式的增量抓取入库；单轮失败不影响服务本身，等下一轮重试。只在选中
-    local_engine 后端且显式打开 ANKLANG_INGEST_ENABLED 时才会启动。
+    实时监控"式的增量抓取入库；单轮失败不影响服务本身，等下一轮重试。只在显式打开
+    ANKLANG_INGEST_ENABLED 时才会启动。
     """
 
     def _loop() -> None:
