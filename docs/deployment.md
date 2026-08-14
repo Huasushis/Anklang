@@ -20,8 +20,10 @@ Anklang 必须作为独立服务部署，不连接 Urmotiv 数据库。运行时
 （如 `docker compose build --build-arg ANKLANG_REVISION=$(git rev-parse --short HEAD)`），则每个
 响应还会带 `X-Anklang-Revision` 头，供发布观测区分部署版本；留空则不输出。该值只允许字母、数字、
 点、下划线和连字符，不泄露路径或密钥。Compose 的 `build.args` 注入的值会写入镜像 `ENV`，作为
-可靠默认值；`environment` 中不再重复设置该变量，避免空插值覆盖构建注入。如需运行时覆盖，在
-`private/anklang.env` 中设置 `ANKLANG_REVISION` 即可（`env_file` 优先于镜像 `ENV`）。
+可靠默认值；`environment:` 和随附的 `private/anklang.env` 默认都不定义该变量，因此直接复制
+`.env.example`（其中 `ANKLANG_REVISION` 处于注释状态）不会用空值覆盖构建注入。只有当操作者
+确实需要在运行时覆盖构建注入的修订时，才在 `private/anklang.env` 中取消注释并填写非空值
+`ANKLANG_REVISION=...`，此时 `env_file` 优先于镜像 `ENV`。
 
 路径和正文版本不匹配时固定返回 400。Anklang 的全部 HTTP 响应都带
 `Cache-Control: no-store`。反向代理不得覆盖或删除这个响应头，也不得自行缓存请求或响应正文。
@@ -138,6 +140,8 @@ similarity 路径使用同一 Bearer 令牌。不要用 shell 的 `source` 或 `
    ```
 
    Compose 会直接读取它，不要 `source`，也不要把展开配置后的输出写入日志。
+   复制进来的 `ANKLANG_REVISION` 默认处于注释状态：除非取消注释并填写非空值，
+   否则不会覆盖镜像构建时注入的修订标识（见上文接口说明）。
 2. 运行 `docker compose --env-file private/anklang.env up --build -d`。容器内显式监听
    `0.0.0.0:8730`，宿主端口固定映射到
    `127.0.0.1:${ANKLANG_PORT:-8730}`，不会直接监听所有宿主网卡。

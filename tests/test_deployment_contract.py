@@ -8,6 +8,7 @@ import json
 import os
 import threading
 import unittest
+import yaml
 from http.client import HTTPConnection
 from http.server import ThreadingHTTPServer
 from typing import Any
@@ -534,6 +535,150 @@ class RevisionHeaderOnErrorPathsTests(unittest.TestCase):
         header_block = raw.split(b"\r\n\r\n", 1)[0]
         header_text = header_block.decode("utf-8")
         self.assertIn("X-Anklang-Revision: " + self._REVISION, header_text)
+
+class ComposeEnvFileRevisionTests(unittest.TestCase):
+    """证明随附的 Compose + 示例环境文件默认不会用空值覆盖构建注入的修订标识。
+
+    部署修订标识的来源优先级：
+    1. private/anklang.env 中显式设置的非空值（运行时覆盖，优先于镜像 ENV）
+    2. Dockerfile 构建参数注入的镜像 ENV（可靠默认值）
+    3. 均未设置时 revision=None，不输出 X-Anklang-Revision 头
+
+    随附的 .env.example 必须不主动定义 ANKLANG_REVISION（处于注释状态），
+    这样操作者直接复制到 private/anklang.env 时不会用空值覆盖构建注入。
+    """
+
+    _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    def test_env_example_does_not_define_revision_by_default(self) -> None:
+        """随附的 .env.example 中 ANKLANG_REVISION 处于注释状态，不是活跃赋值。"""
+        example_path = os.path.join(self._REPO_ROOT, ".env.example")
+        with open(example_path, encoding="utf-8") as f:
+            lines = f.readlines()
+        active = [
+            line.strip()
+            for line in lines
+            if line.strip()
+            and not line.strip().startswith("#")
+            and "ANKLANG_REVISION=" in line
+        ]
+        self.assertEqual(
+            active,
+            [],
+            ".env.example 不得包含未注释的 ANKLANG_REVISION= 赋值，"
+ "否则直接复制到 private/anklang.env 会用空值覆盖构建注入的修订标识",
+        )
+
+    def test_env_example_documents_commented_override(self) -> None:
+        """.env.example 包含注释形式的 ANKLANG_REVISION 覆盖说明。"""
+        example_path = os.path.join(self._REPO_ROOT, ".env.example")
+        with open(example_path, encoding="utf-8") as f:
+            content = f.read()
+        # 确认存在注释行的 ANKLANG_REVISION，供操作者取消注释使用
+        commented = [
+            line for line in content.splitlines()
+            if line.strip().startswith("#ANKLANG_REVISION=")
+        ]
+        self.assertTrue(
+            commented,
+            ".env.example 应包含注释形式的 #ANKLANG_REVISION= 供运行时覆盖",
+        )
+
+    def test_compose_environment_does_not_define_revision(self) -> None:
+        """compose.yaml 的 environment 块不定义 ANKLANG_REVISION。"""
+        compose_path = os.path.join(self._REPO_ROOT, "compose.yaml")
+        with open(compose_path, encoding="utf-8") as f:
+            data = yaml.safe_load(f)
+        env_block = (
+            data.get("services", {})
+            .get("anklang", {})
+            .get("environment", {})
+        )
+        self.assertNotIn(
+            "ANKLANG_REVISION",
+            env_block,
+            "compose.yaml environment 块不得定义 ANKLANG_REVISION，"
+ "否则空插值会覆盖镜像构建注入的修订标识",
+        )
+
+    def test_compose_build_args_still_passes_revision(self) -> None:
+        """compose.yaml 的 build.args 仍然传递 ANKLANG_REVISION 给 Dockerfile。"""
+        compose_path = os.path.join(self._REPO_ROOT, "compose.yaml")
+        with open(compose_path, encoding="utf-8") as f:
+            data = yaml.safe_load(f)
+        build_args = (
+            data.get("services", {})
+            .get("anklang", {})
+            .get("build", {})
+            .get("args", {})
+        )
+        self.assertIn(
+            "ANKLANG_REVISION",
+            build_args,
+            "compose.yaml build.args 必须传递 ANKLANG_REVISION 给 Dockerfile",
+        )
+
+    def test_dockerfile_sets_env_from_arg(self) -> None:
+        """Dockerfile 通过 ARG + ENV 将构建参数写入镜像环境变量。"""
+        dockerfile_path = os.path.join(self._REPO_ROOT, "Dockerfile")
+        with open(dockerfile_path, encoding="utf-8") as f:
+            content = f.read()
+        self.assertIn("ARG ANKLANG_REVISION=", content)
+        self.assertIn("ENV ANKLANG_REVISION=", content)
+
+    def test_verbatim_env_file_does_not_shadow_build_revision(self) -> None:
+        """模拟操作者直接复制 .env.example：解析后的活跃变量不含 ANKLANG_REVISION。
+
+        Docker Compose 的 env_file 只读取未注释的 KEY=VALUE 行；
+        注释行（以 # 开头）被忽略。因此注释状态的 #ANKLANG_REVISION= 不会
+        向容器注入空值，构建注入的镜像 ENV 保持有效。
+        """
+        example_path = os.path.join(self._REPO_ROOT, ".env.example")
+        with open(example_path, encoding="utf-8") as f:
+            lines = f.readlines()
+        # 模拟 Compose env_file 解析：只保留未注释的 KEY=VALUE 行
+        parsed: dict[str, str] = {}
+        for line in lines:
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            if "=" in stripped:
+                key, _, value = stripped.partition("=")
+                parsed[key.strip()] = value
+        self.assertNotIn(
+            "ANKLANG_REVISION",
+            parsed,
+            "直接复制 .env.example 后解析的活跃变量不得包含 ANKLANG_REVISION",
+        )
+
+    def test_explicit_nonempty_runtime_override_wins(self) -> None:
+        """操作者在 private/anklang.env 中显式设置非空值时，该值生效。
+
+        模拟 env_file 包含 ANKLANG_REVISION=override-123 的场景：
+        load_config 应返回该值，覆盖镜像构建注入的默认值。
+        """
+        from anklang.config import load_config
+
+        with patch.dict(
+            os.environ,
+            {"ANKLANG_REVISION": "override-123"},
+            clear=True,
+        ):
+            config = load_config()
+        self.assertEqual(config.revision, "override-123")
+
+    def test_empty_runtime_override_means_no_header(self) -> None:
+        """即使操作者显式设了空值，load_config 返回 None（不输出头）。
+
+        这是安全行为：空值不泄露路径或密钥，也不输出无效修订标识。
+        """
+        from anklang.config import load_config
+
+        with patch.dict(
+            os.environ, {"ANKLANG_REVISION": ""}, clear=True
+        ):
+            config = load_config()
+        self.assertIsNone(config.revision)
 
 
 if __name__ == "__main__":
