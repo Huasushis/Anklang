@@ -104,9 +104,8 @@ class EmbeddingClient:
         except EmbeddingError:
             raise
         except Exception as error:
-            # 这里刻意捕获所有异常再包装成 EmbeddingError：调用方（本地检索后端）只会
-            # 捕获 EmbeddingError 来降级成关键词召回，任何漏出去的异常类型都会让整个
-            # 查重请求失败，而不是退化成"没有向量也能用"。
+            # 调用方只依赖稳定的 EmbeddingError；异常类型、请求正文、配置值和
+            # 提供方原始响应都不能越过该边界。
             raise EmbeddingError("调用百炼 embedding 接口失败。") from error
         if len(raw) > _MAX_RESPONSE_BYTES:
             raise EmbeddingError("百炼 embedding 响应过大。")

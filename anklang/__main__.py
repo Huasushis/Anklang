@@ -4,7 +4,7 @@ from __future__ import annotations
 import sys
 
 from .config import ConfigError, load_config
-from .server import serve
+from ui.server import serve
 
 
 def main() -> int:

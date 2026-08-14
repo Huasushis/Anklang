@@ -59,7 +59,6 @@ class RuntimeConfigTests(unittest.TestCase):
         self.assertEqual(config.max_in_flight_checks, 16)
         self.assertEqual(config.client_idle_timeout_seconds, 15.0)
         self.assertEqual(config.shutdown_grace_seconds, 30.0)
-        self.assertEqual(config.backend, "local_engine")
 
     def test_explicit_container_bind_host_is_accepted(self) -> None:
         for host in ("0.0.0.0", "127.0.0.1", "localhost"):
@@ -184,21 +183,16 @@ class UrlConfigTests(unittest.TestCase):
                 self.assertNotIn(private_marker, str(raised.exception))
 
 
-class LocalEngineConfigTests(unittest.TestCase):
-    def test_local_engine_defaults(self) -> None:
+class SearchConfigTests(unittest.TestCase):
+    def test_store_path_default(self) -> None:
         with patch.dict(os.environ, {}, clear=True):
             config = load_config()
-        self.assertEqual(config.backend, "local_engine")
         self.assertEqual(config.local_db_path, "problems-data/local-index.db")
-        self.assertEqual(config.local_vector_top_k, 20)
-        self.assertEqual(config.local_keyword_top_k, 20)
 
     def test_search_params_ranges(self) -> None:
         cases = (
             ("ANKLANG_SEARCH_K", "1", "20", "0", "21"),
             ("ANKLANG_MINIMUM_SIMILARITY", "0.0", "1.0", "-0.01", "1.01"),
-            ("ANKLANG_LOCAL_VECTOR_TOP_K", "1", "200", "0", "201"),
-            ("ANKLANG_LOCAL_KEYWORD_TOP_K", "1", "200", "0", "201"),
         )
         for variable, minimum, maximum, below, above in cases:
             for accepted in (minimum, maximum):

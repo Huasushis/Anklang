@@ -33,7 +33,7 @@ DASHSCOPE_EMBEDDING_MODEL=text-embedding-v4
 DASHSCOPE_EMBEDDING_DIM=1024
 ```
 
-URL 或密钥任一缺失时，服务按关键词模式运行。不要把真实配置值复制到终端日志、测试报告或 Git。
+URL 或密钥任一缺失时，查询明确返回不可用，增量抓取不写入题目或推进游标。不要把真实配置值复制到终端日志、测试报告或 Git。
 
 运行时增量来源：
 
@@ -60,7 +60,7 @@ docker compose build
 - `ANKLANG_REQUIRE_SERVICE_TOKEN=true`；
 - 停止宽限大于应用退出宽限。
 
-Docker 构建上下文采用默认拒绝策略，只复制 `anklang/` 和 `LICENSE`。不得把 `private/`、本地数据库、测试产物或 Git 元数据加入镜像。
+Docker 构建上下文采用默认拒绝策略，只复制 `anklang/`、`ui/` 和 `LICENSE`。不得把 `private/`、本地数据库、测试产物或 Git 元数据加入镜像。
 
 ## 4. 启动与观测
 
@@ -87,7 +87,7 @@ curl --fail --silent http://127.0.0.1:8730/api/v1/ready
 使用部署平台提供的令牌发起一份合成请求；不要把真实题面写进命令历史或日志。v2 响应的顶层字段只能是：
 
 ```text
-apiVersion, contentHash, checkedAt, completion, candidates, reuse
+apiVersion, contentHash, checkedAt, completion, candidates
 ```
 
 候选字段只能是：
@@ -104,7 +104,7 @@ source, externalId, title, similarity, url（可选）
 
 ```bash
 PYTHONPATH=. python3 -m unittest discover -s tests
-python3 -m compileall -q anklang tests
+python3 -m compileall -q anklang ui tests
 docker compose config -q
 docker build -t anklang:verify .
 ```

@@ -19,7 +19,7 @@ from anklang.contracts import (
     build_result,
     parse_request,
 )
-from anklang.server import AnklangService, _rank_candidates, make_handler
+from anklang.http_api import AnklangService, _rank_candidates, make_handler
 
 
 def _config(**overrides: Any) -> AppConfig:
@@ -28,7 +28,6 @@ def _config(**overrides: Any) -> AppConfig:
         service_token="service-token-abcdef123456",
         search_k=8,
         minimum_similarity=0.5,
-        backend="local_engine",
     )
     base.update(overrides)
     return AppConfig(**base)
@@ -282,7 +281,7 @@ class _FakeBackend:
 
     def describe_health(self) -> dict[str, Any]:
         return {
-            "backend": "local_engine",
+            "backend": "synthetic",
             "localProblemCount": len(self._candidates),
             "localStoreReady": True,
             "indexMetadataReady": True,
@@ -493,7 +492,7 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(payload["contentHash"], "a" * 64)
 
-    def test_v2_returns_completion_and_no_store(self) -> None:
+    def test_v2_returns_completion_and_ranked_candidates(self) -> None:
         candidates = [
             {
                 "source": "EOlymp",
@@ -516,10 +515,9 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(payload["apiVersion"], "2")
         self.assertEqual(payload["completion"]["status"], "complete")
-        self.assertEqual(payload["reuse"], {"policy": "no-store"})
         self.assertEqual(
             set(payload),
-            {"apiVersion", "contentHash", "checkedAt", "completion", "candidates", "reuse"},
+            {"apiVersion", "contentHash", "checkedAt", "completion", "candidates"},
         )
 
 

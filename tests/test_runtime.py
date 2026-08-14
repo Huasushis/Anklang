@@ -21,7 +21,7 @@ from anklang.__main__ import main
 from anklang.backends import BackendSearchResult
 
 from anklang.config import AppConfig
-from anklang.server import (
+from anklang.http_api import (
     AnklangHTTPServer,
     AnklangService,
     ServiceRuntime,
@@ -35,7 +35,6 @@ def _config(**overrides: Any) -> AppConfig:
         service_token="synthetic-service-token",
         search_k=8,
         minimum_similarity=0.1,
-        backend="local_engine",
         max_in_flight_checks=1,
         client_idle_timeout_seconds=0.15,
         shutdown_grace_seconds=0.15,

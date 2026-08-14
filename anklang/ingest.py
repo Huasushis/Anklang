@@ -1,16 +1,7 @@
-"""源插件调度：发现 anklang/sources/ 下的全部源插件，依次抓取新题、规范化、
-（若配置了 embedding）计算向量，去重后写入本地题库（ProblemStore）。
+"""Incremental source-plugin delta around the preserved upstream ``ui/server.py`` flow.
 
-用法：
-  python -m anklang.ingest     # 跑一次全部源插件的抓取入库，打印一行统计摘要后退出
-
-本模块只提供 ingest_once() 这一次性的"跑一轮"函数，不自带循环/调度——"多久跑
-一次"由外层决定，可以是：
-  - 上面这条命令行，配合系统的定时任务（cron / 任务计划程序）周期执行；
-  - anklang.server 里由 ANKLANG_INGEST_ENABLED 开关控制的后台线程（见 server.py
-    的 _start_background_ingest），实现"服务运行时自己按固定间隔抓取"的效果。
-两种方式共用同一个 ingest_once()，行为完全一致，不会出现"命令行跑一遍和后台线程
-跑一遍逻辑不一样"的分裂。
+``ingest_once`` validates one batch per source, embeds changed statements, and upserts the
+current vector rows. The live scheduler is the runtime entrypoint's responsibility.
 """
 from __future__ import annotations
 
@@ -61,8 +52,6 @@ def ingest_once(store: ProblemStore, embedder: EmbeddingClient | None) -> Ingest
         )
         # 在发现来源、读取题面和调用外部模型前拒绝旧向量或规格冲突。
         store.prepare_embedding_writes(index_spec)
-    else:
-        store.prepare_keyword_writes()
     for module in discover_source_modules():
         source_name = module.SOURCE_NAME
         stored_since = store.get_cursor(source_name)
@@ -101,11 +90,11 @@ def ingest_once(store: ProblemStore, embedder: EmbeddingClient | None) -> Ingest
             content_hash = content_hash_of(statement)
             existing = store.get_problem(source_name, raw.external_id)
             embedding: list[float] | None = None
-            if embedder is not None and _needs_embedding(
-                existing,
-                raw,
-                content_hash,
-            ):
+            if embedder is None:
+                summary.embedding_failures += 1
+                may_advance_cursor = False
+                continue
+            if _needs_embedding(existing, raw, content_hash):
                 try:
                     embedding = embedder.embed_one(statement)
                     assert index_spec is not None
@@ -114,26 +103,27 @@ def ingest_once(store: ProblemStore, embedder: EmbeddingClient | None) -> Ingest
                         expected_dimensions=index_spec.dimensions,
                     )
                 except (EmbeddingError, ValueError):
-                    # 向量服务暂不可用时仍写入题目；关键词检索立即可用。
-                    # 来源后续再次返回该题时，会重试缺失向量。
                     summary.embedding_failures += 1
-                    embedding = None
+                    may_advance_cursor = False
+                    continue
             write_result = store.add_problem(
-                source=source_name,
-                external_id=raw.external_id,
-                title=raw.title,
-                url=raw.url,
-                statement=statement,
-                embedding=embedding,
+                StoredProblem(
+                    source=source_name,
+                    external_id=raw.external_id,
+                    title=raw.title,
+                    url=raw.url,
+                    statement=statement,
+                    embedding=embedding,
+                    content_hash=content_hash,
+                    source_updated_at=raw.updated_at,
+                ),
                 index_spec=index_spec if embedding is not None else None,
-                content_hash=content_hash,
-                source_updated_at=raw.updated_at,
             )
             if write_result == "inserted":
                 summary.inserted += 1
             elif write_result == "updated":
                 summary.updated += 1
-            elif write_result == "skipped":
+            elif write_result == "stale":
                 summary.skipped += 1
                 may_advance_cursor = False
             else:
@@ -144,10 +134,10 @@ def ingest_once(store: ProblemStore, embedder: EmbeddingClient | None) -> Ingest
             and latest_updated_at is not None
             and (fetch_since is None or latest_updated_at > fetch_since)
         ):
-            store.set_cursor_if_current(
+            store.compare_and_advance_cursor(
                 source_name,
-                expected_value=stored_since,
-                next_value=latest_updated_at,
+                stored_since,
+                latest_updated_at,
             )
     return summary
 

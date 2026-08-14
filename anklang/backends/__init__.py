@@ -1,9 +1,4 @@
-"""检索后端抽象：把"怎么找相似题目"这件事从 AnklangService 里抽出来，做成统一接口。
-
-唯一实现是 local_engine.LocalEngineBackend（本地题库的向量 + 关键词混合检索）。
-
-Anklang 是 is-my-problem-new（MIT，Copyright (c) 2023 Ziqian Zhong）的最小直接改编。
-"""
+"""HTTP adapter boundary for the preserved upstream ``ui.server`` search entrypoint."""
 from __future__ import annotations
 
 from dataclasses import dataclass

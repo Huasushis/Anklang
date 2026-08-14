@@ -1,28 +1,28 @@
 # Anklang
 
-Anklang 是公开项目 [is-my-problem-new](https://github.com/fjzzq2002/is-my-problem-new) 的小型直接改编：输入一道算法题的题面，返回按相似度排序的已知题目候选。
+Anklang 是公开项目 [is-my-problem-new](https://github.com/fjzzq2002/is-my-problem-new) 的小型直接改编：输入一道算法题的题面，返回按相似度排序的已知题目候选。运行入口直接保留自上游 v2 提交 [`72e309bd`](https://github.com/fjzzq2002/is-my-problem-new/blob/72e309bdcea2669bc3f476bea6fa81b1f21e788a/ui/server.py) 的 `ui/server.py`。
 
 上游作者为 Ziqian Zhong，许可证为 MIT；原版权声明和本项目声明都保存在 [`LICENSE`](LICENSE)。
 
 ## 与上游的对应关系
 
-上游核心流程是“题面 → embedding（把文字转成向量）→ 余弦相似度检索 → 候选排序”。Anklang 保留该流程：
+上游入口的检索主链是“查询向量 → `cosine_all` → 相似度降序 → `collapse` → `mkrow`”。Anklang 的 `ui/server.py` 保留这些函数、调用顺序和运行入口，只做部署所需的有限改动：
 
-- 上游 `src/embedder.py` / v2 embedding 调用对应 `anklang/embedding.py`；
-- 上游 `src/ui.py` / v2 `ui/server.py` 的查询和向量搜索对应 `anklang/server.py` 与 `anklang/backends/local_engine.py`；
-- 上游静态题库索引改为 `anklang/store.py` 的 SQLite 当前快照；
-- 新增 `anklang/sources/` 与 `anklang/ingest.py`，让来源数据增量进入同一索引。
+- 上游 embedding 调用改接 `anklang/embedding.py` 中可配置的百炼 OpenAI 兼容客户端；
+- 上游内存题库改由 `anklang/store.py` 读取 SQLite 当前行，余弦计算使用 Python 标准库而不是 NumPy；
+- `anklang/sources/` 与 `anklang/ingest.py` 把来源更新写入同一组当前行；
+- `anklang/http_api.py` 把检索函数封装为供 Urmotiv 调用的版本化 HTTP 接口。
 
-改动范围只包括可配置的百炼 embedding 提供方、运行时增量来源插件和供 Urmotiv 调用的版本化 HTTP 查询接口。没有 LLM 复核、通过/拦截政策、准确率标定、流程采集、yuantiji 代理或结果缓存。
+未保留上游的网页、查询改写、重排、统计和查询向量缓存。也没有 LLM 复核、通过/拦截政策、准确率标定、流程采集、yuantiji 代理或结果缓存。
 
 ## 数据流
 
 ```text
-来源插件 ──增量题目/更新时间──> ingest_once ──幂等写入──> SQLite 当前索引
-                                                               │
-查询题面 ──可选百炼 embedding──> 向量 + 关键词召回 ──排序──────┘
-                                                               │
-                                                               └─> 候选列表
+来源插件 ──增量题目/更新时间──> ingest_once ──向量化并幂等写入──> SQLite 当前行
+                                                                      │
+查询题面 ──百炼 embedding──> cosine_all ──降序──> collapse ──mkrow────┘
+                                                                      │
+                                                                      └─> 候选列表
 ```
 
 新增或更新题目写入后，下一个查询从当前 SQLite 快照读取，服务无需重启，也不需要离线全量重建。
@@ -54,7 +54,7 @@ v1 成功响应严格为：
 }
 ```
 
-v2 只增加检索完整性和复用状态：
+v2 只增加检索完整性状态：
 
 ```json
 {
@@ -66,8 +66,7 @@ v2 只增加检索完整性和复用状态：
     "reasonCode": "complete",
     "retryable": false
   },
-  "candidates": [],
-  "reuse": {"policy": "no-store"}
+  "candidates": []
 }
 ```
 
@@ -93,7 +92,7 @@ python3 -m anklang
 - `DASHSCOPE_BASE_URL`、`DASHSCOPE_API_KEY`、`DASHSCOPE_EMBEDDING_MODEL`、`DASHSCOPE_EMBEDDING_DIM`：OpenAI 兼容的百炼 embedding；
 - `ANKLANG_INGEST_ENABLED`、`ANKLANG_INGEST_INTERVAL_SECONDS`：运行时增量抓取。
 
-没有 embedding 配置时，服务正常使用关键词召回。已配置提供方调用失败时，v2 返回 `partial` 和仍可用的关键词候选；不会把失败说成完整空结果。
+没有完整 embedding 配置时，v2 明确返回 `unavailable`。提供方调用失败时也返回 `unavailable`；不会写入无向量题目、推进来源游标或把失败说成完整空结果。
 
 ## 来源插件
 
@@ -127,7 +126,7 @@ Compose 只把 `127.0.0.1:${ANKLANG_PORT:-8730}` 暴露到宿主机，并以非 
 
 ```bash
 PYTHONPATH=. python3 -m unittest discover -s tests
-python3 -m compileall -q anklang tests
+python3 -m compileall -q anklang ui tests
 docker compose config -q
 docker build -t anklang:verify .
 ```

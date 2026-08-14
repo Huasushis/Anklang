@@ -51,7 +51,6 @@ _NONCOMPLETE_REASON_CODES = {
     "service_invalid_response",
     "internal_error",
 }
-_MAX_REUSE_SECONDS = 7 * 24 * 60 * 60
 MAX_CANDIDATES = 50
 MAX_RESPONSE_BYTES = 2_000_000
 _REQUEST_KEYS = {"apiVersion", "requestId", "contentHash", "problem"}
@@ -62,7 +61,6 @@ _V2_RESULT_KEYS = {
     "checkedAt",
     "completion",
     "candidates",
-    "reuse",
 }
 
 
@@ -167,7 +165,6 @@ def build_v2_result(
     content_hash: str,
     candidates: list[dict[str, Any]],
     completion: dict[str, Any],
-    reuse: dict[str, Any],
     checked_at: str | None = None,
 ) -> dict[str, Any]:
     """构造并交叉校验 v2 查询结果。"""
@@ -179,15 +176,12 @@ def build_v2_result(
 
     normalized = _normalize_candidates(candidates)
     normalized_checked_at = checked_at or _utc_now_z()
-    checked_datetime = _parse_utc_z(normalized_checked_at, "checkedAt")
+    _parse_utc_z(normalized_checked_at, "checkedAt")
     normalized_completion = _normalize_completion(completion)
-    normalized_reuse = _normalize_reuse(reuse, checked_datetime)
 
     status = normalized_completion["status"]
     if status == "unavailable" and normalized:
         raise ContractError("不可用结果不能携带候选。")
-    if status != "complete" and normalized_reuse["policy"] != "no-store":
-        raise ContractError("非完整结果不得复用。")
 
     result = {
         "apiVersion": "2",
@@ -195,7 +189,6 @@ def build_v2_result(
         "checkedAt": normalized_checked_at,
         "completion": normalized_completion,
         "candidates": normalized,
-        "reuse": normalized_reuse,
     }
     _validate_response_size(result)
     return result
@@ -213,7 +206,6 @@ def validate_v2_result(payload: Any) -> dict[str, Any]:
         content_hash=payload.get("contentHash"),
         candidates=payload.get("candidates"),
         completion=payload.get("completion"),
-        reuse=payload.get("reuse"),
         checked_at=payload.get("checkedAt"),
     )
     if normalized != payload:
@@ -288,22 +280,6 @@ def _normalize_completion(completion: Any) -> dict[str, Any]:
     return normalized
 
 
-def _normalize_reuse(reuse: Any, checked_at: datetime) -> dict[str, Any]:
-    if not isinstance(reuse, dict):
-        raise ContractError("reuse 必须是对象。")
-    policy = reuse.get("policy")
-    if policy == "no-store":
-        _require_exact_keys(reuse, {"policy"}, "reuse")
-        return {"policy": "no-store"}
-    if policy != "allowed":
-        raise ContractError("reuse.policy 不合法。")
-    _require_exact_keys(reuse, {"policy", "expiresAt"}, "reuse")
-    expires_at = reuse.get("expiresAt")
-    expires_datetime = _parse_utc_z(expires_at, "reuse.expiresAt")
-    lifetime = (expires_datetime - checked_at).total_seconds()
-    if not 0 < lifetime <= _MAX_REUSE_SECONDS:
-        raise ContractError("reuse.expiresAt 必须晚于 checkedAt 且不超过七天。")
-    return {"policy": "allowed", "expiresAt": expires_at}
 
 
 def _validate_response_size(result: dict[str, Any]) -> None:

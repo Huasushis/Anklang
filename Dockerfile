@@ -11,6 +11,7 @@ RUN groupadd --system --gid 10001 anklang \
     && chown 10001:10001 /app/problems-data
 
 COPY --chown=10001:10001 anklang /app/anklang
+COPY --chown=10001:10001 ui /app/ui
 COPY --chown=10001:10001 LICENSE /app/LICENSE
 
 USER 10001:10001

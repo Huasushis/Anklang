@@ -20,7 +20,7 @@ from anklang.contracts import (
     parse_request,
     validate_v2_result,
 )
-from anklang.server import AnklangService, make_handler
+from anklang.http_api import AnklangService, make_handler
 
 
 _NONCOMPLETE_REASONS = (
@@ -41,7 +41,6 @@ def _config(**overrides: Any) -> AppConfig:
         service_token="service-token-abcdef123456",
         search_k=8,
         minimum_similarity=0.5,
-        backend="local_engine",
     )
     values.update(overrides)
     return AppConfig(**values)
@@ -133,7 +132,6 @@ class _Harness:
 
 class V2ContractTests(unittest.TestCase):
     checked_at = "2026-08-01T00:00:00.000Z"
-    expires_at = "2026-08-01T01:00:00.000Z"
 
     def _build(
         self,
@@ -143,7 +141,6 @@ class V2ContractTests(unittest.TestCase):
         retryable: bool = False,
         retry_after: int | None = None,
         candidates: list[dict[str, Any]] | None = None,
-        reuse: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         completion: dict[str, Any] = {
             "status": status,
@@ -156,11 +153,6 @@ class V2ContractTests(unittest.TestCase):
             content_hash="a" * 64,
             candidates=[] if candidates is None else candidates,
             completion=completion,
-            reuse=(
-                {"policy": "allowed", "expiresAt": self.expires_at}
-                if reuse is None and status == "complete"
-                else (reuse or {"policy": "no-store"})
-            ),
             checked_at=self.checked_at,
         )
 
@@ -174,7 +166,6 @@ class V2ContractTests(unittest.TestCase):
                 "checkedAt",
                 "completion",
                 "candidates",
-                "reuse",
             },
         )
         self.assertEqual(
@@ -196,7 +187,6 @@ class V2ContractTests(unittest.TestCase):
                     self.assertEqual(result["completion"]["status"], status)
                     self.assertEqual(result["completion"]["reasonCode"], reason)
                     self.assertEqual(result["completion"]["retryAfterSeconds"], 17)
-                    self.assertEqual(result["reuse"], {"policy": "no-store"})
 
     def test_cross_branch_constraints_reject_unsafe_results(self) -> None:
         invalid_builds = (
@@ -204,11 +194,6 @@ class V2ContractTests(unittest.TestCase):
                 status="unavailable",
                 reason="service_unavailable",
                 candidates=[_candidate()],
-            ),
-            lambda: self._build(
-                status="partial",
-                reason="search_partial",
-                reuse={"policy": "allowed", "expiresAt": self.expires_at},
             ),
             lambda: self._build(status="complete", reason="search_partial"),
             lambda: self._build(
@@ -226,7 +211,6 @@ class V2ContractTests(unittest.TestCase):
         for mutate in (
             lambda value: value.update({"extra": True}),
             lambda value: value["completion"].update({"extra": True}),
-            lambda value: value["reuse"].update({"extra": True}),
             lambda value: value["candidates"][0].update({"extra": True}),
         ):
             value = self._build(candidates=[_candidate()])
@@ -254,7 +238,7 @@ class HttpV2Tests(unittest.TestCase):
         self.addCleanup(harness.close)
         return harness, service
 
-    def test_complete_v2_returns_result_with_no_store(self) -> None:
+    def test_complete_v2_calculates_each_query(self) -> None:
         backend = _ScriptedBackend(BackendSearchResult([_candidate()]))
         harness, _ = self._harness(backend)
 
@@ -273,7 +257,6 @@ class HttpV2Tests(unittest.TestCase):
             "reasonCode": "complete",
             "retryable": False,
         })
-        self.assertEqual(first["reuse"], {"policy": "no-store"})
         self.assertEqual(first_headers.get("cache-control"), "no-store")
         self.assertEqual(second_headers.get("cache-control"), "no-store")
 
@@ -296,7 +279,6 @@ class HttpV2Tests(unittest.TestCase):
         )
         self.assertEqual(v1["apiVersion"], "1")
         self.assertNotIn("completion", v1)
-        self.assertNotIn("reuse", v1)
         self.assertEqual(headers.get("cache-control"), "no-store")
 
     def test_same_claimed_hash_with_different_statement_calls_backend_each_time(self) -> None:
@@ -322,11 +304,10 @@ class HttpV2Tests(unittest.TestCase):
             )
             self.assertEqual(status, 200)
             self.assertEqual(payload["completion"]["status"], "partial")
-            self.assertEqual(payload["reuse"], {"policy": "no-store"})
             self.assertTrue(payload["candidates"])
             self.assertEqual(
                 set(payload),
-                {"apiVersion", "contentHash", "checkedAt", "completion", "candidates", "reuse"},
+                {"apiVersion", "contentHash", "checkedAt", "completion", "candidates"},
             )
             self.assertEqual(headers.get("cache-control"), "no-store")
         self.assertEqual(backend.calls, 2)
@@ -347,7 +328,7 @@ class HttpV2Tests(unittest.TestCase):
             {"source", "externalId", "title", "similarity"},
         )
 
-    def test_unavailable_v2_is_200_empty_and_no_store(self) -> None:
+    def test_unavailable_v2_is_200_with_empty_candidates(self) -> None:
         backend = _ScriptedBackend(
             BackendSearchResult.unavailable(
                 reason_code="search_rate_limited",
@@ -364,7 +345,6 @@ class HttpV2Tests(unittest.TestCase):
             self.assertEqual(payload["candidates"], [])
             self.assertEqual(payload["completion"]["reasonCode"], "search_rate_limited")
             self.assertEqual(payload["completion"]["retryAfterSeconds"], 23)
-            self.assertEqual(payload["reuse"], {"policy": "no-store"})
             self.assertEqual(headers.get("cache-control"), "no-store")
             self.assertEqual(headers.get("retry-after"), "23")
         self.assertEqual(backend.calls, 2)

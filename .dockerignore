@@ -3,6 +3,8 @@
 **
 !anklang/
 !anklang/*.py
+!ui/
+!ui/*.py
 !anklang/backends/
 !anklang/backends/*.py
 !anklang/sources/

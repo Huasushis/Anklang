@@ -21,6 +21,7 @@ class ContainerDeploymentTests(unittest.TestCase):
         self.assertIn("USER 10001:10001", dockerfile)
         self.assertIn("PYTHONDONTWRITEBYTECODE=1", dockerfile)
         self.assertIn("COPY --chown=10001:10001 anklang /app/anklang", dockerfile)
+        self.assertIn("COPY --chown=10001:10001 ui /app/ui", dockerfile)
         self.assertNotRegex(dockerfile, r"(?m)^\s*(?:COPY|ADD)\s+\.\s")
         self.assertNotRegex(
             dockerfile,
@@ -41,6 +42,8 @@ class ContainerDeploymentTests(unittest.TestCase):
                 "**",
                 "!anklang/",
                 "!anklang/*.py",
+                "!ui/",
+                "!ui/*.py",
                 "!anklang/backends/",
                 "!anklang/backends/*.py",
                 "!anklang/sources/",
@@ -65,10 +68,11 @@ class ContainerDeploymentTests(unittest.TestCase):
         for allowed, directory in (
             ("LICENSE", False),
             ("anklang", True),
-            ("anklang/server.py", False),
+            ("anklang/http_api.py", False),
             ("anklang/backends", True),
             ("anklang/backends/__init__.py", False),
-            ("anklang/backends/local_engine.py", False),
+            ("ui", True),
+            ("ui/server.py", False),
             ("anklang/sources", True),
             ("anklang/sources/__init__.py", False),
             ("anklang/sources/example_static", True),

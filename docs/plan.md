@@ -7,7 +7,7 @@
 Anklang 只做原题检索：
 
 ```text
-查询题面 -> 可选 embedding -> 向量/关键词召回 -> 相似度降序候选
+查询题面 -> embedding -> cosine_all -> 相似度降序 -> collapse -> mkrow 候选
 ```
 
 返回结果是检索事实，不是产品判断。Anklang 不判断同题、不判断是否可参考、不决定通过或拦截，也不保存提交查询结果。
@@ -18,21 +18,23 @@ Anklang 只做原题检索：
 
 ## 2. 上游保留与有限改动
 
-上游 [is-my-problem-new](https://github.com/fjzzq2002/is-my-problem-new) 的核心入口和数据流：
+上游 [is-my-problem-new v2 `ui/server.py`，提交 `72e309bd`](https://github.com/fjzzq2002/is-my-problem-new/blob/72e309bdcea2669bc3f476bea6fa81b1f21e788a/ui/server.py) 的运行入口和主链：
 
-1. 接收题面查询；
-2. 用 embedding 模型生成查询向量；
-3. 对题库向量计算余弦相似度；
-4. 按相似度返回候选。
+1. 接收题面并生成查询向量；
+2. 用 `cosine_all` 计算题库向量的余弦相似度；
+3. 按相似度降序排列；
+4. 用 `collapse` 去除重复来源行；
+5. 用 `mkrow` 形成候选。
 
 Anklang 的直接对应：
 
-| 上游职责 | Anklang | 差异 |
+| 上游职责 | Anklang | 有限差异 |
 | --- | --- | --- |
-| embedding 客户端 | `anklang/embedding.py` | 改为环境变量配置的百炼 OpenAI 兼容接口 |
-| 查询和向量检索 | `anklang/server.py`、`anklang/backends/local_engine.py` | 加版本化机器接口，补关键词召回 |
-| 题库索引 | `anklang/store.py` | 改为可增量写入的 SQLite 当前快照 |
+| 运行入口和检索主链 | `ui/server.py` | 保留 `cosine_all`、降序、`collapse`、`mkrow` 的调用顺序；删除网页、查询改写、重排、统计和查询向量缓存 |
+| embedding 调用 | `anklang/embedding.py` | 改接环境变量配置的百炼 OpenAI 兼容接口 |
+| 题库向量 | `anklang/store.py` | 上游内存数据改为可增量写入的 SQLite 当前题目行，余弦计算不依赖 NumPy |
 | 题目来源 | `anklang/sources/`、`anklang/ingest.py` | 插件发现、独立游标、幂等更新 |
+| HTTP 适配 | `anklang/http_api.py` | 将上游检索函数封装为严格的版本化机器接口 |
 
 MIT 许可证和上游作者 Ziqian Zhong 的版权声明保留在根目录 `LICENSE`。
 
@@ -66,7 +68,7 @@ v1 只在完整查询时返回 200。v2 用 `completion.status` 区分：
 - `partial`：仍有可用候选，但某条检索信号失败；
 - `unavailable`：不能形成候选，候选数组必须为空。
 
-非完整 v2 结果必须使用 `reuse.policy=no-store`。当前所有结果都使用 `no-store`，且 HTTP 发送 `Cache-Control: no-store`。
+HTTP 发送 `Cache-Control: no-store`。响应契约和运行时不保存查询结果，也没有复用策略、过期时间、缓存身份或索引代次。
 
 ## 4. embedding 提供方
 
@@ -84,7 +86,7 @@ v1 只在完整查询时返回 200。v2 用 `completion.status` 区分：
 - 向量数量、顺序、有限数和维度正确；
 - 错误信息不包含请求正文、密钥或原始响应。
 
-未配置提供方是正常关键词模式。已配置提供方失败时，查询返回 `partial` 和关键词候选；增量入库仍写入无向量题目，使其立即可做关键词搜索。
+未配置提供方或查询调用失败时，v2 返回 `unavailable`，候选为空。增量入库的 embedding 失败时不写题目、不推进来源游标，下一轮重新尝试。
 
 ## 5. 运行时增量来源
 
@@ -117,10 +119,11 @@ v1 只在完整查询时返回 200。v2 用 `completion.status` 区分：
 
 全部门禁必须通过：
 
-1. **上游对照**：文档和许可证能定位上游，代码保留查询向量、余弦搜索、候选排序主流程；
-2. **查询契约**：v1/v2 都只有查询状态与排名候选，严格拒绝额外输出字段；
-3. **embedding**：配置成功路径、响应校验和失败降级测试通过；
-4. **增量来源**：新增、更新、立即可搜、幂等、同版本冲突和并发游标测试通过；
-5. **静态边界**：运行时代码不存在代理、复核、标定、流程采集或跨服务耦合；
-6. **完整验证**：单元测试、编译、Compose 配置、容器构建和容器部署测试通过；
-7. **隐私与 Git**：无真实外部请求，无私有内容进入差异或暂存区，提交已推送且跟踪文件干净。
+1. **上游对照**：许可证和文档定位固定上游提交，`ui/server.py` 保留 `cosine_all`、降序、`collapse`、`mkrow` 主链和运行入口；
+2. **有限改动**：上游之外只有 embedding 提供方、SQLite 当前行与来源游标、增量插件、版本化 HTTP 适配；
+3. **查询契约**：v1/v2 都只有查询状态与排名候选，不含结果缓存或复用字段；
+4. **embedding**：配置成功路径、响应校验、明确不可用和入库重试测试通过；
+5. **增量来源**：后台调度期间新增、更新、立即可搜、幂等、同版本冲突和并发游标测试通过；
+6. **静态边界**：运行时代码不存在代理、复核、标定、流程采集、缓存复用或跨服务耦合；
+7. **完整验证**：单元测试、编译、Compose 配置、容器构建和容器部署测试通过；
+8. **隐私与 Git**：无真实外部请求，无私有内容进入差异或暂存区，提交已推送且跟踪文件干净。

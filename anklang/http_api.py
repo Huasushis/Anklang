@@ -1,23 +1,12 @@
-"""Anklang HTTP 服务：暴露 Urmotiv 插件调用的查重接口与健康检查。
+"""带版本号的查询 HTTP 适配层。
 
-- GET  /api/v1/live                存活检查（无需令牌），固定返回，不做任何外部调用；
-- GET  /api/v1/ready               就绪检查（无需令牌），只验证本地状态，不做后端/网络调用；
-- GET  /api/v1/health              健康检查（无需令牌），透传当前检索后端的公开信息；
-- POST /api/v1/checks/similarity   旧版查重；只有完整结果返回 200；
-- POST /api/v2/checks/similarity   显式返回完整性和复用策略。
-
-鉴权用常量时间比较；错误响应只给出稳定的中文说明，不泄露上游细节或密钥。
-
-检索后端只有 local_engine（本地 SQLite 题库向量+关键词混合检索）。AnklangService
-本身不关心后端内部实现，只调用统一接口。
-
-Anklang 是 is-my-problem-new（MIT，Copyright (c) 2023 Ziqian Zhong）的最小直接改编。
+搜索本身位于保留的上游入口 ``ui/server.py``。本模块只负责 Urmotiv 机器接口的
+鉴权、严格 JSON 契约、健康检查和有界关闭；不实现搜索、缓存或产品判断。
 """
 from __future__ import annotations
 
 import hmac
 import json
-import signal
 import socket
 import threading
 import time
@@ -25,7 +14,6 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
 from .backends import BackendError, BackendSearchResult, CompletionReason, SearchBackend
-from .backends.local_engine import LocalEngineBackend
 from .config import AppConfig
 from .contracts import (
     ContractError,
@@ -35,9 +23,6 @@ from .contracts import (
     utc_now_z,
     validate_v2_result,
 )
-from .embedding import EmbeddingClient
-from .ingest import ingest_once
-from .store import IndexMetadataError, ProblemStore
 
 _MAX_REQUEST_BYTES = 4_000_000
 _V1_SIMILARITY_PATH = "/api/v1/checks/similarity"
@@ -188,7 +173,6 @@ class AnklangService:
                 content_hash=content_hash,
                 candidates=candidates,
                 completion=completion,
-                reuse={"policy": "no-store"},
                 checked_at=checked_at,
             )
         except (ContractError, KeyError, TypeError, ValueError, OverflowError):
@@ -215,7 +199,6 @@ class AnklangService:
                 retryable=retryable,
                 retry_after_seconds=retry_after_seconds,
             ),
-            reuse={"policy": "no-store"},
         )
 
 
@@ -482,10 +465,9 @@ def make_handler(
                 "status": "ok",
                 "service": "anklang",
                 "apiVersion": "1",
-                "backend": service.config.backend,
             }
-            # describe_health() 约定不抛异常，各后端把自己的失败情况体现成状态字段
-            # （例如 localStoreReady=False），这里统一根据这些字段判断是否整体降级。
+            # describe_health() returns fixed local status fields. This adapter never calls
+            # the embedding provider or includes its exception text.
             try:
                 info.update(service.backend.describe_health())
             except Exception:
@@ -592,112 +574,3 @@ def make_handler(
                 self.close_connection = True
 
     return Handler
-
-
-def build_backend(config: AppConfig) -> SearchBackend:
-    """构造本地检索后端。"""
-    store = ProblemStore(config.local_db_path)
-    embedder: EmbeddingClient | None = None
-    if config.dashscope_api_key and config.dashscope_base_url:
-        embedder = EmbeddingClient(
-            base_url=config.dashscope_base_url,
-            api_key=config.dashscope_api_key,
-            model=config.dashscope_embedding_model,
-            dimensions=config.dashscope_embedding_dim,
-        )
-    backend = LocalEngineBackend(
-        store=store,
-        embedder=embedder,
-        vector_top_k=config.local_vector_top_k,
-        keyword_top_k=config.local_keyword_top_k,
-    )
-    try:
-        # 新库或没有旧向量的关键词库可安全登记；旧向量身份未知或规格
-        # 冲突时保留原库并由后端降级，不让启动过程破坏数据。
-        if backend.index_spec is not None:
-            store.prepare_embedding_writes(backend.index_spec)
-        else:
-            store.prepare_keyword_writes()
-    except IndexMetadataError:
-        pass
-    return backend
-
-
-def build_service(config: AppConfig) -> AnklangService:
-    backend = build_backend(config)
-    return AnklangService(config, backend)
-
-
-def _start_background_ingest(
-    backend: LocalEngineBackend, config: AppConfig, stop_event: threading.Event
-) -> threading.Thread:
-    """按 ANKLANG_INGEST_INTERVAL_SECONDS 周期性调用 ingest_once()，实现"源插件
-    实时监控"式的增量抓取入库；单轮失败不影响服务本身，等下一轮重试。只在显式打开
-    ANKLANG_INGEST_ENABLED 时才会启动。
-    """
-
-    def _loop() -> None:
-        while not stop_event.is_set():
-            try:
-                ingest_once(backend.store, backend.embedder)
-            except Exception:
-                pass  # 后台线程不应该因为单轮 ingest 失败而退出
-            stop_event.wait(config.ingest_interval_seconds)
-
-    thread = threading.Thread(target=_loop, daemon=True, name="anklang-ingest")
-    thread.start()
-    return thread
-
-
-def _install_shutdown_handlers(
-    runtime: ServiceRuntime,
-) -> dict[int, Any]:
-    """只在主线程安装信号处理；返回原处理器以便嵌入测试时恢复。"""
-
-    if threading.current_thread() is not threading.main_thread():
-        return {}
-    previous: dict[int, Any] = {}
-
-    def _request_shutdown(_signum: int, _frame: Any) -> None:
-        runtime.begin_shutdown()
-
-    for signum in (signal.SIGTERM, signal.SIGINT):
-        previous[signum] = signal.getsignal(signum)
-        signal.signal(signum, _request_shutdown)
-    return previous
-
-
-def _restore_shutdown_handlers(previous: dict[int, Any]) -> None:
-    for signum, handler in previous.items():
-        signal.signal(signum, handler)
-
-
-def serve(config: AppConfig) -> None:
-    service = build_service(config)
-    runtime = ServiceRuntime(config.max_in_flight_checks)
-    handler = make_handler(service, runtime)
-    httpd = AnklangHTTPServer((config.bind_host, config.port), handler)
-    # handle_request 的短轮询让信号处理器只改内存状态即可；不需要在信号
-    # 处理器中调用 shutdown()，也就不会与同一线程的 serve_forever 死锁。
-    httpd.timeout = 0.2
-    stop_event = threading.Event()
-    ingest_thread: threading.Thread | None = None
-    if config.ingest_enabled and isinstance(service.backend, LocalEngineBackend):
-        ingest_thread = _start_background_ingest(service.backend, config, stop_event)
-    previous_handlers = _install_shutdown_handlers(runtime)
-    try:
-        while runtime.accepting:
-            httpd.handle_request()
-    except KeyboardInterrupt:
-        runtime.begin_shutdown()
-    finally:
-        runtime.begin_shutdown()
-        stop_event.set()
-        # 先关闭监听套接字，再等待已经取得名额的请求。请求线程是 daemon，
-        # 即使后端无视自己的超时，也不会越过退出宽限无限阻止进程结束。
-        httpd.server_close()
-        deadline = time.monotonic() + config.shutdown_grace_seconds
-        runtime.wait_for_idle(config.shutdown_grace_seconds)
-        if ingest_thread is not None:
-            ingest_thread.join(timeout=max(0.0, deadline - time.monotonic()))
-        _restore_shutdown_handlers(previous_handlers)

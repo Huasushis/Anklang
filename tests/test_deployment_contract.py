@@ -15,7 +15,7 @@ from unittest.mock import patch
 
 from anklang.backends import BackendSearchResult
 from anklang.config import AppConfig, ConfigError
-from anklang.server import AnklangService, ServiceRuntime, make_handler
+from anklang.http_api import AnklangService, ServiceRuntime, make_handler
 
 
 def _config(**overrides: Any) -> AppConfig:
@@ -24,7 +24,6 @@ def _config(**overrides: Any) -> AppConfig:
         service_token="service-token-abcdef123456",
         search_k=8,
         minimum_similarity=0.5,
-        backend="local_engine",
     )
     values.update(overrides)
     return AppConfig(**values)

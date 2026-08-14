@@ -152,11 +152,7 @@ class AppConfig:
     service_token: str | None
     search_k: int
     minimum_similarity: float
-    # 本地检索引擎（唯一后端）
-    backend: str = "local_engine"
     local_db_path: str = "problems-data/local-index.db"
-    local_vector_top_k: int = 20
-    local_keyword_top_k: int = 20
     dashscope_base_url: str | None = None
     dashscope_api_key: str | None = None
     dashscope_embedding_model: str = "text-embedding-v4"
@@ -183,8 +179,7 @@ def load_config() -> AppConfig:
             "启用 ANKLANG_REQUIRE_SERVICE_TOKEN 时必须配置至少 16 个字符的服务令牌。"
         )
 
-    # DASHSCOPE_* 不是强制项：没配置时本地引擎只做关键词召回（优雅降级），
-    # 不因为缺 embedding 凭据就拒绝启动。
+    # DASHSCOPE_* 不是启动必填项；缺少时健康检查仍可用，查询明确报告后端不可用。
     dashscope_base_url = _read_optional_url("DASHSCOPE_BASE_URL")
     dashscope_api_key = os.environ.get("DASHSCOPE_API_KEY", "").strip() or None
 
@@ -195,11 +190,8 @@ def load_config() -> AppConfig:
         service_token=service_token,
         search_k=_read_int("ANKLANG_SEARCH_K", 8, 1, 20),
         minimum_similarity=_read_float("ANKLANG_MINIMUM_SIMILARITY", 0.5, 0.0, 1.0),
-        backend="local_engine",
         local_db_path=os.environ.get("ANKLANG_LOCAL_DB_PATH", "").strip()
         or "problems-data/local-index.db",
-        local_vector_top_k=_read_int("ANKLANG_LOCAL_VECTOR_TOP_K", 20, 1, 200),
-        local_keyword_top_k=_read_int("ANKLANG_LOCAL_KEYWORD_TOP_K", 20, 1, 200),
         dashscope_base_url=dashscope_base_url,
         dashscope_api_key=dashscope_api_key,
         dashscope_embedding_model=os.environ.get("DASHSCOPE_EMBEDDING_MODEL", "").strip()

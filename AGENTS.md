@@ -2,9 +2,9 @@
 
 ## 产品边界
 
-Anklang 是公开项目 [is-my-problem-new](https://github.com/fjzzq2002/is-my-problem-new) 的小型直接改编。上游作者 Ziqian Zhong 的 MIT 版权声明必须保留在 `LICENSE` 中。
+Anklang 是公开项目 [is-my-problem-new](https://github.com/fjzzq2002/is-my-problem-new) 的小型直接改编。运行入口直接保留自上游 v2 提交 [`72e309bd`](https://github.com/fjzzq2002/is-my-problem-new/blob/72e309bdcea2669bc3f476bea6fa81b1f21e788a/ui/server.py) 的 `ui/server.py`；上游作者 Ziqian Zhong 的 MIT 版权声明必须保留在 `LICENSE` 中。
 
-只维护一条数据流：题面查询 → 向量化与关键词检索 → 按相似度排序的候选。允许的本地扩展只有：
+只维护一条数据流：题面查询 → 向量化 → `cosine_all` → 相似度降序 → `collapse` → `mkrow` 候选。允许的本地扩展只有：
 
 1. 用环境变量配置阿里云百炼兼容的 embedding（把文字转为向量）接口；
 2. 来源插件在服务运行期间增量添加或更新可检索题目，不离线全量重建，不重启查询服务；
@@ -16,19 +16,19 @@ Anklang 不判断候选是否同题或可作参考，不给通过、拦截、审
 
 ## 当前结构
 
+- `ui/server.py`：保留上游运行入口、`cosine_all`、`collapse`、`mkrow` 和检索调用顺序，并组装本地适配器。
 - `anklang/embedding.py`：OpenAI 兼容的百炼 embedding 客户端；校验模型、维度、顺序和响应大小。
-- `anklang/backends/local_engine.py`：沿用上游“查询向量 → 余弦相似度 → 排序候选”的主流程，并补关键词召回。
-- `anklang/store.py`：SQLite 单文件索引；查询每次读取当前快照，因此增量写入后立即可见。
+- `anklang/store.py`：仅保存 SQLite 当前题目行、向量和来源游标；查询每次读取当前行。
 - `anklang/sources/`、`anklang/ingest.py`：来源发现、规范时间游标、幂等写入、更新冲突保护。
-- `anklang/contracts.py`、`anklang/server.py`：严格的查询入/候选出契约和 HTTP 服务。
+- `anklang/contracts.py`、`anklang/http_api.py`：严格的查询入/候选出契约和 HTTP 适配器。
 
 ## 接口不变量
 
 - `POST /api/v1/checks/similarity`：完整查询成功才返回 200；结果字段严格为 `apiVersion`、`contentHash`、`checkedAt`、`candidates`。
-- `POST /api/v2/checks/similarity`：始终显式返回 `completion` 和 `reuse`；结果仍只包含检索状态及候选，不包含产品判断。
+- `POST /api/v2/checks/similarity`：始终显式返回 `completion`；结果仍只包含检索状态及候选，不包含产品判断。
 - 候选字段严格为 `source`、`externalId`、`title`、`similarity`，可选 `url`。
 - 候选按 `similarity` 降序；服务端只应用显示下限，不形成阈值政策。
-- v2 非完整结果必须 `reuse.policy=no-store`；所有 HTTP 响应都发送 `Cache-Control: no-store`。
+- HTTP 响应发送 `Cache-Control: no-store`，但运行时和契约中不得存在结果缓存、复用策略或代次状态。
 - 外部服务错误、题面、路径、密钥和原始响应不得进入 HTTP、日志或测试报告。
 
 ## 来源插件不变量
@@ -46,7 +46,7 @@ fetch_new_problems(since: str | None) -> list[RawProblem]
 
 ## embedding 不变量
 
-只有同时配置 `DASHSCOPE_BASE_URL` 和 `DASHSCOPE_API_KEY` 才启用向量检索；否则是正常的关键词模式。已配置提供方失败时返回明确的部分结果，不能伪装成完整空结果。索引元数据必须绑定模型和维度；身份冲突不得覆盖现有向量。
+只有同时配置 `DASHSCOPE_BASE_URL` 和 `DASHSCOPE_API_KEY` 才能查询或增量入库。未配置或提供方失败时必须明确返回不可用；增量任务不得写入无向量题目或推进游标。SQLite 中记录的模型和维度必须与查询客户端一致；身份冲突不得覆盖现有向量。
 
 测试不得发起真实外部请求。embedding 测试使用注入的 opener；HTTP 测试只连接回环地址。
 
@@ -56,7 +56,7 @@ fetch_new_problems(since: str | None) -> list[RawProblem]
 
 ```bash
 PYTHONPATH=. python3 -m unittest discover -s tests
-python3 -m compileall -q anklang tests
+python3 -m compileall -q anklang ui tests
 docker compose config -q
 docker build -t anklang:verify .
 ```
