@@ -83,6 +83,30 @@ class RawProblemMetadataTests(unittest.TestCase):
         with self.assertRaises(SourceContractError):
             validate_raw_problem(self._problem({"big": "x" * 513}))
 
+    def test_metadata_float_value_is_rejected(self) -> None:
+        # 浮点渲染存在 Python/JS 差异，元数据数值只允许安全整数。
+        for item in (0.5, -0.0, 1.0, float("inf"), float("nan")):
+            with self.subTest(item=item):
+                with self.assertRaises(SourceContractError):
+                    validate_raw_problem(self._problem({"amount": item}))
+
+    def test_metadata_out_of_safe_integer_range_is_rejected(self) -> None:
+        limit = 2**53 - 1
+        for item in (limit + 1, -(limit + 1), limit + 1_000_000):
+            with self.subTest(item=item):
+                with self.assertRaises(SourceContractError):
+                    validate_raw_problem(self._problem({"width": item}))
+
+    def test_metadata_safe_integer_boundaries_accepted(self) -> None:
+        limit = 2**53 - 1
+        validated = validate_raw_problem(
+            self._problem({"lower": -limit, "upper": limit, "zero": 0})
+        )
+        self.assertEqual(
+            validated.metadata,
+            {"lower": -limit, "upper": limit, "zero": 0},
+        )
+
     def test_metadata_whitespace_string_value_is_rejected(self) -> None:
         with self.assertRaises(SourceContractError):
             validate_raw_problem(self._problem({"pad": "  value  "}))

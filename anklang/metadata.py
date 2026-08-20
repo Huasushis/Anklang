@@ -9,7 +9,9 @@
 边界独立实现）：
 - 键必须是 ASCII 小写字母、数字、下划线，且以字母开头（^[a-z][a-z0-9_]{0,63}$）；
 - 最多 16 个键；
-- 值只允许字符串、有限数字、布尔或 null，不允许嵌套对象/数组；
+- 值只允许字符串、±(2^53-1) 范围内的安全整数、布尔或 null，不允许嵌套
+  对象/数组；浮点值（含 -0.0 与小数）与越界整数会被拒绝，避免 Python 与
+  JavaScript 的 JSON 数字渲染/精度差异破坏 2048 字节的限制一致性；
 - 字符串值必须是去掉两端空白后的规范文本、不允许为空，并按 UTF-8 字节数
   上限 512；显式缺失用 null 而非空串表达；
 - 整包按规范 JSON（ASCII 升序键、紧凑分隔符、ensure_ascii=False）编码后
@@ -19,7 +21,6 @@
 from __future__ import annotations
 
 import json
-import math
 import re
 from typing import Any
 
@@ -27,6 +28,9 @@ METADATA_KEY_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 MAX_METADATA_KEYS = 16
 MAX_METADATA_VALUE_BYTES = 512
 MAX_METADATA_BYTES = 2048
+# JSON 数字在两端界面共同表示时只允许安全整数，规避 Python/JS 的浮点渲染
+# 与精度差异：范围 ±(2^53-1)，严禁任何浮点值（含 -0.0）与小数。
+MAX_METADATA_INTEGER = 2**53 - 1
 # 与 Urmotiv zod 镜像对齐：字符串必须是“已经去掉两端空白”的规范文本。
 # 采用与 JavaScript String.trim() 相同的空白字符集合，保证两边一致。
 _METADATA_TRIM_CHARACTERS = (
@@ -74,14 +78,16 @@ def canonicalize_metadata(value: Any) -> dict[str, Any] | None:
             if _utf8_bytes(item) > MAX_METADATA_VALUE_BYTES:
                 raise MetadataContractError("元数据字符串值不能超过 512 字节。")
             canonical[key] = item
-        elif isinstance(item, (int, float)):
-            if not math.isfinite(item):
-                raise MetadataContractError("元数据数字值必须有限。")
+        elif type(item) is int:
+            # 数字只允许安全整数（±(2^53-1)）：浮点、小数、-0.0、越界整数
+            # 都会破坏 Python/JS 的字节一致，一律拒绝。
+            if not (-MAX_METADATA_INTEGER <= item <= MAX_METADATA_INTEGER):
+                raise MetadataContractError("元数据整数超出安全范围。")
             canonical[key] = item
         elif item is None:
             canonical[key] = None
         else:
-            raise MetadataContractError("元数据值只允许字符串、数字、布尔或 null。")
+            raise MetadataContractError("元数据值只允许字符串、安全整数、布尔或 null。")
 
     if not canonical:
         return None

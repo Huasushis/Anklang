@@ -301,6 +301,49 @@ class ContractTests(unittest.TestCase):
                 completion={"status": "complete", "reasonCode": "complete", "retryable": False},
             )
 
+    def test_v2_rejects_float_and_out_of_range_metadata(self) -> None:
+        limit = 2**53 - 1
+        for item in (0.5, -0.0, 1.0, limit + 1, -(limit + 1)):
+            with self.subTest(item=item):
+                with self.assertRaises(ContractError):
+                    build_v2_result(
+                        "5" * 64,
+                        [
+                            {
+                                "source": "s",
+                                "externalId": "e",
+                                "title": "t",
+                                "similarity": 0.5,
+                                "metadata": {"amount": item},
+                            }
+                        ],
+                        completion={
+                            "status": "complete",
+                            "reasonCode": "complete",
+                            "retryable": False,
+                        },
+                    )
+
+    def test_v2_accepts_safe_integer_metadata(self) -> None:
+        limit = 2**53 - 1
+        result = build_v2_result(
+            "6" * 64,
+            [
+                {
+                    "source": "s",
+                    "externalId": "e",
+                    "title": "t",
+                    "similarity": 0.5,
+                    "metadata": {"lower": -limit, "upper": limit, "zero": 0},
+                }
+            ],
+            completion={"status": "complete", "reasonCode": "complete", "retryable": False},
+        )
+        self.assertEqual(
+            result["candidates"][0]["metadata"],
+            {"lower": -limit, "upper": limit, "zero": 0},
+        )
+
 
 class RankCandidateTests(unittest.TestCase):
     """查询结果只做显示下限过滤和稳定降序，不形成判定。"""
