@@ -142,6 +142,109 @@ class ProblemStoreTests(unittest.TestCase):
             self.addCleanup(second.close)
             self.assertTrue(second.search_snapshot(self.spec).vector_ready)
 
+    def test_metadata_round_trip_insert_and_read(self) -> None:
+        self.store.prepare_embedding_writes(self.spec)
+        problem = StoredProblem(
+            source="synthetic",
+            external_id="problem-meta",
+            title="meta",
+            url=None,
+            statement="statement",
+            embedding=[1.0, 0.0],
+            content_hash="c" * 64,
+            source_updated_at="2026-08-14T00:00:00.000Z",
+            metadata={"origin": "bzoj", "contest": "noip"},
+        )
+        self.assertEqual(self.store.add_problem(problem, index_spec=self.spec), "inserted")
+        stored = self.store.get_problem("synthetic", "problem-meta")
+        self.assertEqual(stored.metadata, {"origin": "bzoj", "contest": "noip"})
+
+    def test_metadata_only_change_is_updated_and_preserves_content_hash(self) -> None:
+        self.store.prepare_embedding_writes(self.spec)
+        base = _problem(vector=[1.0, 0.0])
+        self.assertEqual(self.store.add_problem(base, index_spec=self.spec), "inserted")
+        with_metadata = StoredProblem(
+            source=base.source,
+            external_id=base.external_id,
+            title=base.title,
+            url=base.url,
+            statement=base.statement,
+            embedding=None,
+            content_hash=base.content_hash,
+            source_updated_at="2026-08-14T00:00:01.000Z",
+            metadata={"origin": "vjudge"},
+        )
+        # 发送方没有重新计算 embedding；content_hash 保持不变时应保留旧向量。
+        outcome = self.store.add_problem(with_metadata, index_spec=None)
+        self.assertEqual(outcome, "updated")
+        problem = self.store.get_problem("synthetic", "problem-1")
+        self.assertEqual(problem.metadata, {"origin": "vjudge"})
+        self.assertEqual(problem.content_hash, base.content_hash)
+        self.assertEqual(problem.embedding, [1.0, 0.0])
+
+    def test_metadata_identical_reingest_is_unchanged(self) -> None:
+        self.store.prepare_embedding_writes(self.spec)
+        problem = StoredProblem(
+            source="synthetic",
+            external_id="problem-meta-2",
+            title="meta",
+            url=None,
+            statement="statement",
+            embedding=[1.0, 0.0],
+            content_hash="d" * 64,
+            source_updated_at="2026-08-14T00:00:00.000Z",
+            metadata={"origin": "bzoj"},
+        )
+        self.assertEqual(self.store.add_problem(problem, index_spec=self.spec), "inserted")
+        same = StoredProblem(
+            source="synthetic",
+            external_id="problem-meta-2",
+            title="meta",
+            url=None,
+            statement="statement",
+            embedding=None,
+            content_hash="d" * 64,
+            source_updated_at="2026-08-14T00:00:00.000Z",
+            metadata={"origin": "bzoj"},
+        )
+        self.assertEqual(self.store.add_problem(same, index_spec=None), "unchanged")
+
+    def test_legacy_database_column_migration(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "legacy.db"
+            conn = sqlite3.connect(str(path))
+            conn.executescript(
+                """
+                CREATE TABLE problems (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    source TEXT NOT NULL,
+                    external_id TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    url TEXT,
+                    statement TEXT NOT NULL,
+                    embedding BLOB,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(source, external_id)
+                );
+                INSERT INTO problems(source, external_id, title, statement, created_at)
+                VALUES ('legacy', '1', 'old title', 'old statement', '2026-01-01T00:00:00.000Z');
+                """
+            )
+            conn.commit()
+            conn.close()
+
+            store = ProblemStore(str(path))
+            self.addCleanup(store.close)
+            columns = {
+                row[1]
+                for row in store._conn.execute("PRAGMA table_info(problems)").fetchall()
+            }
+            self.assertIn("metadata", columns)
+            problem = store.get_problem("legacy", "1")
+            self.assertIsNotNone(problem)
+            self.assertEqual(problem.title, "old title")
+            self.assertIsNone(problem.metadata)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -116,6 +116,7 @@ def ingest_once(store: ProblemStore, embedder: EmbeddingClient | None) -> Ingest
                     embedding=embedding,
                     content_hash=content_hash,
                     source_updated_at=raw.updated_at,
+                    metadata=raw.metadata,
                 ),
                 index_spec=index_spec if embedding is not None else None,
             )

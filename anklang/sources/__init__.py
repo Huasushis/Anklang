@@ -34,10 +34,12 @@ import ipaddress
 import importlib
 import pkgutil
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from types import ModuleType
 from urllib.parse import urlsplit
+
+from anklang.metadata import MetadataContractError, canonicalize_metadata
 
 _SOURCE_NAME_RE = re.compile(r"^[a-z][a-z0-9_-]{0,79}$")
 _UPDATED_AT_RE = re.compile(
@@ -75,6 +77,9 @@ class RawProblem:
     2026-01-01T00:00:00.000Z。统一格式让框架能可靠判断哪个版本较新并推进游标。
     不提供时仍可首次入库，但同一题号之后出现不同内容时，框架会保守拒绝覆盖，
     因为它无法判断哪份内容更新。"""
+    metadata: dict | None = None
+    """可选的公开展示元数据，仅允许标量值，容量受 anklang/metadata.py 约束；
+    不参加内容哈希、向量或相似度计算。"""
     raw_ref: str | None = None
     """指向原始抓取产物存放位置的引用（例如本地缓存文件路径、原始响应的某个 ID），
     便于排查问题；不代表要长期保留大文件，也不会被写入 ProblemStore。"""
@@ -140,6 +145,12 @@ def validate_raw_problem(value: object) -> RawProblem:
         value.updated_at
     ):
         raise SourceContractError("来源更新时间必须是规范的 UTC 时间。")
+    try:
+        metadata = canonicalize_metadata(value.metadata)
+    except MetadataContractError:
+        raise SourceContractError("来源元数据不符合约束。") from None
+    if metadata != value.metadata:
+        return replace(value, metadata=metadata)
     return value
 
 

@@ -17,6 +17,7 @@ from anklang.contracts import (
     MAX_RESPONSE_BYTES,
     ContractError,
     build_result,
+    build_v2_result,
     parse_request,
 )
 from anklang.http_api import AnklangService, _rank_candidates, make_handler
@@ -213,6 +214,92 @@ class ContractTests(unittest.TestCase):
             len(json.dumps(result, ensure_ascii=False).encode("utf-8")),
             MAX_RESPONSE_BYTES,
         )
+
+    def test_v1_strips_metadata_even_when_backend_returns_it(self) -> None:
+        result = build_result(
+            "2" * 64,
+            [
+                {
+                    "source": "s",
+                    "externalId": "e",
+                    "title": "t",
+                    "similarity": 0.5,
+                    "url": "https://example.invalid/x",
+                    "metadata": {
+                        "origin": "bzoj",
+                        "contest": "noip-2010",
+                    },
+                }
+            ],
+        )
+        candidate = result["candidates"][0]
+        self.assertNotIn("metadata", candidate)
+        self.assertEqual(
+            set(candidate),
+            {"source", "externalId", "title", "similarity", "url"},
+        )
+
+    def test_v2_emits_metadata_and_canonicalizes(self) -> None:
+        result = build_v2_result(
+            content_hash="3" * 64,
+            candidates=[
+                {
+                    "source": "s",
+                    "externalId": "e",
+                    "title": "t",
+                    "similarity": 0.5,
+                    "metadata": {
+                        "zebra": "tail",
+                        "alpha": 1,
+                        "beta": "中文值",
+                        "flag": True,
+                        "none": None,
+                    },
+                }
+            ],
+            completion={"status": "complete", "reasonCode": "complete", "retryable": False},
+        )
+        candidate = result["candidates"][0]
+        self.assertEqual(
+            candidate["metadata"],
+            {
+                "zebra": "tail",
+                "alpha": 1,
+                "beta": "中文值",
+                "flag": True,
+                "none": None,
+            },
+        )
+
+    def test_v2_invalid_metadata_fails_closed(self) -> None:
+        with self.assertRaises(ContractError):
+            build_v2_result(
+                "4" * 64,
+                [
+                    {
+                        "source": "s",
+                        "externalId": "e",
+                        "title": "t",
+                        "similarity": 0.5,
+                        "metadata": {"UPPER": "rejected", "ok": "value"},
+                    }
+                ],
+                completion={"status": "complete", "reasonCode": "complete", "retryable": False},
+            )
+        with self.assertRaises(ContractError):
+            build_v2_result(
+                "4" * 64,
+                [
+                    {
+                        "source": "s",
+                        "externalId": "e",
+                        "title": "t",
+                        "similarity": 0.5,
+                        "metadata": {"nested": {"object": "rejected"}},
+                    }
+                ],
+                completion={"status": "complete", "reasonCode": "complete", "retryable": False},
+            )
 
 
 class RankCandidateTests(unittest.TestCase):

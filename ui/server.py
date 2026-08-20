@@ -78,6 +78,8 @@ def mkrow(problem: StoredProblem, similarity: float) -> dict[str, Any]:
     }
     if problem.url:
         row["url"] = problem.url
+    if problem.metadata:
+        row["metadata"] = problem.metadata
     return row
 
 

@@ -328,6 +328,55 @@ class HttpV2Tests(unittest.TestCase):
             {"source", "externalId", "title", "similarity"},
         )
 
+    def test_v2_emits_bounded_metadata_over_http(self) -> None:
+        backend = _ScriptedBackend(
+            BackendSearchResult([{**_candidate(), "metadata": {"origin": "bzoj"}}])
+        )
+        harness, _ = self._harness(backend)
+        status, payload, _ = harness.request(
+            "POST", "/api/v2/checks/similarity", _request("2")
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["completion"]["status"], "complete")
+        self.assertEqual(
+            payload["candidates"][0]["metadata"], {"origin": "bzoj"}
+        )
+        # 响应能再次通过完整契约校验，避免非规范元数据外泄。
+        self.assertEqual(validate_v2_result(payload), payload)
+
+    def test_v2_invalid_metadata_fails_closed_to_unavailable(self) -> None:
+        backend = _ScriptedBackend(
+            BackendSearchResult([{**_candidate(), "metadata": {"UPPER": "x"}}])
+        )
+        harness, _ = self._harness(backend)
+        status, payload, _ = harness.request(
+            "POST", "/api/v2/checks/similarity", _request("2")
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["completion"]["status"], "unavailable")
+        self.assertEqual(payload["candidates"], [])
+
+    def test_v1_strips_metadata_emitted_by_backend(self) -> None:
+        backend = _ScriptedBackend(
+            BackendSearchResult([{**_candidate(), "metadata": {"origin": "bzoj"}}])
+        )
+        harness, _ = self._harness(backend)
+        v2_status, v2, _ = harness.request(
+            "POST", "/api/v2/checks/similarity", _request("2")
+        )
+        self.assertEqual(v2_status, 200)
+        self.assertEqual(v2["candidates"][0]["metadata"], {"origin": "bzoj"})
+
+        v1_status, v1, _ = harness.request(
+            "POST", "/api/v1/checks/similarity", _request("1")
+        )
+        self.assertEqual(v1_status, 200)
+        self.assertNotIn("metadata", v1["candidates"][0])
+        self.assertEqual(
+            set(v1["candidates"][0]),
+            {"source", "externalId", "title", "similarity"},
+        )
+
     def test_unavailable_v2_is_200_with_empty_candidates(self) -> None:
         backend = _ScriptedBackend(
             BackendSearchResult.unavailable(

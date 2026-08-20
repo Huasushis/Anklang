@@ -9,8 +9,9 @@ import os
 import sqlite3
 import threading
 from dataclasses import dataclass
-from typing import Literal
+from typing import Any, Literal
 
+from .metadata import parse_canonical_metadata, to_canonical_json
 from .vectormath import pack_embedding, unpack_embedding, validate_embedding
 
 
@@ -48,6 +49,7 @@ class StoredProblem:
     embedding: list[float] | None
     content_hash: str
     source_updated_at: str | None = None
+    metadata: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -79,6 +81,7 @@ CREATE TABLE IF NOT EXISTS problems (
     embedding BLOB,
     content_hash TEXT NOT NULL DEFAULT '',
     source_updated_at TEXT,
+    metadata TEXT,
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     UNIQUE(source, external_id)
@@ -123,6 +126,7 @@ class ProblemStore:
         additions = {
             "content_hash": "TEXT NOT NULL DEFAULT ''",
             "source_updated_at": "TEXT",
+            "metadata": "TEXT",
             "updated_at": "TEXT",
         }
         for name, declaration in additions.items():
@@ -212,12 +216,13 @@ class ProblemStore:
             embedding=unpack_embedding(blob) if read_embedding and blob is not None else None,
             content_hash=row["content_hash"],
             source_updated_at=row["source_updated_at"],
+            metadata=parse_canonical_metadata(row["metadata"]),
         )
 
     def search_snapshot(self, spec: EmbeddingIndexSpec | None) -> SearchSnapshot:
         with self._lock:
             rows = self._conn.execute(
-                "SELECT source, external_id, title, url, statement, embedding, content_hash, source_updated_at "
+                "SELECT source, external_id, title, url, statement, embedding, content_hash, source_updated_at, metadata "
                 "FROM problems ORDER BY id"
             ).fetchall()
             if not rows:
@@ -272,14 +277,14 @@ class ProblemStore:
                         raise IndexMetadataError("missing_metadata", "向量索引尚未登记模型身份。")
                     self._require_matching_metadata(metadata, index_spec)
                 existing = self._conn.execute(
-                    "SELECT title, url, statement, embedding, content_hash, source_updated_at "
+                    "SELECT title, url, statement, embedding, content_hash, source_updated_at, metadata "
                     "FROM problems WHERE source = ? AND external_id = ?",
                     (problem.source, problem.external_id),
                 ).fetchone()
                 if existing is None:
                     self._conn.execute(
-                        "INSERT INTO problems(source, external_id, title, url, statement, embedding, content_hash, source_updated_at) "
-                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                        "INSERT INTO problems(source, external_id, title, url, statement, embedding, content_hash, source_updated_at, metadata) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                         (
                             problem.source,
                             problem.external_id,
@@ -289,6 +294,7 @@ class ProblemStore:
                             blob,
                             problem.content_hash,
                             problem.source_updated_at,
+                            to_canonical_json(problem.metadata) if problem.metadata else None,
                         ),
                     )
                     self._conn.commit()
@@ -296,11 +302,13 @@ class ProblemStore:
 
                 old_timestamp = existing["source_updated_at"]
                 new_timestamp = problem.source_updated_at
+                existing_metadata = parse_canonical_metadata(existing["metadata"])
                 same_payload = (
                     existing["title"] == problem.title
                     and existing["url"] == problem.url
                     and existing["statement"] == problem.statement
                     and existing["content_hash"] == problem.content_hash
+                    and existing_metadata == problem.metadata
                 )
                 if old_timestamp is not None and (
                     new_timestamp is None
@@ -323,7 +331,7 @@ class ProblemStore:
                     next_blob = existing["embedding"]
                 self._conn.execute(
                     "UPDATE problems SET title = ?, url = ?, statement = ?, embedding = ?, content_hash = ?, "
-                    "source_updated_at = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') "
+                    "source_updated_at = ?, metadata = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') "
                     "WHERE source = ? AND external_id = ?",
                     (
                         problem.title,
@@ -332,6 +340,7 @@ class ProblemStore:
                         next_blob,
                         problem.content_hash,
                         problem.source_updated_at,
+                        to_canonical_json(problem.metadata) if problem.metadata else None,
                         problem.source,
                         problem.external_id,
                     ),
@@ -349,7 +358,7 @@ class ProblemStore:
     def get_problem(self, source: str, external_id: str) -> StoredProblem | None:
         with self._lock:
             row = self._conn.execute(
-                "SELECT source, external_id, title, url, statement, embedding, content_hash, source_updated_at "
+                "SELECT source, external_id, title, url, statement, embedding, content_hash, source_updated_at, metadata "
                 "FROM problems WHERE source = ? AND external_id = ?",
                 (source, external_id),
             ).fetchone()
@@ -358,7 +367,7 @@ class ProblemStore:
     def iter_all(self) -> list[StoredProblem]:
         with self._lock:
             rows = self._conn.execute(
-                "SELECT source, external_id, title, url, statement, embedding, content_hash, source_updated_at "
+                "SELECT source, external_id, title, url, statement, embedding, content_hash, source_updated_at, metadata "
                 "FROM problems ORDER BY id"
             ).fetchall()
         return [self._row_to_problem(row) for row in rows]

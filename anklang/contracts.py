@@ -22,6 +22,8 @@ from typing import Any
 from urllib.parse import urlsplit
 from uuid import UUID
 
+from .metadata import MetadataContractError, canonicalize_metadata
+
 _HASH_RE = re.compile(r"^[a-f0-9]{64}$")
 _UUID_RE = re.compile(
     r"^(?:"
@@ -149,6 +151,11 @@ def build_result(
         raise ContractError("响应候选必须是数组。")
 
     normalized = _normalize_candidates(candidates)
+    # v1 契约固定不携带元数据；即使后端返回了 metadata 也保持 v1 字段形状不变。
+    normalized = [
+        {key: value for key, value in candidate.items() if key != "metadata"}
+        for candidate in normalized
+    ]
     normalized_checked_at = checked_at or _utc_now_z()
     _parse_utc_z(normalized_checked_at, "checkedAt")
     result = {
@@ -237,6 +244,16 @@ def _normalize_candidates(candidates: list[dict[str, Any]]) -> list[dict[str, An
         url = _safe_http_url(candidate.get("url"))
         if url is not None:
             item["url"] = url
+        raw_metadata = candidate.get("metadata")
+        if raw_metadata is not None:
+            try:
+                metadata = canonicalize_metadata(raw_metadata)
+            except MetadataContractError:
+                raise ContractError(
+                    "candidate.metadata 不符合元数据约束。"
+                ) from None
+            if metadata is not None:
+                item["metadata"] = metadata
         normalized.append(item)
     return normalized
 

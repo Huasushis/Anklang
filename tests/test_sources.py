@@ -10,6 +10,7 @@ from anklang.sources import (
     RawProblem,
     SourceContractError,
     discover_source_modules,
+    validate_raw_problem,
     validate_source_modules,
 )
 from anklang.sources.example_static import SOURCE_NAME
@@ -53,6 +54,49 @@ class SourceDiscoveryTests(unittest.TestCase):
                     SimpleNamespace(SOURCE_NAME="same", fetch_new_problems=fetch),
                 ]
             )
+
+
+class RawProblemMetadataTests(unittest.TestCase):
+    def _problem(self, metadata) -> RawProblem:
+        return RawProblem(
+            external_id="meta-id",
+            title="title",
+            statement="statement",
+            updated_at="2026-08-14T00:00:00.000Z",
+            metadata=metadata,
+        )
+
+    def test_str_contains_uppercase_metadata_key_is_rejected(self) -> None:
+        with self.assertRaises(SourceContractError):
+            validate_raw_problem(self._problem({"BadKey": "value"}))
+
+    def test_metadata_nested_object_is_rejected(self) -> None:
+        with self.assertRaises(SourceContractError):
+            validate_raw_problem(self._problem({"nested": {"object": "rejected"}}))
+
+    def test_metadata_over_max_keys_is_rejected(self) -> None:
+        many = {f"k{i}": i for i in range(17)}
+        with self.assertRaises(SourceContractError):
+            validate_raw_problem(self._problem(many))
+
+    def test_metadata_oversized_value_is_rejected(self) -> None:
+        with self.assertRaises(SourceContractError):
+            validate_raw_problem(self._problem({"big": "x" * 513}))
+
+    def test_metadata_whitespace_string_value_is_rejected(self) -> None:
+        with self.assertRaises(SourceContractError):
+            validate_raw_problem(self._problem({"pad": "  value  "}))
+        with self.assertRaises(SourceContractError):
+            validate_raw_problem(self._problem({"empty": ""}))
+
+    def test_valid_metadata_canonicalizes_and_round_trips(self) -> None:
+        validated = validate_raw_problem(
+            self._problem({"zebra": "1", "alpha": 2, "flag": True, "none": None})
+        )
+        self.assertEqual(
+            validated.metadata,
+            {"zebra": "1", "alpha": 2, "flag": True, "none": None},
+        )
 
 
 class IncrementalIngestTests(unittest.TestCase):
