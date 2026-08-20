@@ -11,7 +11,7 @@ import threading
 from dataclasses import dataclass
 from typing import Any, Literal
 
-from .metadata import parse_canonical_metadata, to_canonical_json
+from .metadata import MetadataContractError, parse_canonical_metadata, to_canonical_json
 from .vectormath import pack_embedding, unpack_embedding, validate_embedding
 
 
@@ -205,8 +205,14 @@ class ProblemStore:
         row: sqlite3.Row,
         *,
         read_embedding: bool = True,
+        read_metadata: bool = True,
     ) -> StoredProblem:
         blob = row["embedding"]
+        metadata = (
+            parse_canonical_metadata(row["metadata"])
+            if read_metadata
+            else None
+        )
         return StoredProblem(
             source=row["source"],
             external_id=row["external_id"],
@@ -216,7 +222,7 @@ class ProblemStore:
             embedding=unpack_embedding(blob) if read_embedding and blob is not None else None,
             content_hash=row["content_hash"],
             source_updated_at=row["source_updated_at"],
-            metadata=parse_canonical_metadata(row["metadata"]),
+            metadata=metadata,
         )
 
     def search_snapshot(self, spec: EmbeddingIndexSpec | None) -> SearchSnapshot:
@@ -228,11 +234,17 @@ class ProblemStore:
             if not rows:
                 return SearchSnapshot((), False, "empty")
             if spec is None:
-                problems = tuple(self._row_to_problem(row, read_embedding=False) for row in rows)
+                problems = tuple(
+                    self._row_to_problem(row, read_embedding=False, read_metadata=False)
+                    for row in rows
+                )
                 return SearchSnapshot(problems, False, "embedding_disabled")
             metadata = self._metadata_locked()
             if metadata is None:
-                problems = tuple(self._row_to_problem(row, read_embedding=False) for row in rows)
+                problems = tuple(
+                    self._row_to_problem(row, read_embedding=False, read_metadata=False)
+                    for row in rows
+                )
                 return SearchSnapshot(problems, False, "missing_metadata")
             try:
                 self._require_matching_metadata(metadata, spec)
@@ -241,11 +253,23 @@ class ProblemStore:
                     if problem.embedding is None:
                         raise IndexMetadataError("incomplete_vectors", "题库存在缺失向量。")
                     validate_embedding(problem.embedding, expected_dimensions=spec.dimensions)
+            except MetadataContractError:
+                safe = tuple(
+                    self._row_to_problem(row, read_embedding=False, read_metadata=False)
+                    for row in rows
+                )
+                return SearchSnapshot(safe, False, "invalid_metadata")
             except IndexMetadataError as error:
-                safe = tuple(self._row_to_problem(row, read_embedding=False) for row in rows)
+                safe = tuple(
+                    self._row_to_problem(row, read_embedding=False, read_metadata=False)
+                    for row in rows
+                )
                 return SearchSnapshot(safe, False, error.status)
             except ValueError:
-                safe = tuple(self._row_to_problem(row, read_embedding=False) for row in rows)
+                safe = tuple(
+                    self._row_to_problem(row, read_embedding=False, read_metadata=False)
+                    for row in rows
+                )
                 return SearchSnapshot(safe, False, "invalid_vectors")
             return SearchSnapshot(problems, True, "ready")
 

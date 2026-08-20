@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from anklang.metadata import MetadataContractError
 from anklang.store import (
     EmbeddingIndexSpec,
     IndexMetadataError,
@@ -244,6 +245,116 @@ class ProblemStoreTests(unittest.TestCase):
             self.assertIsNotNone(problem)
             self.assertEqual(problem.title, "old title")
             self.assertIsNone(problem.metadata)
+
+    def _corrupt_metadata_store(self, raw_metadata: str) -> ProblemStore:
+        """建一个带损坏 metadata 文本行的 store，供只读路径失败关闭测试。"""
+        store = ProblemStore(":memory:")
+        self.addCleanup(store.close)
+        store._conn.execute(  # type: ignore[attr-defined]
+            "INSERT INTO problems(source, external_id, title, url, statement, embedding, content_hash, source_updated_at, metadata) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "synthetic",
+                "corrupt-1",
+                "损坏题",
+                None,
+                "statement corrupt",
+                None,
+                "e" * 64,
+                "2026-08-14T00:00:00.000Z",
+                raw_metadata,
+            ),
+        )
+        store._conn.commit()  # type: ignore[attr-defined]
+        return store
+
+    def test_stored_null_metadata_means_absent(self) -> None:
+        self.assertIsNone(self.store.get_problem("synthetic", "problem-1"))
+        self.store.prepare_embedding_writes(self.spec)
+        self.store.add_problem(
+            StoredProblem(
+                source="synthetic",
+                external_id="problem-null",
+                title="null meta",
+                url=None,
+                statement="statement",
+                embedding=None,
+                content_hash="f" * 64,
+                source_updated_at="2026-08-14T00:00:00.000Z",
+                metadata=None,
+            ),
+            index_spec=None,
+        )
+        problem = self.store.get_problem("synthetic", "problem-null")
+        self.assertIsNotNone(problem)
+        self.assertIsNone(problem.metadata)
+        stored = self.store._conn.execute(  # type: ignore[attr-defined]
+            "SELECT metadata FROM problems WHERE source = 'synthetic' AND external_id = 'problem-null'"
+        ).fetchone()
+        self.assertIsNone(stored["metadata"])
+
+    def test_empty_stored_metadata_fails_closed(self) -> None:
+        store = self._corrupt_metadata_store("")
+        with self.assertRaises(MetadataContractError):
+            store.get_problem("synthetic", "corrupt-1")
+        with self.assertRaises(MetadataContractError):
+            store.iter_all()
+
+    def test_malformed_stored_metadata_fails_closed(self) -> None:
+        store = self._corrupt_metadata_store("{not json")
+        with self.assertRaises(MetadataContractError):
+            store.get_problem("synthetic", "corrupt-1")
+        with self.assertRaises(MetadataContractError):
+            store.iter_all()
+
+    def test_empty_object_stored_metadata_fails_closed(self) -> None:
+        store = self._corrupt_metadata_store("{}")
+        with self.assertRaises(MetadataContractError):
+            store.get_problem("synthetic", "corrupt-1")
+        with self.assertRaises(MetadataContractError):
+            store.iter_all()
+
+    def test_noncanonical_stored_metadata_fails_closed(self) -> None:
+        # 规范 JSON 要求 ASCII 升序键与紧凑分隔符；乱序键属于存储损坏。
+        store = self._corrupt_metadata_store('{"z":1,"a":2}')
+        with self.assertRaises(MetadataContractError):
+            store.get_problem("synthetic", "corrupt-1")
+        with self.assertRaises(MetadataContractError):
+            store.iter_all()
+
+    def test_contract_invalid_stored_metadata_fails_closed(self) -> None:
+        store = self._corrupt_metadata_store('{"nested": {"object": "rejected"}}')
+        with self.assertRaises(MetadataContractError):
+            store.get_problem("synthetic", "corrupt-1")
+        store2 = self._corrupt_metadata_store('{"UPPER": "rejected"}')
+        with self.assertRaises(MetadataContractError):
+            store2.get_problem("synthetic", "corrupt-1")
+
+    def test_corrupt_stored_metadata_makes_search_snapshot_fail_closed(self) -> None:
+        self.store.prepare_embedding_writes(self.spec)
+        self.store.add_problem(_problem(vector=[1.0, 0.0]), index_spec=self.spec)
+        self.store.add_problem(
+            StoredProblem(
+                source="synthetic",
+                external_id="corrupt-row",
+                title="损坏行",
+                url=None,
+                statement="statement",
+                embedding=None,
+                content_hash="d" * 64,
+                source_updated_at="2026-08-14T00:00:00.000Z",
+            ),
+            index_spec=None,
+        )
+        self.store._conn.execute(  # type: ignore[attr-defined]
+            "UPDATE problems SET metadata = ? WHERE external_id = 'corrupt-row'",
+            ("{bad json",),
+        )
+        self.store._conn.commit()  # type: ignore[attr-defined]
+        snapshot = self.store.search_snapshot(self.spec)
+        # 损坏的元数据不允许形成查询快照，也不允许带候选出站。
+        self.assertFalse(snapshot.vector_ready)
+        self.assertEqual(snapshot.vector_status, "invalid_metadata")
 
 
 if __name__ == "__main__":

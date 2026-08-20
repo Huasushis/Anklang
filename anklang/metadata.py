@@ -103,15 +103,24 @@ def to_canonical_json(metadata: dict[str, Any]) -> str:
 
 
 def parse_canonical_metadata(text: str | None) -> dict[str, Any] | None:
-    """从 SQLite 的规范 JSON 文本读回元数据；缺失或空返回 None。"""
+    """从 SQLite 的规范 JSON 文本读回元数据。
 
-    if text is None or not text:
+    SQL NULL 表示确实没有元数据，返回 None。空文本、空对象、非法 JSON、
+    非规范字节或不符合契约的值都属于损坏的存储状态，一律抛
+    MetadataContractError 让调用方失败关闭，绝不静默丢弃。错误信息不含值。
+    """
+
+    if text is None:
         return None
+    if not isinstance(text, str) or not text:
+        raise MetadataContractError("存储的元数据为空文本。")
     try:
         value = json.loads(text)
     except json.JSONDecodeError:
-        return None
-    try:
-        return canonicalize_metadata(value)
-    except MetadataContractError:
-        return None
+        raise MetadataContractError("存储的元数据不是合法 JSON。") from None
+    canonical = canonicalize_metadata(value)
+    if canonical is None:
+        raise MetadataContractError("存储的元数据是空对象。")
+    if to_canonical_json(canonical) != text:
+        raise MetadataContractError("存储的元数据不是规范 JSON。")
+    return canonical

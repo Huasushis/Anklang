@@ -141,6 +141,36 @@ class UpstreamEntrypointTests(unittest.TestCase):
         self.assertEqual(result.reason_code, "search_backend_invalid")
         self.assertEqual(opener.calls, 0)
 
+    def test_corrupt_stored_metadata_makes_query_unavailable(self) -> None:
+        # 手写损坏的 metadata 行：查询路径必须失败关闭，不产生候选。
+        self.store.prepare_embedding_writes(self.spec)
+        self.store.add_problem(
+            StoredProblem(
+                source="synthetic",
+                external_id="corrupt-row",
+                title="损坏行",
+                url=None,
+                statement="statement corrupt",
+                embedding=[1.0, 0.0],
+                content_hash="1" * 64,
+                source_updated_at="2026-08-14T00:00:00.000Z",
+            ),
+            index_spec=self.spec,
+        )
+        self.store._conn.execute(  # type: ignore[attr-defined]
+            "UPDATE problems SET metadata = ? WHERE external_id = 'corrupt-row'",
+            ("{not json",),
+        )
+        self.store._conn.commit()  # type: ignore[attr-defined]
+        embedder, opener = _embedder({"synthetic query": [1.0, 0.0]})
+        result = upstream_server.UpstreamSearchBackend(self.store, embedder).search(
+            "synthetic query", 5
+        )
+        self.assertEqual(result.status, "unavailable")
+        self.assertEqual(result.reason_code, "search_backend_invalid")
+        self.assertEqual(result.candidates, [])
+        self.assertEqual(opener.calls, 0)
+
 
 if __name__ == "__main__":
     unittest.main()
