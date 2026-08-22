@@ -46,7 +46,7 @@ def _health_body() -> bytes:
             "status": "ok",
             "service": "anklang",
             "apiVersion": "1",
-            "backend": "reverse_proxy",
+            "backend": "upstream-v2",
         }
     )
 
@@ -68,6 +68,11 @@ class ReviewFlowCaptureTests(unittest.TestCase):
         self.repository_patch = patch.object(
             capture, "_repository_root", return_value=Path(self.temporary.name)
         )
+        self.service_identity_patch = patch.object(
+            capture, "_require_service_identity"
+        )
+        self.service_identity_patch.start()
+        self.addCleanup(self.service_identity_patch.stop)
         self.ignore_patch = patch.object(capture, "_require_project_ignored")
         self.identity_patch.start()
         self.repository_patch.start()
@@ -77,8 +82,8 @@ class ReviewFlowCaptureTests(unittest.TestCase):
         self.addCleanup(self.ignore_patch.stop)
 
     def _prepare_manifest(self, case_count: int) -> tuple[Path, str]:
-        requests: list[bytes] = []
         cases: list[dict[str, object]] = []
+        bindings: list[capture.RequestBinding] = []
         for index in range(case_count):
             request = _json_bytes(
                 {
@@ -99,45 +104,107 @@ class ReviewFlowCaptureTests(unittest.TestCase):
             path = self.workspace / file_name
             path.write_bytes(request)
             path.chmod(0o600)
-            requests.append(request)
+            request_sha256 = _sha256(request)
+            request_id = f"00000000-0000-4000-8000-{index + 1:012x}"
+            content_hash = _sha256(f"synthetic-{index}".encode("ascii"))
             cases.append(
                 {
                     "caseId": f"case-synthetic-{index + 1}",
-                    "request": {"fileName": file_name, "sha256": _sha256(request)},
+                    "request": {
+                        "fileName": file_name,
+                        "sha256": request_sha256,
+                    },
                 }
             )
-        upstream_hash = "4" * 64
+            bindings.append(
+                capture.RequestBinding(
+                    case_id=f"case-synthetic-{index + 1}",
+                    file_name=file_name,
+                    expected_sha256=request_sha256,
+                    request_id=request_id,
+                    content_hash=content_hash,
+                )
+            )
+
+        corpus_hashes = {
+            "sourceSetSha256": "4" * 64,
+            "sourceConfirmationSha256": "5" * 64,
+            "materializationMarkerSha256": "6" * 64,
+            "approvalSha256": "7" * 64,
+            "requestSetSha256": "8" * 64,
+            "requestPreparationMarkerSha256": "9" * 64,
+        }
+        embedding = {
+            "provider": "dashscope",
+            "baseUrlSha256": None,
+            "apiKeyPresent": False,
+            "model": "text-embedding-v4",
+            "dimensions": 1024,
+            "configured": False,
+            "configurationSha256": "a" * 64,
+        }
+        index = {
+            "indexId": "formal156-local-index-test",
+            "dbSha256": "b" * 64,
+            "problemCount": 0,
+            "vectorIndexReady": False,
+            "vectorIndexStatus": "empty",
+            "embeddingModel": "text-embedding-v4",
+            "embeddingDimensions": 1024,
+        }
         capture_id = "capture-0123456789abcdef"
         manifest = {
-            "schemaVersion": 1,
-            "artifactKind": "anklang_review_flow_v2_capture_manifest",
+            "schemaVersion": 2,
+            "artifactKind": "anklang_local_query_only_capture_manifest",
             "captureId": capture_id,
+            "serviceCodeVersion": "1" * 40,
             "expectedCaseCount": case_count,
+            "caseSelection": {
+                "policy": "evenly_spaced_source_ids_v1",
+                "population": 156,
+                "sampleCount": case_count,
+            },
             "endpoint": "http://127.0.0.1:1/api/v2/checks/similarity",
             "timeoutMs": 5_000,
             "externalStatementTransferConfirmed": True,
+            "resultContract": {
+                "apiVersion": "2",
+                "topLevelKeys": list(capture.RESULT_CONTRACT_KEYS),
+            },
+            "corpusIdentity": {
+                "evidenceKind": "reproducible_snapshot",
+                "corpusId": "formal156-test",
+                "sourceCount": 156,
+                **corpus_hashes,
+            },
+            "embeddingIdentity": embedding,
+            "indexIdentity": index,
             "runtimeDeclaration": {
-                "backend": "reverse_proxy",
+                "backend": "upstream-v2",
                 "searchK": 8,
                 "minimumSimilarity": 0.5,
-                "blockThreshold": 0.9,
+                "blockThreshold": 0.0,
                 "similarityBlockEnabled": False,
-                "cacheTtlSeconds": 3_600,
+                "cacheTtlSeconds": 0,
                 "llmReviewEnabled": False,
                 "llmModel": None,
                 "llmReviewTopN": None,
                 "llmEndpointSha256": None,
-                "reverseProxy": {
-                    "useRerank": False,
-                    "upstreamEndpointSha256": upstream_hash,
-                },
-                "localEngine": None,
-                "corpus": {
-                    "evidenceKind": "remote_corpus_unverifiable",
-                    "serviceOriginSha256": upstream_hash,
-                    "declarationSha256": "5" * 64,
+                "reverseProxy": None,
+                "localEngine": {
+                    "mode": "query_only",
+                    "vectorTopK": 8,
+                    "keywordTopK": 0,
+                    "embeddingConfigured": False,
+                    "embeddingModel": None,
+                    "embeddingDimensions": None,
+                    "embeddingEndpointSha256": None,
+                    "indexIdentitySha256": index["dbSha256"],
                 },
             },
+            "requestIdentitySetSha256": capture._request_identity_set_sha256(
+                bindings
+            ),
             "cases": cases,
         }
         manifest_path = self.workspace / "manifest.json"
@@ -237,6 +304,7 @@ class ReviewFlowCaptureTests(unittest.TestCase):
         verified = capture.verify_capture(
             workspace=self.workspace,
             manifest_path=manifest,
+            expected_service_code_version=identity.git_head,
             expected_code_version=identity.git_head,
             expected_runner_sha256=identity.runner_sha256,
             expected_dependency_code_sha256=identity.dependency_code_sha256,
@@ -250,6 +318,37 @@ class ReviewFlowCaptureTests(unittest.TestCase):
             oct(stat.S_IMODE(self.workspace.stat().st_mode)), "0o700"
         )
         self.assertEqual(oct(stat.S_IMODE(run.stat().st_mode)), "0o700")
+
+    def test_manifest_verifier_reports_fixed_local_identity(self) -> None:
+        manifest, _ = self._prepare_manifest(2)
+        summary = json.loads(
+            capture.verify_manifest(
+                workspace=self.workspace,
+                manifest_path=manifest,
+                expected_service_code_version=self.identity.git_head,
+                expected_case_count=2,
+            )
+        )
+        self.assertTrue(summary["complete"])
+        self.assertEqual(summary["serviceCodeVersion"], self.identity.git_head)
+        self.assertEqual(summary["caseCount"], 2)
+        self.assertEqual(summary["corpus"]["sourceCount"], 156)
+        self.assertFalse(summary["embedding"]["configured"])
+        self.assertEqual(summary["index"]["vectorIndexStatus"], "empty")
+        self.assertEqual(
+            summary["resultContract"]["topLevelKeys"],
+            list(capture.RESULT_CONTRACT_KEYS),
+        )
+
+    def test_reverse_proxy_manifest_is_historical(self) -> None:
+        manifest, _ = self._prepare_manifest(1)
+        value = json.loads(manifest.read_text())
+        value["runtimeDeclaration"]["backend"] = "reverse_proxy"
+        with self.assertRaises(capture.CaptureError) as context:
+            capture._parse_manifest(
+                _json_bytes(value), self.workspace, Path(self.temporary.name)
+            )
+        self.assertEqual(context.exception.code, "CAPTURE_HISTORICAL_BACKEND")
 
 
 if __name__ == "__main__":

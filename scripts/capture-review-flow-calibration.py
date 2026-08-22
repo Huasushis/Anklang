@@ -19,6 +19,7 @@ from anklang.review_flow_capture import (  # noqa: E402
     CaptureError,
     run_capture,
     verify_capture,
+    verify_manifest,
 )
 
 
@@ -50,13 +51,25 @@ def _parser() -> argparse.ArgumentParser:
 def _verify_parser() -> argparse.ArgumentParser:
     parser = _VerifyArgumentParser(
         prog="capture-review-flow-calibration.py verify-capture",
-        description="只读重放并验证已完成的 Anklang capture。",
+        description="只读重放并验证已完成的 Anklang v2 capture。",
     )
     parser.add_argument("--workspace", required=True)
     parser.add_argument("--manifest", required=True)
+    parser.add_argument("--verifier-service-code-version", required=True)
     parser.add_argument("--verifier-code-version", required=True)
     parser.add_argument("--verifier-runner-sha256", required=True)
     parser.add_argument("--verifier-dependency-code-sha256", required=True)
+    return parser
+
+
+def _verify_manifest_parser() -> argparse.ArgumentParser:
+    parser = _VerifyArgumentParser(
+        prog="capture-review-flow-calibration.py verify-manifest",
+        description="只读验证冻结的本地 query-only manifest。",
+    )
+    parser.add_argument("--workspace", required=True)
+    parser.add_argument("--manifest", required=True)
+    parser.add_argument("--verifier-service-code-version", required=True)
     return parser
 
 
@@ -66,6 +79,7 @@ def _verify_main(argv: list[str]) -> int:
         attestation_bytes = verify_capture(
             workspace=args.workspace,
             manifest_path=args.manifest,
+            expected_service_code_version=args.verifier_service_code_version,
             expected_code_version=args.verifier_code_version,
             expected_runner_sha256=args.verifier_runner_sha256,
             expected_dependency_code_sha256=(
@@ -86,9 +100,30 @@ def _verify_main(argv: list[str]) -> int:
     return 0
 
 
+def _verify_manifest_main(argv: list[str]) -> int:
+    args = _verify_manifest_parser().parse_args(argv)
+    try:
+        summary_bytes = verify_manifest(
+            workspace=args.workspace,
+            manifest_path=args.manifest,
+            expected_service_code_version=args.verifier_service_code_version,
+        )
+    except CaptureError as error:
+        sys.stderr.write(f"{error.code}\n")
+        return 1
+    except Exception:
+        sys.stderr.write("CAPTURE_INTERNAL_ERROR\n")
+        return 1
+    sys.stdout.buffer.write(summary_bytes)
+    sys.stdout.buffer.flush()
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     os.umask(0o077)
     arguments = list(sys.argv[1:] if argv is None else argv)
+    if arguments and arguments[0] == "verify-manifest":
+        return _verify_manifest_main(arguments[1:])
     if arguments and arguments[0] == "verify-capture":
         return _verify_main(arguments[1:])
     args = _parser().parse_args(arguments)

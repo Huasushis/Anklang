@@ -28,7 +28,7 @@ from urllib.parse import urlsplit
 from .contracts import ContractError, parse_request, validate_v2_result
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 MAX_CASE_COUNT = 2_000
 COMPLETION_MARKER_NAME = "REVIEW_FLOW_ANKLANG_CAPTURE_COMPLETE"
 ATTESTATION_NAME = "attestation.json"
@@ -40,6 +40,17 @@ FIXED_DEPENDENCY_PATHS = (
     "anklang/__init__.py",
     "anklang/review_flow_capture.py",
     "anklang/contracts.py",
+)
+HISTORICAL_BACKENDS = frozenset({"reverse_proxy"})
+RESULT_CONTRACT_KEYS = (
+    "apiVersion",
+    "contentHash",
+    "checkedAt",
+    "completion",
+    "candidates",
+)
+_SERVICE_ALLOWED_CHANGE_PATHS = frozenset(
+    {*FIXED_DEPENDENCY_PATHS, "tests/test_review_flow_capture.py"}
 )
 
 _CAPTURE_ID_RE = re.compile(r"^capture-[0-9a-f]{16}$")
@@ -108,14 +119,20 @@ class RequestBinding:
 @dataclass(frozen=True)
 class CaptureManifest:
     capture_id: str
+    service_code_version: str
     expected_case_count: int
+    case_selection: dict[str, Any]
     endpoint: str
     base_url_sha256: str
     timeout_ms: int
+    result_contract: dict[str, Any]
+    corpus_identity: dict[str, Any]
+    embedding_identity: dict[str, Any]
+    index_identity: dict[str, Any]
     runtime_declaration: dict[str, Any]
     runtime_declaration_sha256: str
+    request_identity_set_sha256: str
     cases: tuple[RequestBinding, ...]
-
 
 @dataclass(frozen=True)
 class HttpCaptureResponse:
@@ -165,6 +182,11 @@ def run_capture(
     )
     manifest_sha256 = _sha256(manifest_bytes)
     manifest = _parse_manifest(manifest_bytes, root, repository_root)
+    _require_service_identity(
+        repository_root,
+        service_code_version=manifest.service_code_version,
+        generator=generator,
+    )
     _require_project_ignored(
         repository_root,
         root / "runs" / manifest.capture_id / "output-probe.private",
@@ -174,6 +196,8 @@ def run_capture(
         "manifestSha256": manifest_sha256,
         "baseUrlSha256": manifest.base_url_sha256,
         "runtimeDeclarationSha256": manifest.runtime_declaration_sha256,
+        "requestIdentitySetSha256": manifest.request_identity_set_sha256,
+        "serviceCodeVersion": manifest.service_code_version,
         "generator": generator.descriptor(),
     }
     run_directory = _prepare_run_directory(root, manifest.capture_id, resume=resume)
@@ -458,6 +482,7 @@ def verify_capture(
     *,
     workspace: Path | str,
     manifest_path: Path | str,
+    expected_service_code_version: str,
     expected_code_version: str,
     expected_runner_sha256: str,
     expected_dependency_code_sha256: str,
@@ -482,6 +507,13 @@ def verify_capture(
     )
     manifest_sha256 = _sha256(manifest_bytes)
     manifest = _parse_manifest(manifest_bytes, root, repository_root)
+    _require_service_identity(
+        repository_root,
+        service_code_version=manifest.service_code_version,
+        generator=generator,
+    )
+    if manifest.service_code_version != expected_service_code_version:
+        raise CaptureError("CAPTURE_SERVICE_IDENTITY_MISMATCH")
     run_directory = _require_existing_run_directory(root, manifest.capture_id)
     _require_project_ignored(
         repository_root, run_directory / "output-probe.private"
@@ -490,6 +522,8 @@ def verify_capture(
         "manifestSha256": manifest_sha256,
         "baseUrlSha256": manifest.base_url_sha256,
         "runtimeDeclarationSha256": manifest.runtime_declaration_sha256,
+        "requestIdentitySetSha256": manifest.request_identity_set_sha256,
+        "serviceCodeVersion": manifest.service_code_version,
         "generator": generator.descriptor(),
     }
 
@@ -573,6 +607,72 @@ def verify_capture(
         return attestation_bytes
 
 
+def verify_manifest(
+    *,
+    workspace: Path | str,
+    manifest_path: Path | str,
+    expected_service_code_version: str,
+    expected_case_count: int = 32,
+) -> bytes:
+    """只读验证冻结 manifest 的服务、语料、索引和请求身份绑定。"""
+    root = Path(workspace).resolve()
+    repository_root = _repository_root()
+    manifest_file = Path(manifest_path).resolve()
+    _require_project_ignored(repository_root, manifest_file)
+    raw = _read_private_file(
+        manifest_file, _MAX_MANIFEST_BYTES, "CAPTURE_MANIFEST_INVALID"
+    )
+    manifest_sha256 = _sha256(raw)
+    manifest = _parse_manifest(raw, root, repository_root)
+    generator = _load_generator_identity()
+    _require_service_identity(
+        repository_root,
+        service_code_version=manifest.service_code_version,
+        generator=generator,
+    )
+    if (
+        not isinstance(expected_service_code_version, str)
+        or manifest.service_code_version != expected_service_code_version
+    ):
+        raise CaptureError("CAPTURE_SERVICE_IDENTITY_MISMATCH")
+    if manifest.expected_case_count != expected_case_count:
+        raise CaptureError("CAPTURE_CASE_COUNT_MISMATCH")
+    return _pretty_json(
+        {
+            "complete": True,
+            "captureId": manifest.capture_id,
+            "manifestSha256": manifest_sha256,
+            "serviceCodeVersion": manifest.service_code_version,
+            "caseCount": manifest.expected_case_count,
+            "caseSelection": manifest.case_selection,
+            "corpus": {
+                "sourceCount": manifest.corpus_identity["sourceCount"],
+                "sourceSetSha256": manifest.corpus_identity["sourceSetSha256"],
+                "requestSetSha256": manifest.corpus_identity["requestSetSha256"],
+            },
+            "embedding": {
+                "provider": manifest.embedding_identity["provider"],
+                "model": manifest.embedding_identity["model"],
+                "dimensions": manifest.embedding_identity["dimensions"],
+                "configured": manifest.embedding_identity["configured"],
+                "configurationSha256": manifest.embedding_identity[
+                    "configurationSha256"
+                ],
+            },
+            "index": {
+                "dbSha256": manifest.index_identity["dbSha256"],
+                "problemCount": manifest.index_identity["problemCount"],
+                "vectorIndexStatus": manifest.index_identity[
+                    "vectorIndexStatus"
+                ],
+            },
+            "resultContract": manifest.result_contract,
+            "requestIdentitySetSha256": manifest.request_identity_set_sha256,
+            "runtimeDeclaration": manifest.runtime_declaration,
+        }
+    )
+
+
 def _require_expected_generator_identity(
     generator: GeneratorIdentity,
     *,
@@ -611,6 +711,32 @@ def _require_source_identity(
     if _load_generator_identity() != generator:
         raise CaptureError("CAPTURE_CODE_CHANGED")
 
+def _require_service_identity(
+    repository_root: Path,
+    *,
+    service_code_version: str,
+    generator: GeneratorIdentity,
+) -> None:
+    if (
+        not isinstance(service_code_version, str)
+        or re.fullmatch(r"(?!0{40})[a-f0-9]{40}", service_code_version)
+        is None
+    ):
+        raise CaptureError("CAPTURE_SERVICE_IDENTITY_INVALID")
+    try:
+        _run_git(
+            repository_root,
+            ["merge-base", "--is-ancestor", service_code_version, generator.git_head],
+        )
+        changed = _run_git(
+            repository_root,
+            ["diff", "--name-only", service_code_version, generator.git_head, "--"],
+        )
+    except CaptureError:
+        raise CaptureError("CAPTURE_SERVICE_IDENTITY_INVALID") from None
+    changed_paths = {line for line in changed.splitlines() if line}
+    if not changed_paths.issubset(_SERVICE_ALLOWED_CHANGE_PATHS):
+        raise CaptureError("CAPTURE_SERVICE_CODE_CHANGED")
 
 def _parse_manifest(
     raw: bytes, workspace: Path, repository_root: Path
@@ -620,11 +746,18 @@ def _parse_manifest(
         "schemaVersion",
         "artifactKind",
         "captureId",
+        "serviceCodeVersion",
         "expectedCaseCount",
+        "caseSelection",
         "endpoint",
         "timeoutMs",
         "externalStatementTransferConfirmed",
+        "resultContract",
+        "corpusIdentity",
+        "embeddingIdentity",
+        "indexIdentity",
         "runtimeDeclaration",
+        "requestIdentitySetSha256",
         "cases",
     }:
         raise CaptureError("CAPTURE_MANIFEST_INVALID")
@@ -632,23 +765,38 @@ def _parse_manifest(
         type(value.get("schemaVersion")) is not int
         or value["schemaVersion"] != SCHEMA_VERSION
         or value.get("artifactKind")
-        != "anklang_review_flow_v2_capture_manifest"
+        != "anklang_local_query_only_capture_manifest"
         or value.get("externalStatementTransferConfirmed") is not True
     ):
         raise CaptureError("CAPTURE_MANIFEST_INVALID")
     capture_id = value.get("captureId")
+    service_code_version = value.get("serviceCodeVersion")
     if (
         not isinstance(capture_id, str)
         or _CAPTURE_ID_RE.fullmatch(capture_id) is None
+        or not isinstance(service_code_version, str)
+        or re.fullmatch(r"(?!0{40})[a-f0-9]{40}", service_code_version)
+        is None
     ):
         raise CaptureError("CAPTURE_MANIFEST_INVALID")
     endpoint = _validate_endpoint(value.get("endpoint"))
     timeout_ms = _bounded_int(value.get("timeoutMs"), 1_000, 600_000)
+    result_contract = _validate_result_contract(value.get("resultContract"))
+    corpus_identity = _validate_corpus_identity(value.get("corpusIdentity"))
+    embedding_identity = _validate_embedding_identity(
+        value.get("embeddingIdentity")
+    )
+    index_identity = _validate_index_identity(value.get("indexIdentity"))
     runtime_declaration = _validate_runtime_declaration(
-        value.get("runtimeDeclaration")
+        value.get("runtimeDeclaration"),
+        embedding_identity=embedding_identity,
+        index_identity=index_identity,
     )
     expected_case_count = _bounded_int(
         value.get("expectedCaseCount"), 1, MAX_CASE_COUNT
+    )
+    case_selection = _validate_case_selection(
+        value.get("caseSelection"), expected_case_count
     )
     raw_cases = value.get("cases")
     if (
@@ -718,19 +866,213 @@ def _parse_manifest(
             )
         )
 
+    request_identity_set_sha256 = _request_identity_set_sha256(cases)
+    if value.get("requestIdentitySetSha256") != request_identity_set_sha256:
+        raise CaptureError("CAPTURE_REQUEST_IDENTITY_SET_MISMATCH")
+
     return CaptureManifest(
         capture_id=capture_id,
+        service_code_version=service_code_version,
         expected_case_count=expected_case_count,
+        case_selection=case_selection,
         endpoint=endpoint,
         base_url_sha256=_base_url_sha256(endpoint),
         timeout_ms=timeout_ms,
+        result_contract=result_contract,
+        corpus_identity=corpus_identity,
+        embedding_identity=embedding_identity,
+        index_identity=index_identity,
         runtime_declaration=runtime_declaration,
         runtime_declaration_sha256=_hash_json(runtime_declaration),
+        request_identity_set_sha256=request_identity_set_sha256,
         cases=tuple(cases),
     )
 
 
-def _validate_runtime_declaration(value: object) -> dict[str, Any]:
+def _validate_result_contract(value: object) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != {
+        "apiVersion",
+        "topLevelKeys",
+    }:
+        raise CaptureError("CAPTURE_RESULT_CONTRACT_INVALID")
+    keys = value.get("topLevelKeys")
+    if (
+        value.get("apiVersion") != "2"
+        or not isinstance(keys, list)
+        or keys != list(RESULT_CONTRACT_KEYS)
+    ):
+        raise CaptureError("CAPTURE_RESULT_CONTRACT_INVALID")
+    return {"apiVersion": "2", "topLevelKeys": list(RESULT_CONTRACT_KEYS)}
+
+
+def _validate_case_selection(
+    value: object, expected_case_count: int
+) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != {
+        "policy",
+        "population",
+        "sampleCount",
+    }:
+        raise CaptureError("CAPTURE_CASE_SELECTION_INVALID")
+    if (
+        value.get("policy") != "evenly_spaced_source_ids_v1"
+        or _bounded_int(value.get("population"), 156, 156)
+        != value.get("population")
+        or value.get("sampleCount") != expected_case_count
+    ):
+        raise CaptureError("CAPTURE_CASE_SELECTION_INVALID")
+    return {
+        "policy": "evenly_spaced_source_ids_v1",
+        "population": 156,
+        "sampleCount": expected_case_count,
+    }
+
+
+
+def _validate_corpus_identity(value: object) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != {
+        "evidenceKind",
+        "corpusId",
+        "sourceCount",
+        "sourceSetSha256",
+        "sourceConfirmationSha256",
+        "materializationMarkerSha256",
+        "approvalSha256",
+        "requestSetSha256",
+        "requestPreparationMarkerSha256",
+    }:
+        raise CaptureError("CAPTURE_CORPUS_DECLARATION_INVALID")
+    corpus_id = value.get("corpusId")
+    source_count = value.get("sourceCount")
+    if (
+        value.get("evidenceKind") != "reproducible_snapshot"
+        or not isinstance(corpus_id, str)
+        or not 1 <= len(corpus_id) <= 160
+        or corpus_id != corpus_id.strip()
+        or not corpus_id.startswith("formal156-")
+        or _bounded_int(source_count, 156, 156) != source_count
+        or not _is_digest(value.get("sourceSetSha256"))
+        or not _is_digest(value.get("sourceConfirmationSha256"))
+        or not _is_digest(value.get("materializationMarkerSha256"))
+        or not _is_digest(value.get("approvalSha256"))
+        or not _is_digest(value.get("requestSetSha256"))
+        or not _is_digest(value.get("requestPreparationMarkerSha256"))
+    ):
+        raise CaptureError("CAPTURE_CORPUS_DECLARATION_INVALID")
+    return {
+        "evidenceKind": "reproducible_snapshot",
+        "corpusId": corpus_id,
+        "sourceCount": source_count,
+        "sourceSetSha256": value["sourceSetSha256"],
+        "sourceConfirmationSha256": value["sourceConfirmationSha256"],
+        "materializationMarkerSha256": value["materializationMarkerSha256"],
+        "approvalSha256": value["approvalSha256"],
+        "requestSetSha256": value["requestSetSha256"],
+        "requestPreparationMarkerSha256": value["requestPreparationMarkerSha256"],
+    }
+
+
+def _validate_embedding_identity(value: object) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != {
+        "provider",
+        "baseUrlSha256",
+        "apiKeyPresent",
+        "model",
+        "dimensions",
+        "configured",
+        "configurationSha256",
+    }:
+        raise CaptureError("CAPTURE_EMBEDDING_IDENTITY_INVALID")
+    provider = value.get("provider")
+    base_url_sha256 = value.get("baseUrlSha256")
+    api_key_present = value.get("apiKeyPresent")
+    model = value.get("model")
+    dimensions = value.get("dimensions")
+    configured = value.get("configured")
+    if (
+        provider != "dashscope"
+        or (base_url_sha256 is not None and not _is_digest(base_url_sha256))
+        or not isinstance(api_key_present, bool)
+        or not isinstance(model, str)
+        or not 1 <= len(model) <= 200
+        or model != model.strip()
+        or _bounded_int(dimensions, 1, 4096) != dimensions
+        or not isinstance(configured, bool)
+        or not _is_digest(value.get("configurationSha256"))
+        or configured != (api_key_present and base_url_sha256 is not None)
+    ):
+        raise CaptureError("CAPTURE_EMBEDDING_IDENTITY_INVALID")
+    return {
+        "provider": "dashscope",
+        "baseUrlSha256": base_url_sha256,
+        "apiKeyPresent": api_key_present,
+        "model": model,
+        "dimensions": dimensions,
+        "configured": configured,
+        "configurationSha256": value["configurationSha256"],
+    }
+
+
+def _validate_index_identity(value: object) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != {
+        "indexId",
+        "dbSha256",
+        "problemCount",
+        "vectorIndexReady",
+        "vectorIndexStatus",
+        "embeddingModel",
+        "embeddingDimensions",
+    }:
+        raise CaptureError("CAPTURE_INDEX_IDENTITY_INVALID")
+    index_id = value.get("indexId")
+    status = value.get("vectorIndexStatus")
+    ready = value.get("vectorIndexReady")
+    if (
+        not isinstance(index_id, str)
+        or not 1 <= len(index_id) <= 160
+        or index_id != index_id.strip()
+        or not _is_digest(value.get("dbSha256"))
+        or _bounded_int(value.get("problemCount"), 0, 100_000_000)
+        != value.get("problemCount")
+        or not isinstance(ready, bool)
+        or status
+        not in {
+            "empty",
+            "ready",
+            "missing_metadata",
+            "incomplete_vectors",
+            "model_mismatch",
+            "dimension_mismatch",
+            "invalid_metadata",
+            "invalid_vectors",
+            "embedding_disabled",
+            "store_unavailable",
+        }
+        or ready != (status == "ready")
+        or not isinstance(value.get("embeddingModel"), str)
+        or not 1 <= len(value["embeddingModel"]) <= 200
+        or value["embeddingModel"] != value["embeddingModel"].strip()
+        or _bounded_int(value.get("embeddingDimensions"), 1, 4096)
+        != value.get("embeddingDimensions")
+    ):
+        raise CaptureError("CAPTURE_INDEX_IDENTITY_INVALID")
+    return {
+        "indexId": index_id,
+        "dbSha256": value["dbSha256"],
+        "problemCount": value["problemCount"],
+        "vectorIndexReady": ready,
+        "vectorIndexStatus": status,
+        "embeddingModel": value["embeddingModel"],
+        "embeddingDimensions": value["embeddingDimensions"],
+    }
+
+
+def _validate_runtime_declaration(
+    value: object,
+    *,
+    embedding_identity: dict[str, Any],
+    index_identity: dict[str, Any],
+) -> dict[str, Any]:
     if not isinstance(value, dict) or set(value) != {
         "backend",
         "searchK",
@@ -744,16 +1086,13 @@ def _validate_runtime_declaration(value: object) -> dict[str, Any]:
         "llmEndpointSha256",
         "reverseProxy",
         "localEngine",
-        "corpus",
     }:
         raise CaptureError("CAPTURE_RUNTIME_DECLARATION_INVALID")
     backend = value.get("backend")
-    if backend not in {"reverse_proxy", "local_engine"}:
+    if backend in HISTORICAL_BACKENDS:
+        raise CaptureError("CAPTURE_HISTORICAL_BACKEND")
+    if backend != "upstream-v2":
         raise CaptureError("CAPTURE_RUNTIME_DECLARATION_INVALID")
-    if backend == "local_engine":
-        # 本版固定依赖清单没有 SQLite 快照/清单的独立验证器；不能只凭操作员
-        # 自报哈希把本地语料包装成 Fermata 的 reproducible_snapshot。
-        raise CaptureError("CAPTURE_LOCAL_CORPUS_UNVERIFIED")
     search_k = _bounded_int(value.get("searchK"), 1, 20)
     minimum_similarity = _finite_number(
         value.get("minimumSimilarity"), minimum=0.0, maximum=1.0
@@ -761,167 +1100,79 @@ def _validate_runtime_declaration(value: object) -> dict[str, Any]:
     block_threshold = _finite_number(
         value.get("blockThreshold"), minimum=0.0, maximum=1.0
     )
-    if not isinstance(value.get("similarityBlockEnabled"), bool):
+    if value.get("similarityBlockEnabled") is not False:
         raise CaptureError("CAPTURE_RUNTIME_DECLARATION_INVALID")
-    cache_ttl_seconds = _bounded_int(
-        value.get("cacheTtlSeconds"), 60, 604_800
-    )
-    llm_enabled = value.get("llmReviewEnabled")
-    llm_model = value.get("llmModel")
-    llm_top_n = value.get("llmReviewTopN")
-    llm_endpoint_sha256 = value.get("llmEndpointSha256")
-    if not isinstance(llm_enabled, bool):
+    if _bounded_int(value.get("cacheTtlSeconds"), 0, 0) != 0:
         raise CaptureError("CAPTURE_RUNTIME_DECLARATION_INVALID")
-    if llm_enabled:
+    if (
+        value.get("llmReviewEnabled") is not False
+        or value.get("llmModel") is not None
+        or value.get("llmReviewTopN") is not None
+        or value.get("llmEndpointSha256") is not None
+        or value.get("reverseProxy") is not None
+    ):
+        raise CaptureError("CAPTURE_RUNTIME_DECLARATION_INVALID")
+    local_engine = value.get("localEngine")
+    if not isinstance(local_engine, dict) or set(local_engine) != {
+        "mode",
+        "vectorTopK",
+        "keywordTopK",
+        "embeddingConfigured",
+        "embeddingModel",
+        "embeddingDimensions",
+        "embeddingEndpointSha256",
+        "indexIdentitySha256",
+    }:
+        raise CaptureError("CAPTURE_RUNTIME_DECLARATION_INVALID")
+    embedding_configured = local_engine.get("embeddingConfigured")
+    if (
+        local_engine.get("mode") != "query_only"
+        or _bounded_int(local_engine.get("vectorTopK"), 1, 200) != search_k
+        or _bounded_int(local_engine.get("keywordTopK"), 0, 0) != 0
+        or not isinstance(embedding_configured, bool)
+        or embedding_configured != embedding_identity["configured"]
+        or local_engine.get("indexIdentitySha256") != index_identity["dbSha256"]
+    ):
+        raise CaptureError("CAPTURE_RUNTIME_DECLARATION_INVALID")
+    if embedding_configured:
         if (
-            not isinstance(llm_model, str)
-            or not 1 <= len(llm_model) <= 200
-            or llm_model != llm_model.strip()
-            or _bounded_int(llm_top_n, 1, 5) != llm_top_n
-            or not _is_digest(llm_endpoint_sha256)
+            not isinstance(local_engine.get("embeddingModel"), str)
+            or local_engine["embeddingModel"] != embedding_identity["model"]
+            or local_engine.get("embeddingDimensions")
+            != embedding_identity["dimensions"]
+            or local_engine.get("embeddingEndpointSha256")
+            != embedding_identity["baseUrlSha256"]
+            or not _is_digest(local_engine.get("embeddingEndpointSha256"))
         ):
             raise CaptureError("CAPTURE_RUNTIME_DECLARATION_INVALID")
     elif not (
-        llm_model is None
-        and llm_top_n is None
-        and llm_endpoint_sha256 is None
+        local_engine.get("embeddingModel") is None
+        and local_engine.get("embeddingDimensions") is None
+        and local_engine.get("embeddingEndpointSha256") is None
     ):
         raise CaptureError("CAPTURE_RUNTIME_DECLARATION_INVALID")
-
-    reverse_proxy = value.get("reverseProxy")
-    local_engine = value.get("localEngine")
-    corpus = _validate_corpus_declaration(value.get("corpus"), backend)
-    if backend == "reverse_proxy":
-        if (
-            not isinstance(reverse_proxy, dict)
-            or set(reverse_proxy) != {"useRerank", "upstreamEndpointSha256"}
-            or not isinstance(reverse_proxy.get("useRerank"), bool)
-            or not _is_digest(reverse_proxy.get("upstreamEndpointSha256"))
-            or local_engine is not None
-        ):
-            raise CaptureError("CAPTURE_RUNTIME_DECLARATION_INVALID")
-        normalized_reverse: dict[str, Any] | None = {
-            "useRerank": reverse_proxy["useRerank"],
-            "upstreamEndpointSha256": reverse_proxy["upstreamEndpointSha256"],
-        }
-        if (
-            corpus["serviceOriginSha256"]
-            != normalized_reverse["upstreamEndpointSha256"]
-        ):
-            raise CaptureError("CAPTURE_RUNTIME_DECLARATION_INVALID")
-        normalized_local = None
-    else:
-        if reverse_proxy is not None or not isinstance(local_engine, dict) or set(
-            local_engine
-        ) != {
-            "vectorTopK",
-            "keywordTopK",
-            "embeddingConfigured",
-            "embeddingModel",
-            "embeddingDimensions",
-            "embeddingEndpointSha256",
-        }:
-            raise CaptureError("CAPTURE_RUNTIME_DECLARATION_INVALID")
-        vector_top_k = _bounded_int(local_engine.get("vectorTopK"), 1, 200)
-        keyword_top_k = _bounded_int(local_engine.get("keywordTopK"), 1, 200)
-        embedding_configured = local_engine.get("embeddingConfigured")
-        if not isinstance(embedding_configured, bool):
-            raise CaptureError("CAPTURE_RUNTIME_DECLARATION_INVALID")
-        embedding_model = local_engine.get("embeddingModel")
-        embedding_dimensions = local_engine.get("embeddingDimensions")
-        embedding_endpoint_sha256 = local_engine.get("embeddingEndpointSha256")
-        if embedding_configured:
-            if (
-                not isinstance(embedding_model, str)
-                or not 1 <= len(embedding_model) <= 200
-                or embedding_model != embedding_model.strip()
-                or _bounded_int(embedding_dimensions, 1, 4096)
-                != embedding_dimensions
-                or not _is_digest(embedding_endpoint_sha256)
-            ):
-                raise CaptureError("CAPTURE_RUNTIME_DECLARATION_INVALID")
-        elif not (
-            embedding_model is None
-            and embedding_dimensions is None
-            and embedding_endpoint_sha256 is None
-        ):
-            raise CaptureError("CAPTURE_RUNTIME_DECLARATION_INVALID")
-        normalized_reverse = None
-        normalized_local = {
-            "vectorTopK": vector_top_k,
-            "keywordTopK": keyword_top_k,
-            "embeddingConfigured": embedding_configured,
-            "embeddingModel": embedding_model,
-            "embeddingDimensions": embedding_dimensions,
-            "embeddingEndpointSha256": embedding_endpoint_sha256,
-        }
-
     return {
-        "backend": backend,
+        "backend": "upstream-v2",
         "searchK": search_k,
         "minimumSimilarity": minimum_similarity,
         "blockThreshold": block_threshold,
-        "similarityBlockEnabled": value["similarityBlockEnabled"],
-        "cacheTtlSeconds": cache_ttl_seconds,
-        "llmReviewEnabled": llm_enabled,
-        "llmModel": llm_model,
-        "llmReviewTopN": llm_top_n,
-        "llmEndpointSha256": llm_endpoint_sha256,
-        "reverseProxy": normalized_reverse,
-        "localEngine": normalized_local,
-        "corpus": corpus,
-    }
-
-
-def _validate_corpus_declaration(value: object, backend: str) -> dict[str, Any]:
-    if not isinstance(value, dict):
-        raise CaptureError("CAPTURE_CORPUS_DECLARATION_INVALID")
-    if backend == "reverse_proxy":
-        if (
-            set(value)
-            != {
-                "evidenceKind",
-                "serviceOriginSha256",
-                "declarationSha256",
-            }
-            or value.get("evidenceKind") != "remote_corpus_unverifiable"
-            or not _is_digest(value.get("serviceOriginSha256"))
-            or not _is_digest(value.get("declarationSha256"))
-        ):
-            raise CaptureError("CAPTURE_CORPUS_DECLARATION_INVALID")
-        return {
-            "evidenceKind": "remote_corpus_unverifiable",
-            "serviceOriginSha256": value["serviceOriginSha256"],
-            "declarationSha256": value["declarationSha256"],
-        }
-    if (
-        set(value)
-        != {
-            "evidenceKind",
-            "corpusId",
-            "manifestSha256",
-            "snapshotSha256",
-            "corpusRevisionSha256",
-            "problemCount",
-        }
-        or value.get("evidenceKind") != "reproducible_snapshot"
-        or not isinstance(value.get("corpusId"), str)
-        or not 1 <= len(value["corpusId"]) <= 160
-        or value["corpusId"] != value["corpusId"].strip()
-        or not _is_digest(value.get("manifestSha256"))
-        or not _is_digest(value.get("snapshotSha256"))
-        or not _is_digest(value.get("corpusRevisionSha256"))
-        or _bounded_int(value.get("problemCount"), 1, 100_000_000)
-        != value.get("problemCount")
-    ):
-        raise CaptureError("CAPTURE_CORPUS_DECLARATION_INVALID")
-    return {
-        "evidenceKind": "reproducible_snapshot",
-        "corpusId": value["corpusId"],
-        "manifestSha256": value["manifestSha256"],
-        "snapshotSha256": value["snapshotSha256"],
-        "corpusRevisionSha256": value["corpusRevisionSha256"],
-        "problemCount": value["problemCount"],
+        "similarityBlockEnabled": False,
+        "cacheTtlSeconds": 0,
+        "llmReviewEnabled": False,
+        "llmModel": None,
+        "llmReviewTopN": None,
+        "llmEndpointSha256": None,
+        "reverseProxy": None,
+        "localEngine": {
+            "mode": "query_only",
+            "vectorTopK": search_k,
+            "keywordTopK": 0,
+            "embeddingConfigured": embedding_configured,
+            "embeddingModel": local_engine.get("embeddingModel"),
+            "embeddingDimensions": local_engine.get("embeddingDimensions"),
+            "embeddingEndpointSha256": local_engine.get("embeddingEndpointSha256"),
+            "indexIdentitySha256": index_identity["dbSha256"],
+        },
     }
 
 
@@ -1378,6 +1629,8 @@ def _build_capture_result(
         "captureId": manifest.capture_id,
         "capturedAt": _validate_existing_time(created_at),
         "capturer": bindings["generator"],
+        "serviceCodeVersion": manifest.service_code_version,
+        "caseSelection": manifest.case_selection,
         "configuration": {
             "apiVersion": "2",
             "endpointPath": "/api/v2/checks/similarity",
@@ -1386,8 +1639,10 @@ def _build_capture_result(
             "authentication": "bearer_redacted",
             "secretsExcluded": True,
         },
+        "resultContract": manifest.result_contract,
         "backend": {
             "kind": manifest.runtime_declaration["backend"],
+            "mode": manifest.runtime_declaration["localEngine"]["mode"],
             "configurationSha256": _backend_configuration_sha256(
                 manifest,
                 manifest_sha256,
@@ -1396,7 +1651,10 @@ def _build_capture_result(
             ),
             "secretsExcluded": True,
         },
-        "corpus": manifest.runtime_declaration["corpus"],
+        "embedding": manifest.embedding_identity,
+        "index": manifest.index_identity,
+        "corpus": manifest.corpus_identity,
+        "requestIdentitySetSha256": manifest.request_identity_set_sha256,
         "cases": capture_cases,
         "counts": counts,
     }
@@ -2686,6 +2944,20 @@ def _capture_set_sha256(cases: list[Any]) -> str:
             "protocol": "anklang-review-flow-capture-set-v1",
             "cases": cases,
         }
+    )
+def _request_identity_set_sha256(
+    cases: Sequence[RequestBinding],
+) -> str:
+    return _hash_canonical_value(
+        [
+            {
+                "caseId": case.case_id,
+                "requestId": case.request_id,
+                "contentHash": case.content_hash,
+                "requestSha256": case.expected_sha256,
+            }
+            for case in cases
+        ]
     )
 
 
