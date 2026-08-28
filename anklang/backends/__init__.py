@@ -153,7 +153,7 @@ class BackendUpsertResult:
         if self.outcome not in {"inserted", "updated", "unchanged", "stale"}:
             raise ValueError("入库结果状态不合法。")
         if not isinstance(self.content_hash, str):
-            raise ValueError("入库结果哈希不合法。")
+            raise TypeError("入库结果哈希类型不合法。")
 
 
 @runtime_checkable

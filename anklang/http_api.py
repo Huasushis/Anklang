@@ -15,7 +15,6 @@ from typing import Any
 
 from .backends import (
     BackendError,
-    BackendSearchResult,
     BackendUpsertResult,
     CompletionReason,
     SearchBackend,
@@ -284,7 +283,7 @@ def make_handler(
     service: AnklangService,
     runtime: ServiceRuntime | None = None,
 ) -> type[BaseHTTPRequestHandler]:
-    runtime = runtime or ServiceRuntime(service.config.max_in_flight_checks)
+    active_runtime = runtime or ServiceRuntime(service.config.max_in_flight_checks)
 
     class Handler(BaseHTTPRequestHandler):
         server_version = "Anklang/0.1"
@@ -333,7 +332,7 @@ def make_handler(
                 self._handle_unsupported_method()
                 return
             # 入库和查重共用同一个在途名额，不能绕过资源上限。
-            if not runtime.try_begin_check():
+            if not active_runtime.try_begin_check():
                 self.close_connection = True
                 self._send(
                     503,
@@ -350,7 +349,7 @@ def make_handler(
             try:
                 self._handle_upsert()
             finally:
-                runtime.finish_check()
+                active_runtime.finish_check()
 
         def do_PATCH(self) -> None:  # noqa: N802
             self._handle_unsupported_method()
@@ -406,7 +405,7 @@ def make_handler(
                 return
             # 在鉴权、读取正文和调用任何后端之前取得名额。满载或退出中的请求
             # 都得到同一个小型响应；未读正文所在连接随即关闭，不能被复用。
-            if not runtime.try_begin_check():
+            if not active_runtime.try_begin_check():
                 self.close_connection = True
                 self._send(
                     503,
@@ -423,7 +422,7 @@ def make_handler(
             try:
                 self._handle_similarity(api_version)
             finally:
-                runtime.finish_check()
+                active_runtime.finish_check()
 
         def _handle_similarity(self, api_version: str) -> None:
             if not self._authorized():
@@ -511,7 +510,7 @@ def make_handler(
 
             try:
                 result = service.upsert_problem(request)
-            except Exception:
+            except Exception:  # noqa: BLE001 - fixed public error boundary
                 self._send(
                     503,
                     {
@@ -571,7 +570,7 @@ def make_handler(
         def _handle_ready(self) -> None:
             """就绪检查：只验证本地服务/配置不变量，不调用任何后端、不发起任何
             网络请求，也不读取题库。"""
-            if runtime.accepting:
+            if active_runtime.accepting:
                 self._send(
                     200,
                     {"status": "ok", "service": "anklang", "apiVersion": "1", "ready": True},

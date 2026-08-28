@@ -18,7 +18,7 @@ import json
 import math
 import re
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, cast
 from urllib.parse import urlsplit
 from uuid import UUID
 
@@ -214,16 +214,17 @@ def validate_upsert_result(payload: Any) -> dict[str, Any]:
         raise ContractError("入库响应必须是对象。")
     _require_exact_keys(payload, _UPSERT_RESULT_KEYS, "入库响应")
     normalized = build_upsert_result(
-        request_id=payload.get("requestId"),
-        external_id=payload.get("externalId"),
-        content_hash=payload.get("contentHash"),
-        outcome=payload.get("outcome"),
+        request_id=cast(str, payload.get("requestId")),
+        external_id=cast(str, payload.get("externalId")),
+        content_hash=cast(str, payload.get("contentHash")),
+        outcome=cast(str, payload.get("outcome")),
     )
     if payload.get("apiVersion") != "1" or payload.get("source") != "urmotiv":
         raise ContractError("入库响应的版本或来源不合法。")
     if normalized != payload:
         raise ContractError("入库响应包含非规范字段或值。")
     return normalized
+
 def _utc_now_z() -> str:
     now = datetime.now(timezone.utc)
     return now.strftime("%Y-%m-%dT%H:%M:%S.") + f"{now.microsecond // 1000:03d}Z"
@@ -307,9 +308,9 @@ def validate_v2_result(payload: Any) -> dict[str, Any]:
     if payload.get("apiVersion") != "2":
         raise ContractError("v2 响应版本不合法。")
     normalized = build_v2_result(
-        content_hash=payload.get("contentHash"),
-        candidates=payload.get("candidates"),
-        completion=payload.get("completion"),
+        content_hash=cast(str, payload.get("contentHash")),
+        candidates=cast(list[dict[str, Any]], payload.get("candidates")),
+        completion=cast(dict[str, Any], payload.get("completion")),
         checked_at=payload.get("checkedAt"),
     )
     if normalized != payload:

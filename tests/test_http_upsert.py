@@ -1,19 +1,23 @@
 """Anklang 单题入库 HTTP 契约；只使用合成题面和回环连接。"""
+
 from __future__ import annotations
 
 import json
 import threading
 import unittest
 from http.client import HTTPConnection
-from http.server import ThreadingHTTPServer
 from typing import Any
 
 from anklang.config import AppConfig
-from anklang.http_api import AnklangHTTPServer, AnklangService, ServiceRuntime, make_handler
+from anklang.http_api import (
+    AnklangHTTPServer,
+    AnklangService,
+    ServiceRuntime,
+    make_handler,
+)
 from anklang.store import EmbeddingIndexSpec, ProblemStore
 from anklang.text_normalize import content_hash_of, normalize_statement
 from ui.server import UpstreamSearchBackend
-
 
 _TOKEN = "synthetic-service-token-abcdef"
 _PATH = "/api/v1/index/problems"
@@ -54,7 +58,7 @@ class _Harness:
     def __init__(self, embedder: Any | None = None) -> None:
         self.store = ProblemStore(":memory:")
         self.embedder = _Embedder() if embedder is None else embedder
-        backend = UpstreamSearchBackend(self.store, self.embedder)
+        backend = UpstreamSearchBackend(self.store, self.embedder)  # type: ignore[arg-type]
         config = AppConfig(
             port=8730,
             service_token=_TOKEN,
@@ -201,7 +205,14 @@ class UpsertContractTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(
             set(response),
-            {"apiVersion", "requestId", "source", "externalId", "contentHash", "outcome"},
+            {
+                "apiVersion",
+                "requestId",
+                "source",
+                "externalId",
+                "contentHash",
+                "outcome",
+            },
         )
         self.assertEqual(response["apiVersion"], "1")
         self.assertEqual(response["requestId"], request["requestId"])
@@ -267,7 +278,15 @@ class UpsertContractTests(unittest.TestCase):
         )
         status, response, headers = harness.request("PUT", _PATH, stale)
         self.assertEqual(status, 409)
-        self.assertEqual(response, {"error": {"code": "STALE_UPDATE", "message": "题目版本已过期或发生冲突。"}})
+        self.assertEqual(
+            response,
+            {
+                "error": {
+                    "code": "STALE_UPDATE",
+                    "message": "题目版本已过期或发生冲突。",
+                }
+            },
+        )
         self.assertEqual(headers.get("cache-control"), "no-store")
         self.assertEqual(len(harness.embedder.calls), 1)
         stored = harness.store.get_problem("urmotiv", current["externalId"])
@@ -324,7 +343,7 @@ class UpsertContractTests(unittest.TestCase):
 
         unusable_store = ProblemStore(":memory:")
         unusable_store.prepare_embedding_writes(EmbeddingIndexSpec("other-model", 2))
-        unusable_backend = UpstreamSearchBackend(unusable_store, _Embedder())
+        unusable_backend = UpstreamSearchBackend(unusable_store, _Embedder())  # type: ignore[arg-type]
         unusable_service = AnklangService(missing_config, unusable_backend)
         unusable_server = AnklangHTTPServer(
             ("127.0.0.1", 0), make_handler(unusable_service)
@@ -370,7 +389,9 @@ class UpsertContractTests(unittest.TestCase):
             with self.subTest(method=method, path=path):
                 status, payload, headers = harness.request(method, path, inserted)
                 self.assertEqual(status, expected_status)
-                self.assertIn(payload["error"]["code"], {"METHOD_NOT_ALLOWED", "NOT_FOUND"})
+                self.assertIn(
+                    payload["error"]["code"], {"METHOD_NOT_ALLOWED", "NOT_FOUND"}
+                )
                 self.assertEqual(headers.get("cache-control"), "no-store")
 
         query = {
@@ -384,15 +405,22 @@ class UpsertContractTests(unittest.TestCase):
                 "basicStatement": "synthetic alpha statement",
             },
         }
-        status, v2, _headers = harness.request("POST", "/api/v2/checks/similarity", query)
+        status, v2, _headers = harness.request(
+            "POST", "/api/v2/checks/similarity", query
+        )
         self.assertEqual(status, 200)
         self.assertEqual(
-            set(v2), {"apiVersion", "contentHash", "checkedAt", "completion", "candidates"}
+            set(v2),
+            {"apiVersion", "contentHash", "checkedAt", "completion", "candidates"},
         )
         query["apiVersion"] = "1"
-        status, v1, _headers = harness.request("POST", "/api/v1/checks/similarity", query)
+        status, v1, _headers = harness.request(
+            "POST", "/api/v1/checks/similarity", query
+        )
         self.assertEqual(status, 200)
-        self.assertEqual(set(v1), {"apiVersion", "contentHash", "checkedAt", "candidates"})
+        self.assertEqual(
+            set(v1), {"apiVersion", "contentHash", "checkedAt", "candidates"}
+        )
 
 
 if __name__ == "__main__":
