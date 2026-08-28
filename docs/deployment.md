@@ -135,6 +135,37 @@ POST /api/v1/checks/similarity
 
 v1 只在完整检索时返回 HTTP 200；部分或不可用会返回 HTTP 503 固定错误，且不携带候选。鉴权失败、请求非法、服务繁忙等也会返回固定错误对象。
 
+## Urmotiv 单题增量入库
+
+生产环境可用已有 Bearer 服务令牌调用唯一的单题写入路由：
+
+```text
+PUT /api/v1/index/problems
+Authorization: Bearer <ANKLANG_SERVICE_TOKEN>
+Content-Type: application/json
+```
+
+鉴权会在读取请求正文前完成。正文必须严格匹配以下可复制的合成 JSON（不要把生产题面、令牌或外部响应粘贴到 shell 历史或报告）：
+
+```json
+{
+  "apiVersion": "1",
+  "requestId": "11111111-1111-4111-8111-111111111111",
+  "externalId": "synthetic-urmotiv-1",
+  "updatedAt": "2026-08-28T00:00:00.000Z",
+  "problem": {
+    "title": "合成示例：数组求和",
+    "basicStatement": "这是用于接口联调的合成题面：计算数组元素的总和。"
+  }
+}
+```
+
+顶层和 `problem` 都不接受额外字段。`externalId` 非空且最多 200 个 UTF-16 单元，`title` 为 1–200，`basicStatement` 为 1–500,000；`updatedAt` 必须是以 `Z` 结尾的 UTC 时间。成功 HTTP 200 响应严格返回 `apiVersion`、`requestId`、`source`、`externalId`、`contentHash`、`outcome`，其中 `source` 固定为 `urmotiv`，`outcome` 为 `inserted`、`updated` 或 `unchanged`。所有响应带 `Cache-Control: no-store`。
+
+重复提交相同题面和版本返回 `unchanged`；较新的标题变更复用向量，题面变更会重新 embedding 并原子替换。旧版本或同时间冲突版本返回 HTTP 409（`STALE_UPDATE`）；embedding 缺失/失败或索引不可用返回 HTTP 503（`INDEX_UNAVAILABLE`）；正文非法返回 HTTP 400；令牌无效返回 HTTP 401。请求和后台查询共用 `ANKLANG_MAX_IN_FLIGHT_CHECKS` 在途上限。
+
+服务端不会接受调用方提供的 source/namespace、URL、metadata、verdict、workflow state 或 Fermata 字段，也没有删除路由。该路由**使 Urmotiv 适配器能够接入**实时题目，但**不在 Anklang 中实现 Urmotiv 适配器**、授权读取、业务判断或工作流；集成方必须在受控边界中单独提供适配器。Anklang 仍不主动调用 Urmotiv、不共享数据库。
+
 ## 实时来源适配器
 
 来源适配器是 Anklang 进程可导入的 `anklang/sources/<name>/` 子包。它只需导出：

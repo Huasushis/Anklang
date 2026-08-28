@@ -104,6 +104,35 @@ v2 成功形成的响应严格为：
 
 HTTP 层不向外发送题面、来源摘录、模型原始响应、复核字段、审核建议或工作流属性。错误消息是固定文本，响应不缓存。
 
+### Urmotiv 单题增量入库
+
+唯一写入路由为：
+
+```text
+PUT /api/v1/index/problems
+```
+
+它使用既有 Bearer 服务令牌，先鉴权再读取正文。请求严格只允许以下合成 JSON 字段：顶层 `apiVersion`、`requestId`、`externalId`、`updatedAt`、`problem`；`problem` 内只有 `title`、`basicStatement`。`apiVersion` 固定 `"1"`；`requestId` 为 UUID；`externalId` 非空且最多 200 个 UTF-16 单元；`updatedAt` 为 UTC `Z` 时间；`title` 为 1–200、`basicStatement` 为 1–500,000 个 UTF-16 单元。
+
+可直接复制的合成请求：
+
+```json
+{
+  "apiVersion": "1",
+  "requestId": "11111111-1111-4111-8111-111111111111",
+  "externalId": "synthetic-urmotiv-1",
+  "updatedAt": "2026-08-28T00:00:00.000Z",
+  "problem": {
+    "title": "合成示例：数组求和",
+    "basicStatement": "这是用于接口联调的合成题面：计算数组元素的总和。"
+  }
+}
+```
+
+HTTP 200 成功响应严格包含 `apiVersion`、`requestId`、`source`、`externalId`、`contentHash`、`outcome`；`source` 固定 `"urmotiv"`，`contentHash` 来自规范化题面，`outcome` 为 `inserted`、`updated` 或 `unchanged`。同 ID、题面和版本重放不重新 embedding；较新的标题更新复用向量，题面更新重新 embedding 并由 SQLite 原子替换。较旧或同时间冲突返回 409/`STALE_UPDATE`；embedding 或索引不可用返回 503/`INDEX_UNAVAILABLE`；无效正文返回 400，鉴权失败返回 401。所有响应 `Cache-Control: no-store`，并共享在途上限。
+
+服务端固定命名空间，不接受调用方传入 source/namespace、URL、metadata、verdict、workflow state 或 Fermata 字段，也没有删除路由。该端点使 Urmotiv 适配器能够接入实时题目，但不实现 Urmotiv 适配器、授权读取、业务判断或工作流；适配器由集成方单独提供。此能力仍只写入 Anklang 自己的 SQLite 索引，不与 Urmotiv/Fermata 共享数据库。
+
 ## 部署不变量
 
 - 本机默认监听 `127.0.0.1`；Compose 容器内监听 `0.0.0.0`，宿主仍只映射到回环地址。

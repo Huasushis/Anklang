@@ -236,6 +236,53 @@ v2 完整结果的顶层字段严格为 `apiVersion`、`contentHash`、`checkedA
 
 v1 成功响应只包含 `apiVersion`、`contentHash`、`checkedAt`、`candidates`，不包含 `completion` 或 v2 元数据。无论 v1 还是 v2，响应都不会包含题面摘录、复核结论、审核建议、通过/拦截字段或工作流状态。鉴权失败、请求契约错误、服务繁忙等 HTTP 错误也只返回固定错误对象，不回显题面、路径、密钥或外部响应。
 
+## Urmotiv 单题增量入库契约
+
+为让已授权的 Urmotiv 适配器把题目实时加入 Anklang 当前索引，Anklang 冻结了唯一的单题写入路由：
+
+```text
+PUT /api/v1/index/problems
+```
+
+生产请求必须带已有的 Bearer 服务令牌。鉴权在读取正文之前执行；正文是严格 JSON，顶层只能有 `apiVersion`、`requestId`、`externalId`、`updatedAt`、`problem`，`problem` 只能有 `title`、`basicStatement`：
+
+- `apiVersion` 固定为字符串 `"1"`；
+- `requestId` 必须是规范 UUID；`externalId` 必须非空且不超过 200 个 UTF-16 单元；
+- `updatedAt` 必须是以 `Z` 结尾的 UTC 时间；
+- `title` 长度为 1–200，`basicStatement` 长度为 1–500,000；长度均按 JavaScript UTF-16 字符串单元计算。
+
+下面是可直接复制的合成请求；示例题面不是生产题库内容，也不应替换为未获授权的正文：
+
+```json
+{
+  "apiVersion": "1",
+  "requestId": "11111111-1111-4111-8111-111111111111",
+  "externalId": "synthetic-urmotiv-1",
+  "updatedAt": "2026-08-28T00:00:00.000Z",
+  "problem": {
+    "title": "合成示例：数组求和",
+    "basicStatement": "这是用于接口联调的合成题面：计算数组元素的总和。"
+  }
+}
+```
+
+成功返回 HTTP 200，响应严格只有 `apiVersion`、`requestId`、`source`、`externalId`、`contentHash`、`outcome` 六个字段；`source` 固定为 `"urmotiv"`，`contentHash` 是规范化题面的 SHA-256，`outcome` 为 `inserted`、`updated` 或 `unchanged`：
+
+```json
+{
+  "apiVersion": "1",
+  "requestId": "11111111-1111-4111-8111-111111111111",
+  "source": "urmotiv",
+  "externalId": "synthetic-urmotiv-1",
+  "contentHash": "b089beea953d8bc775377bae06041cca860e2c186ea9fff32d500da8801ffcfc",
+  "outcome": "inserted"
+}
+```
+
+同一 `externalId` 搭配相同题面和 `updatedAt` 会返回 `unchanged`；较新的只改标题请求复用已有向量；题面变化会重新向量化后原子替换。较旧或同一时间的冲突版本返回 HTTP 409 和固定错误码 `STALE_UPDATE`；缺少或失败的 embedding、或不可用索引返回 HTTP 503 和固定错误码 `INDEX_UNAVAILABLE`；无效正文返回 HTTP 400，鉴权失败返回 HTTP 401。所有响应都带 `Cache-Control: no-store`，并共用在途请求上限。
+
+服务端固定命名空间为 `urmotiv`；调用方不能通过正文选择 source/namespace，也不能写入 URL、metadata、verdict、workflow state 或 Fermata 字段。没有删除路由。这个端点**使 Urmotiv 适配器可以接入**实时题目，但**不在 Anklang 内实现 Urmotiv 适配器**、授权读取、业务判断或工作流；适配器仍须由集成方在受控边界中单独提供。
+
 ## 固定 32/32 证据的正确解释
 仓库关联的受控验收记录使用一个可复现的 Formal156 题目快照，从 156 条来源记录中按固定规则均匀抽取 32 条查询。记录绑定 DashScope `text-embedding-v4`（1024 维）、156 条向量索引、`upstream-v2` 查询模式和已启用的提供方配置，观察到：
 
