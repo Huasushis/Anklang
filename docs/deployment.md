@@ -1,12 +1,12 @@
 # Anklang 部署与运行手册
 
-Anklang 是独立的题面相似检索服务。它有自己的 SQLite 索引和容器数据卷，不需要 Urmotiv 或 Fermata 才能启动；Urmotiv 通过版本化 HTTP 查询接口调用它。产品边界、请求字段和候选含义见 [`README.md`](../README.md)。
+Anklang 是独立的题面相似检索服务。它有自己的 SQLite（Python 自带的单文件数据库）索引和容器数据卷，不需要 Urmotiv 或 Fermata 才能启动；Urmotiv 通过版本化 HTTP（用于机器通信的协议）查询接口调用它。产品边界、请求字段和候选含义见 [`README.md`](../README.md)。
 
 ## 前置条件
 
 - 本机运行：Python 3.11。
 - 容器运行：Docker Engine 与 Docker Compose v2。
-- 生产 embedding：一个可访问的阿里云百炼 OpenAI 兼容 embedding 接口，以及由部署平台注入的 API 密钥。
+- 生产 embedding（把文字转换成数字向量）：一个可访问的阿里云百炼 OpenAI 兼容 embedding 接口，以及由部署平台注入的 API 密钥。
 - 生产鉴权：至少 16 个字符的 `ANKLANG_SERVICE_TOKEN`。令牌只应由部署平台注入，不应写入仓库、镜像、终端历史或诊断输出。
 
 Anklang 只使用 Python 标准库，不需要安装 SDK。程序不会自动读取 `.env` 文件；请把 [`.env.example`](../.env.example) 中的字段交给进程管理器或部署平台注入。

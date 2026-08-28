@@ -1,6 +1,6 @@
 # Anklang
 
-Anklang 是一个可独立部署的题面相似检索服务：输入一道算法题的题面，服务把题面向量化（embedding，把文字转换成固定长度的数字向量），再返回按余弦相似度（比较两个向量方向接近程度的分数）排序的候选题目。它是公开项目 [is-my-problem-new](https://github.com/fjzzq2002/is-my-problem-new) v2 的小型直接改编，机器调用入口是版本化的 HTTP API。
+Anklang 是一个可独立部署的题面相似检索服务：输入一道算法题的题面，服务把题面向量化（embedding，把文字转换成固定长度的数字向量），再返回按余弦相似度（比较两个向量方向接近程度的分数）排序的候选题目。它是公开项目 [is-my-problem-new](https://github.com/fjzzq2002/is-my-problem-new) v2 的小型直接改编，机器调用入口是版本化的 HTTP API（基于 HTTP 的程序接口）。
 
 Anklang 不需要 Urmotiv 或 Fermata 才能启动；它使用自己的 SQLite 索引（SQLite 是 Python 自带的单文件数据库）。Urmotiv 可以把 Anklang 当作独立的检索后端，两个系统不共享数据库。
 
@@ -52,7 +52,7 @@ Anklang 不内置真实题库。`anklang/sources/example_static/` 只有本仓�
 
 ### embedding 提供方
 
-`DASHSCOPE_BASE_URL` 必须是完整的 HTTP/HTTPS 地址，并包含百炼 OpenAI 兼容接口的 `/compatible-mode/v1` 前缀；客户端向 `{DASHSCOPE_BASE_URL}/embeddings` 发送 `model`、`input` 和 `dimensions`，使用 `DASHSCOPE_API_KEY` 作为 Bearer 令牌。默认模型是 `text-embedding-v4`，默认维度是 `1024`。
+`DASHSCOPE_BASE_URL` 必须是完整的 HTTP/HTTPS 地址，并包含百炼 OpenAI 兼容接口的 `/compatible-mode/v1` 前缀；客户端向 `{DASHSCOPE_BASE_URL}/embeddings` 发送 `model`、`input` 和 `dimensions`，使用 `DASHSCOPE_API_KEY` 作为 Bearer 令牌（放在 `Authorization` 请求头中的访问令牌）。默认模型是 `text-embedding-v4`，默认维度是 `1024`。
 
 查询前，服务会确认 SQLite 中的向量模型和维度与当前配置一致。以下任一情况都会让 v2 明确返回 `unavailable`，而不是伪装成完整的空结果：
 
@@ -79,7 +79,7 @@ fetch_new_problems(since: str | None) -> list[RawProblem]
 | `external_id` | 来源内稳定题号；与 `SOURCE_NAME` 组成稳定主键。 |
 | `title`、`statement` | 非空题目标题和题面。题面会由框架统一规范化并计算 `contentHash`。 |
 | `url` | 可选的 HTTPS 或 HTTP 题目链接。 |
-| `updated_at` | 可选的毫秒精度 UTC 时间，例如 `2026-01-01T00:00:00.000Z`。提供时用于选择较新版本和推进游标。 |
+| `updated_at` | 可选的毫秒精度 UTC（协调世界时）时间，例如 `2026-01-01T00:00:00.000Z`。提供时用于选择较新版本和推进游标。 |
 | `metadata` | 可选的公开标量元数据；只在 v2 候选中传递，不参加题面哈希、向量或相似度。 |
 
 `since` 是该来源上次成功推进的 UTC 时间游标；首次调用为 `null`。来源插件负责从自己的数据源读取增量，Anklang 负责校验、规范化、调用 embedding、幂等写入和游标比较交换。来源名必须全局唯一；同一 `(source, external_id)` 的不明确冲突会整组跳过，不会覆盖已有较新内容。
@@ -93,7 +93,7 @@ Urmotiv 的实时新增题目应通过可被 Anklang 导入的来源插件接入
 ### 运行前准备
 
 - 本机运行需要 Python 3.11；运行代码只使用标准库。
-- 容器运行需要 Docker Engine 和 Docker Compose v2。
+- 容器运行需要 Docker Engine 和 Docker Compose（定义容器编排的工具）v2。
 - 为进程注入 [`.env.example`](.env.example) 中的变量。程序不会自动读取任何 `.env` 文件；不要把密钥写进命令历史、镜像或版本库。
 - 生产环境必须设置至少 16 个字符的 `ANKLANG_SERVICE_TOKEN`，并启用 `ANKLANG_REQUIRE_SERVICE_TOKEN=true`。Compose 会强制启用此要求。
 
@@ -168,7 +168,7 @@ Anklang 暴露两个 POST 路由：
 - `/api/v1/checks/similarity`：兼容接口，只在完整检索时返回 HTTP 200；部分或不可用时返回 HTTP 503 固定错误。
 - `/api/v2/checks/similarity`：推荐接口。只要服务形成结构化结果，就以 HTTP 200 返回，并在 `completion` 中明确是完整、部分还是不可用。
 
-查询请求必须是严格 JSON 对象，顶层只能有 `apiVersion`、`requestId`、`contentHash`、`problem` 四个字段。`apiVersion` 必须与 URL 中的版本一致；`requestId` 是规范 UUID；`contentHash` 是调用方计算的 64 位小写十六进制字符串。`problem` 只能有 `title`、`type`、`tagIds`、`basicStatement`：
+查询请求必须是严格 JSON（用于机器交换数据的文本格式）对象，顶层只能有 `apiVersion`、`requestId`、`contentHash`、`problem` 四个字段。`apiVersion` 必须与 URL 中的版本一致；`requestId` 是规范 UUID（通用唯一标识符）；`contentHash` 是调用方计算的 64 位小写十六进制字符串。`problem` 只能有 `title`、`type`、`tagIds`、`basicStatement`：
 
 - `type` 只能是 `traditional`、`interactive` 或 `submit_answer`；
 - `title` 长度为 1–200；`tagIds` 有 1–30 个字符串，每个长度不超过 120；
