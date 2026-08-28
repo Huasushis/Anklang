@@ -125,7 +125,7 @@ v2 在服务成功形成结构化结果时返回 HTTP 200；通过 `completion` 
 - `partial`：仍有可用候选，但部分检索信号失败；调用方按 `retryable` 决定是否重试；
 - `unavailable`：不能形成可信结果，`candidates` 必须为空。
 
-候选只允许 `source`、`externalId`、`title`、`similarity` 和可选 `url`；v2 可额外带有来源插件的有界标量 `metadata`。Anklang 不返回题面摘录、复核结论、审核建议、通过/拦截字段或工作流状态。所有响应均带 `Cache-Control: no-store`。
+候选只允许 `source`、`externalId`、`title`、`similarity` 和可选 `url`；v2 可额外带有来源适配器的有界标量 `metadata`。Anklang 不返回题面摘录、复核结论、审核建议、通过/拦截字段或工作流状态。所有响应均带 `Cache-Control: no-store`。
 
 若需要检查兼容行为，可改用：
 
@@ -135,15 +135,15 @@ POST /api/v1/checks/similarity
 
 v1 只在完整检索时返回 HTTP 200；部分或不可用会返回 HTTP 503 固定错误，且不携带候选。鉴权失败、请求非法、服务繁忙等也会返回固定错误对象。
 
-## 实时来源插件
+## 实时来源适配器
 
-来源插件是 Anklang 进程可导入的 `anklang/sources/<name>/` 子包。它只需导出：
+来源适配器是 Anklang 进程可导入的 `anklang/sources/<name>/` 子包。它只需导出：
 
 ```text
 SOURCE_NAME: str
 fetch_new_problems(since: str | None) -> list[RawProblem]
 ```
-当前仓库只带 `example_static` 合成来源；实际部署必须把 Urmotiv 插件作为可导入的来源子包随运行环境提供。Anklang 不会自动发现另一个仓库中的插件，也没有跨服务回调或数据库直连接口。
+当前仓库只带 `example_static` 合成来源；以 Urmotiv 为数据源的 Anklang 来源适配器（可导入来源子包）未随当前实现提供。部署前，集成方必须实现并随运行环境提供该适配器，并通过获授权的数据读取方式取得题目；否则实时导入仍是未满足的前置条件。Anklang 不会自动发现另一个仓库中的来源适配器，也没有跨服务回调或数据库直连接口。
 
 打开以下设置后，进程按间隔发现来源、读取游标、规范化题面、调用 embedding 并幂等写入 SQLite：
 
@@ -152,9 +152,9 @@ ANKLANG_INGEST_ENABLED=true
 ANKLANG_INGEST_INTERVAL_SECONDS=3600
 ```
 
-Urmotiv 的实时新增或更新题目应由 Urmotiv 侧来源插件按上述契约提供；Anklang 负责把提交完成的向量行纳入当前索引。下一次查询立即读取新快照，不需要重启或离线全量重建。一个来源失败不会阻断其他来源；embedding 失败不会推进该来源游标。
+在集成方已提供该适配器并具备获授权的数据读取方式的前提下，Urmotiv 的实时新增或更新题目可按上述契约接入；Anklang 负责把提交完成的向量行纳入当前索引。下一次查询立即读取新快照，不需要重启或离线全量重建。一个来源失败不会阻断其他来源；embedding 失败不会推进该来源游标。
 
-这条接入路径不是 Urmotiv 工作流 API。Anklang 不主动调用 Urmotiv、不共享 Urmotiv 数据库，也不拥有问题状态。抄袭/检查信息属于 Urmotiv 问题属性，可由 Urmotiv 插件添加并由 Fermata 从带版本号的 Urmotiv HTTP 接口读取；不要把这些属性解释为 Anklang 的检索结论。
+这条接入路径不是 Urmotiv 工作流 API。Anklang 不主动调用 Urmotiv、不共享 Urmotiv 数据库，也不拥有问题状态。抄袭/检查信息属于 Urmotiv 问题属性，可由 Urmotiv 的受信任插件添加并由 Fermata 从带版本号的 Urmotiv HTTP 接口读取；不要把这些属性解释为 Anklang 的检索结论。
 
 手工执行一轮导入（适合受控维护窗口）：
 
@@ -178,7 +178,7 @@ PYTHONPATH=. python3 -m anklang.ingest
 - 宿主端口默认只绑定回环地址；需要外部访问时，应在受控网络边界后再代理，不要直接暴露服务。
 - 生产必须启用服务令牌；只有查询 POST 路由使用 Bearer 鉴权，存活、就绪和健康路由用于本地探针。
 - 日志不记录请求行、题面、外部响应或异常原文；HTTP 错误只返回固定消息。
-- SQLite 数据卷只属于 Anklang。Urmotiv、Fermata 和来源插件不得共享 Anklang 数据库文件。
+- SQLite 数据卷只属于 Anklang。Urmotiv、Fermata 和来源适配器不得共享 Anklang 数据库文件。
 - `ANKLANG_MINIMUM_SIMILARITY` 只是显示下限，不是重复、抄袭、通过或拦截政策。
 
 ## 排查顺序
@@ -188,4 +188,4 @@ PYTHONPATH=. python3 -m anklang.ingest
 3. `/api/v1/ready` 返回 503：服务正在停止接收新请求；等待进程退出并由 Compose 重启，或检查停止信号处理。
 4. `/api/v1/health` 为 `degraded`：先检查数据卷可写性、SQLite 文件和 embedding 模型/维度是否与索引一致。
 5. v2 返回 `unavailable`：检查 `DASHSCOPE_BASE_URL` 与 `DASHSCOPE_API_KEY` 是否同时存在、接口是否返回匹配的模型和维度，以及本地索引是否为 `ready`。不要把它当作“没有相似题”。
-6. 增量数量不变：确认 `ANKLANG_INGEST_ENABLED=true`、来源插件可被导入、更新时间游标有效，并检查 embedding 是否失败；不要通过推进游标来掩盖失败。
+6. 增量数量不变：确认 `ANKLANG_INGEST_ENABLED=true`、来源适配器可被导入、更新时间游标有效，并检查 embedding 是否失败；不要通过推进游标来掩盖失败。

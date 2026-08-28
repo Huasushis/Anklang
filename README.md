@@ -13,7 +13,7 @@ Anklang 只回答“哪些已收录题目与这道题相似”，返回检索候
 - 不调用 LLM（大语言模型）复核，不做代理，不保存查询结果，也不提供结果缓存；
 - 不替 Urmotiv 保存或解释业务属性。
 
-共享边界必须保持清楚：Urmotiv 插件可以把抄袭/检查信息作为 **Urmotiv 的问题属性** 添加，供 Fermata 读取；Fermata 通过带版本号的 Urmotiv HTTP 接口读取这些属性。Anklang 只返回题目候选，不拥有这些属性、审核结论、工作流状态或跨服务数据库，也不提供让 Fermata 与 Anklang 运行时互调的接口。
+共享边界必须保持清楚：Urmotiv 的受信任插件可以把抄袭/检查信息作为 **Urmotiv 的问题属性** 添加，供 Fermata 读取；Fermata 通过带版本号的 Urmotiv HTTP 接口读取这些属性。Anklang 只返回题目候选，不拥有这些属性、审核结论、工作流状态或跨服务数据库，也不提供让 Fermata 与 Anklang 运行时互调的接口。
 
 ## 与上游的对应关系
 
@@ -31,19 +31,19 @@ Anklang 只增加部署所需的四类能力：
 | --- | --- | --- |
 | embedding 提供方 | `anklang/embedding.py` | 使用环境变量配置的阿里云百炼（DashScope）OpenAI 兼容 `/embeddings` 接口；查询和入库使用同一模型与维度。 |
 | 当前题库 | `anklang/store.py` | 把上游内存题库换成可独立持久化的 SQLite 当前题目行和向量；每次查询读取当前快照。 |
-| 增量来源 | `anklang/sources/`、`anklang/ingest.py` | 自动发现来源插件，按来源维护时间游标，并幂等插入或更新题目。 |
+| 增量来源 | `anklang/sources/`、`anklang/ingest.py` | 自动发现来源适配器，按来源维护时间游标，并幂等插入或更新题目。 |
 | 机器接口 | `anklang/http_api.py` | 为 Urmotiv 提供严格、带版本号的查询和本地健康检查。 |
 
 上游的网页、查询改写、重排、统计、查询向量缓存和 OJ 筛选不在 Anklang 当前范围内。候选分数是排序信号，不是“重复”阈值政策。
 
 ## 数据来源、embedding 与实时增量
 
-Anklang 不内置真实题库。`anklang/sources/example_static/` 只有本仓库编写的合成样例；生产题目由来源插件提供。embedding 提供方也不随镜像打包：必须由部署者配置百炼兼容地址、密钥、模型和维度。
+Anklang 不内置真实题库。`anklang/sources/example_static/` 只有本仓库编写的合成样例；生产题目由来源适配器提供。embedding 提供方也不随镜像打包：必须由部署者配置百炼兼容地址、密钥、模型和维度。
 
 运行时的两条数据流如下：
 
 ```text
-来源插件 --新增/更新题目--> ingest_once --规范化、哈希、embedding--> SQLite 当前行
+来源适配器 --新增/更新题目--> ingest_once --规范化、哈希、embedding--> SQLite 当前行
                                                                         |
 查询题面 --同一 embedding 提供方--> cosine_all --降序--> collapse --mkrow-+
                                                                         |
@@ -62,15 +62,15 @@ Anklang 不内置真实题库。`anklang/sources/example_static/` 只有本仓�
 
 增量入库时 embedding 失败不会写入没有向量的题目，也不会推进来源游标；下一轮会再次尝试。
 
-### 来源插件契约
+### 来源适配器契约
 
-服务启动后每轮都会重新发现 `anklang/sources/` 下的子包。一个来源插件只需导出下列两个符号：
+服务启动后每轮都会重新发现 `anklang/sources/` 下的子包。一个来源适配器只需导出下列两个符号：
 
 ```text
 SOURCE_NAME: str
 fetch_new_problems(since: str | None) -> list[RawProblem]
 ```
-本仓库只内置 `example_static` 合成来源，没有内置的 Urmotiv 题库连接器。实际接入时，部署者必须把 Urmotiv 插件作为可被 Anklang 导入的来源子包随运行环境提供；不存在未实现的跨服务回调或数据库直连替代方案。
+本仓库只内置 `example_static` 合成来源；当前接受的 Anklang 和 Urmotiv 仓库均未提供以 Urmotiv 为数据源的 Anklang 来源适配器（可导入来源子包）。集成方必须实现并随 Anklang 运行环境提供该适配器，通过获授权的数据读取方式取得题目；两边不共享数据库，也不能假定存在回调或其他未实现的跨服务接口。
 
 `RawProblem` 的字段如下：
 
@@ -82,11 +82,11 @@ fetch_new_problems(since: str | None) -> list[RawProblem]
 | `updated_at` | 可选的毫秒精度 UTC（协调世界时）时间，例如 `2026-01-01T00:00:00.000Z`。提供时用于选择较新版本和推进游标。 |
 | `metadata` | 可选的公开标量元数据；只在 v2 候选中传递，不参加题面哈希、向量或相似度。 |
 
-`since` 是该来源上次成功推进的 UTC 时间游标；首次调用为 `null`。来源插件负责从自己的数据源读取增量，Anklang 负责校验、规范化、调用 embedding、幂等写入和游标比较交换。来源名必须全局唯一；同一 `(source, external_id)` 的不明确冲突会整组跳过，不会覆盖已有较新内容。
+`since` 是该来源上次成功推进的 UTC 时间游标；首次调用为 `null`。来源适配器负责从自己的数据源读取增量，Anklang 负责校验、规范化、调用 embedding、幂等写入和游标比较交换。来源名必须全局唯一；同一 `(source, external_id)` 的不明确冲突会整组跳过，不会覆盖已有较新内容。
 
-Urmotiv 的实时新增题目应通过可被 Anklang 导入的来源插件接入：打开 `ANKLANG_INGEST_ENABLED=true` 后，服务按 `ANKLANG_INGEST_INTERVAL_SECONDS` 周期调用同一抓取入口。写入提交后，现有服务实例的下一次查询直接读取新快照，不需要重启或离线全量重建。一个来源失败不会阻断其他来源。
+只有在集成方已实现并提供上述适配器、并具备获授权的数据读取方式后，Urmotiv 的实时新增题目才能接入：打开 `ANKLANG_INGEST_ENABLED=true` 后，服务按 `ANKLANG_INGEST_INTERVAL_SECONDS` 周期调用该适配器的抓取入口。写入提交后，现有服务实例的下一次查询直接读取新快照，不需要重启或离线全量重建。一个来源失败不会阻断其他来源。
 
-这不是跨服务工作流接口：Anklang 不主动调用 Urmotiv，也不读取 Urmotiv 数据库。插件必须自行遵守 Urmotiv 对来源数据的授权、脱敏和生命周期要求。
+这不是跨服务工作流接口：Anklang 不主动调用 Urmotiv，也不读取 Urmotiv 数据库。适配器实现必须自行遵守 Urmotiv 对来源数据的授权、脱敏和生命周期要求。
 
 ## 独立部署
 
@@ -200,7 +200,7 @@ curl --fail --silent \
   http://127.0.0.1:8730/api/v2/checks/similarity
 ```
 
-v2 完整结果的顶层字段严格为 `apiVersion`、`contentHash`、`checkedAt`、`completion`、`candidates`。候选最多 50 条，按 `similarity` 降序排列；服务只应用 `ANKLANG_MINIMUM_SIMILARITY` 作为显示下限，不把它解释成“重复”或“通过”阈值。每条候选必填 `source`、`externalId`、`title`、`similarity`，可选 `url`；v2 还可以带来源插件提供的有界 `metadata`。示例：
+v2 完整结果的顶层字段严格为 `apiVersion`、`contentHash`、`checkedAt`、`completion`、`candidates`。候选最多 50 条，按 `similarity` 降序排列；服务只应用 `ANKLANG_MINIMUM_SIMILARITY` 作为显示下限，不把它解释成“重复”或“通过”阈值。每条候选必填 `source`、`externalId`、`title`、`similarity`，可选 `url`；v2 还可以带来源适配器提供的有界 `metadata`。示例：
 
 ```json
 {
@@ -265,7 +265,7 @@ v1 成功响应只包含 `apiVersion`、`contentHash`、`checkedAt`、`candidate
 | `DASHSCOPE_API_KEY` | 空 | 百炼 embedding 令牌；只读入内存。 |
 | `DASHSCOPE_EMBEDDING_MODEL` | `text-embedding-v4` | 向量模型标识。 |
 | `DASHSCOPE_EMBEDDING_DIM` | `1024` | 向量维度，范围 1–4096。 |
-| `ANKLANG_INGEST_ENABLED` | `false` | 是否在进程内启用来源插件增量抓取。 |
+| `ANKLANG_INGEST_ENABLED` | `false` | 是否在进程内启用来源适配器增量抓取。 |
 | `ANKLANG_INGEST_INTERVAL_SECONDS` | `3600` | 增量抓取间隔，范围 60–86,400 秒。 |
 | `ANKLANG_STOP_GRACE_PERIOD` | `45s` | 仅供 Compose 使用的容器停止宽限；应大于应用停止宽限。 |
 
