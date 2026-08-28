@@ -10,10 +10,10 @@
   POST {base_url}/embeddings
   请求体 {"model": "text-embedding-v4", "input": "文本" 或 ["文本1", "文本2", ...],
           "dimensions": 1024}
-  鉴权   Authorization: Bearer <DASHSCOPE_API_KEY>
+  鉴权   Authorization: Bearer <apiKey>
   响应体 {"data": [{"embedding": [...]}, ...], "model": ...}
-  其中 base_url 已包含 DashScope 的 "/compatible-mode/v1" 后缀（由部署环境的
-  DASHSCOPE_BASE_URL 配置项提供，本模块不假设具体地区域名）。
+  其中 base_url 已包含 DashScope 的 "/compatible-mode/v1" 后缀，由管理接口在运行期
+  提供给客户端（本模块不假设具体地区域名）。
 
 同步接口限制（docs/plan.md 3.4 节）：一次最多 10 条文本、单条最多 8192 Token。这里
 只封装"一次一条或几条"的同步调用（超过 10 条自动分批串行请求），不实现面向几十万题

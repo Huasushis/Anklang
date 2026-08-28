@@ -46,7 +46,7 @@ fetch_new_problems(since: str | None) -> list[RawProblem]
 
 ## embedding 不变量
 
-只有同时配置 `DASHSCOPE_BASE_URL` 和 `DASHSCOPE_API_KEY` 才能查询或增量入库。未配置或提供方失败时必须明确返回不可用；增量任务不得写入无向量题目或推进游标。SQLite 中记录的模型和维度必须与查询客户端一致；身份冲突不得覆盖现有向量。
+embedding 提供方只由管理接口在运行期供给（进程内存，重启后回到未配置）；`DASHSCOPE_*` 等环境变量不能激活它。提供方未配置、被清除或失败时，查询与增量入库必须明确返回不可用；增量任务不得写入无向量题目或推进游标。SQLite 中记录的模型和维度必须与当前提供方一致；身份冲突不得覆盖现有向量。
 
 测试不得发起真实外部请求。embedding 测试使用注入的 opener；HTTP 测试只连接回环地址。
 

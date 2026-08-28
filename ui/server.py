@@ -34,6 +34,7 @@ from anklang.http_api import (
     make_handler,
 )
 from anklang.ingest import UpsertUnavailable, ingest_once, upsert_one_problem
+from anklang.provider import ProviderRegistry
 from anklang.sources import RawProblem
 from anklang.store import EmbeddingIndexSpec, IndexMetadataError, ProblemStore, StoredProblem
 from anklang.vectormath import cosine_similarity
@@ -110,26 +111,34 @@ def search(
 
 
 class UpstreamSearchBackend(SearchBackend):
-    """Runtime backend whose search method delegates to the preserved upstream flow above."""
+    """Runtime backend whose search method delegates to the preserved upstream flow above.
 
-    def __init__(self, store: ProblemStore, embedder: EmbeddingClient | None) -> None:
+    The active embedding provider lives in a thread-safe in-memory registry; every
+    embedding operation acquires the current client and releases it afterwards, so the
+    provider can be replaced or cleared at runtime without a restart.
+    """
+
+    def __init__(
+        self,
+        store: ProblemStore,
+        provider: ProviderRegistry | None = None,
+    ) -> None:
         self.store = store
-        self.embedder = embedder
+        self.provider = provider if provider is not None else ProviderRegistry()
 
     @property
     def index_spec(self) -> EmbeddingIndexSpec | None:
-        if self.embedder is None:
-            return None
-        return EmbeddingIndexSpec(self.embedder.model, self.embedder.dimensions)
+        return self.provider.spec()
 
     def search(self, query_text: str, k: int) -> BackendSearchResult:
-        if self.embedder is None:
+        client = self.provider.acquire()
+        if client is None:
             return BackendSearchResult.unavailable(
                 reason_code="search_backend_unavailable",
                 retryable=False,
             )
         try:
-            candidates = search(self.store, self.embedder, query_text, k)
+            candidates = search(self.store, client, query_text, k)
         except EmbeddingError:
             return BackendSearchResult.unavailable(
                 reason_code="search_backend_unavailable",
@@ -149,6 +158,8 @@ class UpstreamSearchBackend(SearchBackend):
                 reason_code="search_backend_unavailable",
                 retryable=False,
             )
+        finally:
+            self.provider.release()
         return BackendSearchResult(candidates)
 
     def upsert_problem(
@@ -160,46 +171,53 @@ class UpstreamSearchBackend(SearchBackend):
     ) -> BackendUpsertResult:
         """把固定来源 ``urmotiv`` 的一道题写入同一 SQLite/向量路径。"""
 
-        if self.embedder is None:
+        client = self.provider.acquire()
+        if client is None:
             raise BackendError(
                 reason_code="service_unavailable",
                 retryable=False,
             )
         try:
-            result = upsert_one_problem(
-                self.store,
-                self.embedder,
-                RawProblem(
-                    external_id=external_id,
-                    title=title,
-                    statement=basic_statement,
-                    updated_at=updated_at,
-                ),
-                source="urmotiv",
-            )
-        except UpsertUnavailable as error:
-            raise BackendError(
-                reason_code="service_unavailable",
-                retryable=True,
-            ) from error
-        except Exception as error:
-            # 只向 HTTP 层传播固定类别，避免数据库/提供方细节越过边界。
-            raise BackendError(
-                reason_code="service_unavailable",
-                retryable=True,
-            ) from error
+            try:
+                result = upsert_one_problem(
+                    self.store,
+                    client,
+                    RawProblem(
+                        external_id=external_id,
+                        title=title,
+                        statement=basic_statement,
+                        updated_at=updated_at,
+                    ),
+                    source="urmotiv",
+                )
+            except UpsertUnavailable as error:
+                raise BackendError(
+                    reason_code="service_unavailable",
+                    retryable=True,
+                ) from error
+            except Exception as error:
+                # 只向 HTTP 层传播固定类别，避免数据库/提供方细节越过边界。
+                raise BackendError(
+                    reason_code="service_unavailable",
+                    retryable=True,
+                ) from error
+        finally:
+            self.provider.release()
         return BackendUpsertResult(result.outcome, result.content_hash)
 
-
     def describe_health(self) -> dict[str, Any]:
+        configured, _base_url, model, dimension = self.provider.status()
+        spec = None
+        if configured and model is not None and dimension is not None:
+            spec = EmbeddingIndexSpec(model, dimension)
         try:
-            inspection = self.store.inspect_index(self.index_spec)
+            inspection = self.store.inspect_index(spec)
         except Exception:
             return {
                 "backend": "upstream-v2",
                 "localStoreReady": False,
                 "localProblemCount": None,
-                "embeddingAvailable": self.embedder is not None,
+                "embeddingAvailable": configured,
                 "vectorIndexReady": False,
                 "vectorIndexStatus": "store_unavailable",
             }
@@ -207,7 +225,7 @@ class UpstreamSearchBackend(SearchBackend):
             "backend": "upstream-v2",
             "localStoreReady": True,
             "localProblemCount": inspection.problem_count,
-            "embeddingAvailable": self.embedder is not None,
+            "embeddingAvailable": configured,
             "vectorIndexReady": inspection.vector_ready,
             "vectorIndexStatus": inspection.status,
         }
@@ -217,22 +235,12 @@ class UpstreamSearchBackend(SearchBackend):
 
 
 def build_backend(config: AppConfig) -> UpstreamSearchBackend:
+    """从环境配置只创建本地存储与空的提供方注册表。
+
+    提供方不由环境变量激活；进程启动后必须由 Urmotiv 通过管理接口重新供给。
+    """
     store = ProblemStore(config.local_db_path)
-    embedder: EmbeddingClient | None = None
-    if config.dashscope_api_key and config.dashscope_base_url:
-        embedder = EmbeddingClient(
-            base_url=config.dashscope_base_url,
-            api_key=config.dashscope_api_key,
-            model=config.dashscope_embedding_model,
-            dimensions=config.dashscope_embedding_dim,
-        )
-        try:
-            store.prepare_embedding_writes(
-                EmbeddingIndexSpec(embedder.model, embedder.dimensions)
-            )
-        except IndexMetadataError:
-            pass
-    return UpstreamSearchBackend(store, embedder)
+    return UpstreamSearchBackend(store, ProviderRegistry())
 
 
 def build_service(config: AppConfig) -> AnklangService:
@@ -249,7 +257,12 @@ def start_background_ingest(
     def _loop() -> None:
         while not stop_event.is_set():
             try:
-                ingest_once(backend.store, backend.embedder)
+                client = backend.provider.acquire()
+                try:
+                    if client is not None:
+                        ingest_once(backend.store, client)
+                finally:
+                    backend.provider.release()
             except Exception:
                 pass
             stop_event.wait(config.ingest_interval_seconds)

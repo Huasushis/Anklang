@@ -12,6 +12,7 @@ from unittest.mock import patch
 
 from anklang.config import AppConfig
 from anklang.http_api import AnklangService, make_handler
+from anklang.provider import ProviderRegistry
 from anklang.sources import RawProblem
 from anklang.store import ProblemStore
 from ui.server import UpstreamSearchBackend, start_background_ingest
@@ -35,7 +36,7 @@ class LiveSchedulerEndToEndTests(unittest.TestCase):
     def test_emitted_update_becomes_searchable_without_rebuild_or_restart(self) -> None:
         store = ProblemStore(":memory:")
         embedder = _Embedder()
-        backend = UpstreamSearchBackend(store, embedder)  # type: ignore[arg-type]
+        backend = UpstreamSearchBackend(store, ProviderRegistry(initial=embedder))
         config = AppConfig(
             port=8730,
             service_token=None,

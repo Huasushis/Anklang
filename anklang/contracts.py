@@ -68,6 +68,9 @@ _UPSERT_RESULT_KEYS = {
     "outcome",
 }
 _UPSERT_OUTCOMES = {"inserted", "updated", "unchanged"}
+_PROVIDER_KEYS = {"baseUrl", "apiKey", "model", "dimension"}
+_PROVIDER_STATUS_KEYS_CONFIGURED = {"configured", "baseUrl", "model", "dimension"}
+_PROVIDER_STATUS_KEYS_UNCONFIGURED = {"configured"}
 _V2_RESULT_KEYS = {
     "apiVersion",
     "contentHash",
@@ -177,6 +180,94 @@ def parse_upsert_request(payload: Any) -> dict[str, Any]:
         "basic_statement": basic_statement,
     }
 
+
+
+def parse_provider_config(payload: Any) -> dict[str, Any]:
+    """解析 embedding 提供方管理请求；密钥只进入解析结果，永不进入任何响应。"""
+
+    if not isinstance(payload, dict):
+        raise ContractError("请求正文必须是 JSON 对象。")
+    _require_exact_keys(payload, _PROVIDER_KEYS, "请求正文")
+
+    base_url_value = payload.get("baseUrl")
+    if not isinstance(base_url_value, str) or _parse_safe_http_url(_js_trim(base_url_value)) is None:
+        raise ContractError("baseUrl 不合法。")
+    base_url = _js_trim(base_url_value)
+    api_key = _normalize_required_input(payload.get("apiKey"), 4096, "apiKey")
+    model = _normalize_required_input(payload.get("model"), 200, "model")
+    dimension = payload.get("dimension")
+    if (
+        isinstance(dimension, bool)
+        or not isinstance(dimension, int)
+        or not 1 <= dimension <= 4096
+    ):
+        raise ContractError("dimension 不合法。")
+    return {
+        "base_url": base_url,
+        "api_key": api_key,
+        "model": model,
+        "dimension": dimension,
+    }
+
+
+def build_provider_status(
+    *,
+    configured: bool,
+    base_url: str | None = None,
+    model: str | None = None,
+    dimension: int | None = None,
+) -> dict[str, Any]:
+    """构造管理接口的提供方状态响应；只暴露非机密字段，绝不包含密钥。"""
+
+    if configured:
+        if not isinstance(base_url, str) or not base_url:
+            raise ContractError("提供方状态缺少 baseUrl。")
+        if not isinstance(model, str) or not model:
+            raise ContractError("提供方状态缺少 model。")
+        if (
+            isinstance(dimension, bool)
+            or not isinstance(dimension, int)
+            or not 1 <= dimension <= 4096
+        ):
+            raise ContractError("提供方状态缺少合法 dimension。")
+        result: dict[str, Any] = {
+            "configured": True,
+            "baseUrl": base_url,
+            "model": model,
+            "dimension": dimension,
+        }
+    else:
+        result = {"configured": False}
+    _validate_response_size(result)
+    return result
+
+
+def validate_provider_status(payload: Any) -> dict[str, Any]:
+    """重新验证即将发出的提供方状态响应。"""
+
+    if not isinstance(payload, dict):
+        raise ContractError("提供方状态响应必须是对象。")
+    configured = payload.get("configured")
+    if configured is True:
+        _require_exact_keys(
+            payload, _PROVIDER_STATUS_KEYS_CONFIGURED, "提供方状态响应"
+        )
+        normalized = build_provider_status(
+            configured=True,
+            base_url=cast(str, payload.get("baseUrl")),
+            model=cast(str, payload.get("model")),
+            dimension=cast(int, payload.get("dimension")),
+        )
+    elif configured is False:
+        _require_exact_keys(
+            payload, _PROVIDER_STATUS_KEYS_UNCONFIGURED, "提供方状态响应"
+        )
+        normalized = build_provider_status(configured=False)
+    else:
+        raise ContractError("提供方状态的 configured 不合法。")
+    if normalized != payload:
+        raise ContractError("提供方状态响应包含非规范字段或值。")
+    return normalized
 
 
 def build_upsert_result(
@@ -443,12 +534,12 @@ def _bounded_required(value: Any, limit: int, path: str) -> str:
     return _truncate_utf16(trimmed, limit)
 
 
-def _safe_http_url(value: Any) -> str | None:
-    if value is None:
-        return None
-    if not isinstance(value, str):
-        return None
-    trimmed = _js_trim(value)
+
+
+def _parse_safe_http_url(trimmed: str) -> str | None:
+    """共享的 HTTP(S) URL 安全检查：有界长度、无控制字符/空白/反斜杠、合法主机名、
+    无内嵌账号密码、端口合法。候选链接和管理接口的 baseUrl 使用同一套防护规则。"""
+
     if (
         not trimmed
         or _utf16_length(trimmed) > 2_000
@@ -472,6 +563,14 @@ def _safe_http_url(value: Any) -> str | None:
     ):
         return None
     return trimmed
+
+
+def _safe_http_url(value: Any) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        return None
+    return _parse_safe_http_url(_js_trim(value))
 
 
 def _safe_hostname(hostname: str) -> bool:

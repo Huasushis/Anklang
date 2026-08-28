@@ -287,16 +287,9 @@ def main() -> int:
         return 2
 
     store = ProblemStore(config.local_db_path)
-    embedder: EmbeddingClient | None = None
-    if config.dashscope_api_key and config.dashscope_base_url:
-        embedder = EmbeddingClient(
-            base_url=config.dashscope_base_url,
-            api_key=config.dashscope_api_key,
-            model=config.dashscope_embedding_model,
-            dimensions=config.dashscope_embedding_dim,
-        )
     try:
-        summary = ingest_once(store, embedder)
+        # 提供方只存在于运行进程内存并由管理接口供给；命令行环境不会激活它。
+        summary = ingest_once(store, None)
     except IndexMetadataError:
         sys.stderr.write(
             "本地向量索引未通过当前写入门禁，任务没有继续；现有数据未被清空。"

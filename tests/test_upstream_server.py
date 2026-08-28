@@ -5,6 +5,7 @@ import unittest
 from unittest.mock import patch
 
 from anklang.embedding import EmbeddingClient
+from anklang.provider import ProviderRegistry
 from anklang.store import EmbeddingIndexSpec, ProblemStore, StoredProblem
 from ui import server as upstream_server
 
@@ -98,7 +99,9 @@ class UpstreamEntrypointTests(unittest.TestCase):
 
     def test_backend_returns_strict_ranked_candidates(self) -> None:
         embedder, _ = _embedder({"synthetic query": [1.0, 0.0]})
-        backend = upstream_server.UpstreamSearchBackend(self.store, embedder)
+        backend = upstream_server.UpstreamSearchBackend(
+            self.store, ProviderRegistry(initial=embedder)
+        )
         result = backend.search("synthetic query", 1)
         self.assertEqual(result.status, "complete")
         self.assertEqual(
@@ -108,7 +111,9 @@ class UpstreamEntrypointTests(unittest.TestCase):
 
     def test_provider_failure_is_explicit_unavailable(self) -> None:
         embedder, opener = _embedder({})
-        result = upstream_server.UpstreamSearchBackend(self.store, embedder).search(
+        result = upstream_server.UpstreamSearchBackend(
+            self.store, ProviderRegistry(initial=embedder)
+        ).search(
             "synthetic query", 5
         )
         self.assertEqual(result.status, "unavailable")
@@ -134,7 +139,9 @@ class UpstreamEntrypointTests(unittest.TestCase):
             dimensions=2,
             opener=opener,
         )
-        result = upstream_server.UpstreamSearchBackend(self.store, embedder).search(
+        result = upstream_server.UpstreamSearchBackend(
+            self.store, ProviderRegistry(initial=embedder)
+        ).search(
             "synthetic query", 5
         )
         self.assertEqual(result.status, "unavailable")
@@ -163,7 +170,9 @@ class UpstreamEntrypointTests(unittest.TestCase):
         )
         self.store._conn.commit()  # type: ignore[attr-defined]
         embedder, opener = _embedder({"synthetic query": [1.0, 0.0]})
-        result = upstream_server.UpstreamSearchBackend(self.store, embedder).search(
+        result = upstream_server.UpstreamSearchBackend(
+            self.store, ProviderRegistry(initial=embedder)
+        ).search(
             "synthetic query", 5
         )
         self.assertEqual(result.status, "unavailable")

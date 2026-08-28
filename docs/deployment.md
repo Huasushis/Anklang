@@ -19,15 +19,11 @@ Compose 要求 `compose.yaml` 声明的 `env_file` 在启动前已经存在。�
 ANKLANG_SERVICE_TOKEN=<至少16个字符的随机值>
 ANKLANG_REQUIRE_SERVICE_TOKEN=true
 ANKLANG_LOCAL_DB_PATH=problems-data/local-index.db
-DASHSCOPE_BASE_URL=<包含/compatible-mode/v1的HTTPS地址>
-DASHSCOPE_API_KEY=<由密钥管理系统注入的值>
-DASHSCOPE_EMBEDDING_MODEL=text-embedding-v4
-DASHSCOPE_EMBEDDING_DIM=1024
 ANKLANG_INGEST_ENABLED=false
 ANKLANG_INGEST_INTERVAL_SECONDS=3600
 ```
 
-必须同时配置 `DASHSCOPE_BASE_URL` 和 `DASHSCOPE_API_KEY` 才会启用向量查询。缺少任一项时，健康路由仍可用，但 v2 查询会明确返回 `completion.status=unavailable`；增量导入不会写入无向量题目，也不会推进来源游标。
+embedding 提供方不通过环境变量配置（`DASHSCOPE_*` 等均被忽略）：进程启动时处于未配置状态，重启后回到未配置。向量能力由调用方在运行期通过管理接口供给（见下文「Embedding 提供方管理接口」）。提供方未配置或被清除时，健康路由仍可用，v2 查询明确返回 `completion.status=unavailable`；增量导入不会写入无向量题目，也不会推进来源游标。
 
 Compose 会覆盖下列容器内设置：
 
@@ -135,6 +131,18 @@ POST /api/v1/checks/similarity
 
 v1 只在完整检索时返回 HTTP 200；部分或不可用会返回 HTTP 503 固定错误，且不携带候选。鉴权失败、请求非法、服务繁忙等也会返回固定错误对象。
 
+## Embedding 提供方管理接口
+
+提供方只存在于进程内存，由三个管理路由在运行期供给；所有管理请求都必须带已有的 Bearer 服务令牌，未配置令牌时一律失败关闭。
+
+```text
+GET    /api/v1/admin/embedding-provider
+PUT    /api/v1/admin/embedding-provider
+DELETE /api/v1/admin/embedding-provider
+```
+
+`PUT` 正文只允许 `baseUrl`、`apiKey`、`model`、`dimension`（`Content-Type: application/json`）。成功响应严格为 `{"configured": true, "baseUrl", "model", "dimension"}`，未配置时为 `{"configured": false}`；任何响应都不包含 `apiKey` 或异常原文。`DELETE` 会等待已在途的向量化操作结束后才返回，清空后查询与入库明确不可用。完整字段约束见 [`README.md`](../README.md) 的「Embedding 提供方管理契约」。
+
 ## Urmotiv 单题增量入库
 
 生产环境可用已有 Bearer 服务令牌调用唯一的单题写入路由：
@@ -207,7 +215,7 @@ PYTHONPATH=. python3 -m anklang.ingest
 ## 安全与数据边界
 
 - 宿主端口默认只绑定回环地址；需要外部访问时，应在受控网络边界后再代理，不要直接暴露服务。
-- 生产必须启用服务令牌；只有查询 POST 路由使用 Bearer 鉴权，存活、就绪和健康路由用于本地探针。
+- 生产必须启用服务令牌；查询、入库和管理路由都使用同一个 Bearer 服务令牌，存活、就绪和健康路由用于本地探针。
 - 日志不记录请求行、题面、外部响应或异常原文；HTTP 错误只返回固定消息。
 - SQLite 数据卷只属于 Anklang。Urmotiv、Fermata 和来源适配器不得共享 Anklang 数据库文件。
 - `ANKLANG_MINIMUM_SIMILARITY` 只是显示下限，不是重复、抄袭、通过或拦截政策。
@@ -218,5 +226,5 @@ PYTHONPATH=. python3 -m anklang.ingest
 2. `/api/v1/live` 失败：检查容器状态、宿主端口映射和进程启动配置。
 3. `/api/v1/ready` 返回 503：服务正在停止接收新请求；等待进程退出并由 Compose 重启，或检查停止信号处理。
 4. `/api/v1/health` 为 `degraded`：先检查数据卷可写性、SQLite 文件和 embedding 模型/维度是否与索引一致。
-5. v2 返回 `unavailable`：检查 `DASHSCOPE_BASE_URL` 与 `DASHSCOPE_API_KEY` 是否同时存在、接口是否返回匹配的模型和维度，以及本地索引是否为 `ready`。不要把它当作“没有相似题”。
+5. v2 返回 `unavailable`：检查 embedding 提供方是否已通过管理接口配置、接口是否返回匹配的模型和维度，以及本地索引是否为 `ready`。不要把它当作“没有相似题”。
 6. 增量数量不变：确认 `ANKLANG_INGEST_ENABLED=true`、来源适配器可被导入、更新时间游标有效，并检查 embedding 是否失败；不要通过推进游标来掩盖失败。

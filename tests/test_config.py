@@ -5,13 +5,7 @@ import os
 import unittest
 from unittest.mock import patch
 
-from anklang.config import (
-    ConfigError,
-    _read_bool,
-    _read_optional_url,
-    _read_url,
-    load_config,
-)
+from anklang.config import ConfigError, _read_bool, load_config
 
 
 class BooleanConfigTests(unittest.TestCase):
@@ -131,56 +125,31 @@ class RuntimeConfigTests(unittest.TestCase):
                         load_config()
 
 
-class UrlConfigTests(unittest.TestCase):
-    def test_http_url_accepts_host_path_and_valid_port(self) -> None:
-        raw = "https://example.com/path"
-        with patch.dict(os.environ, {"REQUIRED_URL": raw}, clear=True):
-            self.assertEqual(_read_url("REQUIRED_URL", ""), raw)
+class DashScopeInertnessTests(unittest.TestCase):
+    """DASHSCOPE_* 环境变量不再被读取：无论取值是否合法，都不能激活或拒绝启动。"""
 
-    def test_dashscope_credentials_are_optional(self) -> None:
-        with patch.dict(os.environ, {}, clear=True):
-            config = load_config()
-        self.assertIsNone(config.dashscope_base_url)
-        self.assertIsNone(config.dashscope_api_key)
-        self.assertEqual(config.dashscope_embedding_model, "text-embedding-v4")
-        self.assertEqual(config.dashscope_embedding_dim, 1024)
-
-    def test_dashscope_base_url_validated_when_provided(self) -> None:
-        with patch.dict(
-            os.environ,
-            {
-                "DASHSCOPE_BASE_URL": "https://dashscope.example.invalid/compatible-mode/v1",
-                "DASHSCOPE_API_KEY": "synthetic-embedding-key",
-            },
-            clear=True,
-        ):
-            config = load_config()
-        self.assertEqual(
-            config.dashscope_base_url,
-            "https://dashscope.example.invalid/compatible-mode/v1",
-        )
-        self.assertEqual(config.dashscope_api_key, "synthetic-embedding-key")
-
-    def test_invalid_dashscope_url_rejected_without_echo(self) -> None:
-        private_marker = "private-key-marker"
+    def test_dashscope_env_is_completely_ignored(self) -> None:
         for raw in (
+            "https://dashscope.example.invalid/compatible-mode/v1",
             "ftp://example.com",
             "javascript:alert(1)",
             "https://exa%mple.invalid",
-            "",
         ):
             with self.subTest(raw=raw), patch.dict(
                 os.environ,
-                {"DASHSCOPE_BASE_URL": raw, "DASHSCOPE_API_KEY": private_marker},
+                {
+                    "DASHSCOPE_BASE_URL": raw,
+                    "DASHSCOPE_API_KEY": "synthetic-embedding-key",
+                    "DASHSCOPE_EMBEDDING_MODEL": "text-embedding-v4",
+                    "DASHSCOPE_EMBEDDING_DIM": "2",
+                },
                 clear=True,
             ):
-                if raw == "":
-                    config = load_config()
-                    self.assertIsNone(config.dashscope_base_url)
-                    continue
-                with self.assertRaises(ConfigError) as raised:
-                    load_config()
-                self.assertNotIn(private_marker, str(raised.exception))
+                config = load_config()
+                self.assertFalse(hasattr(config, "dashscope_base_url"))
+                self.assertFalse(hasattr(config, "dashscope_api_key"))
+                self.assertFalse(hasattr(config, "dashscope_embedding_model"))
+                self.assertFalse(hasattr(config, "dashscope_embedding_dim"))
 
 
 class SearchConfigTests(unittest.TestCase):

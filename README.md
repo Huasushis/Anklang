@@ -29,7 +29,7 @@ Anklang 只增加部署所需的四类能力：
 
 | 能力 | 实现 | 说明 |
 | --- | --- | --- |
-| embedding 提供方 | `anklang/embedding.py` | 使用环境变量配置的阿里云百炼（DashScope）OpenAI 兼容 `/embeddings` 接口；查询和入库使用同一模型与维度。 |
+| embedding 提供方 | `anklang/embedding.py` | 阿里云百炼（DashScope）OpenAI 兼容 `/embeddings` 接口的客户端；提供方由管理接口在运行期供给，查询和入库使用同一模型与维度。 |
 | 当前题库 | `anklang/store.py` | 把上游内存题库换成可独立持久化的 SQLite 当前题目行和向量；每次查询读取当前快照。 |
 | 增量来源 | `anklang/sources/`、`anklang/ingest.py` | 自动发现来源适配器，按来源维护时间游标，并幂等插入或更新题目。 |
 | 机器接口 | `anklang/http_api.py` | 为 Urmotiv 提供严格、带版本号的查询和本地健康检查。 |
@@ -38,7 +38,7 @@ Anklang 只增加部署所需的四类能力：
 
 ## 数据来源、embedding 与实时增量
 
-Anklang 不内置真实题库。`anklang/sources/example_static/` 只有本仓库编写的合成样例；生产题目由来源适配器提供。embedding 提供方也不随镜像打包：必须由部署者配置百炼兼容地址、密钥、模型和维度。
+Anklang 不内置真实题库。`anklang/sources/example_static/` 只有本仓库编写的合成样例；生产题目由来源适配器提供。embedding 提供方也不随镜像打包：服务启动时处于未配置状态，必须由调用方通过管理接口在运行期供给。
 
 运行时的两条数据流如下：
 
@@ -52,12 +52,14 @@ Anklang 不内置真实题库。`anklang/sources/example_static/` 只有本仓�
 
 ### embedding 提供方
 
-`DASHSCOPE_BASE_URL` 必须是完整的 HTTP/HTTPS 地址，并包含百炼 OpenAI 兼容接口的 `/compatible-mode/v1` 前缀；客户端向 `{DASHSCOPE_BASE_URL}/embeddings` 发送 `model`、`input` 和 `dimensions`，使用 `DASHSCOPE_API_KEY` 作为 Bearer 令牌（放在 `Authorization` 请求头中的访问令牌）。默认模型是 `text-embedding-v4`，默认维度是 `1024`。
+embedding 提供方只在进程内存中，由管理接口在运行期供给（见下文「Embedding 提供方管理契约」），不通过任何环境变量配置。进程启动时永远处于未配置状态，重启后回到未配置；包括 `DASHSCOPE_*` 在内的任何环境变量都不会激活它。
 
-查询前，服务会确认 SQLite 中的向量模型和维度与当前配置一致。以下任一情况都会让 v2 明确返回 `unavailable`，而不是伪装成完整的空结果：
+提供方的 base URL 必须是完整的 HTTP/HTTPS 地址，并包含百炼 OpenAI 兼容接口的 `/compatible-mode/v1` 前缀；客户端向 `{baseUrl}/embeddings` 发送 `model`、`input` 和 `dimensions`，使用 `apiKey` 作为 Bearer 令牌（放在 `Authorization` 请求头中）。
 
-- `DASHSCOPE_BASE_URL` 或 `DASHSCOPE_API_KEY` 缺失；
-- 提供方请求失败或返回结构、数量、顺序、维度不符合约定；
+查询前，服务会确认 SQLite 中的向量模型和维度与当前提供方一致。以下任一情况都会让 v2 明确返回 `unavailable`，而不是伪装成完整的空结果：
+
+- 提供方未配置或被清除；
+- 提供方请求失败，或响应结构、数量、顺序、维度不符合约定；
 - 本地向量索引为空、损坏或与当前模型身份冲突。
 
 增量入库时 embedding 失败不会写入没有向量的题目，也不会推进来源游标；下一轮会再次尝试。
@@ -283,6 +285,22 @@ PUT /api/v1/index/problems
 
 服务端固定命名空间为 `urmotiv`；调用方不能通过正文选择 source/namespace，也不能写入 URL、metadata、verdict、workflow state 或 Fermata 字段。没有删除路由。这个端点**使 Urmotiv 适配器可以接入**实时题目，但**不在 Anklang 内实现 Urmotiv 适配器**、授权读取、业务判断或工作流；适配器仍须由集成方在受控边界中单独提供。
 
+## Embedding 提供方管理契约
+
+embedding 提供方由管理接口在运行期供给，只存在于进程内存；配置后立即生效，进程重启后回到未配置状态。所有管理请求都必须带已有的 Bearer 服务令牌（与查询、入库使用同一个 `ANKLANG_SERVICE_TOKEN`）；没有配置服务令牌时管理接口一律失败关闭。三个方法返回严格 JSON 对象：
+
+```text
+GET    /api/v1/admin/embedding-provider
+PUT    /api/v1/admin/embedding-provider
+DELETE /api/v1/admin/embedding-provider
+```
+
+- `GET` 返回当前状态；未配置时为 `{"configured": false}`，已配置时为 `{"configured": true, "baseUrl": ..., "model": ..., "dimension": ...}`。响应绝不包含 `apiKey` 或任何密钥字段。
+- `PUT` 的正文是严格 JSON，只能有 `baseUrl`、`apiKey`、`model`、`dimension` 四个字段。`baseUrl` 必须是安全的 HTTP/HTTPS 地址，`apiKey` 非空且不超过 4096 个 UTF-16 单元，`model` 非空且不超过 200 个 UTF-16 单元，`dimension` 是 1–4096 的整数。`Content-Type` 必须是 `application/json`（否则 415）；字段缺失、多余或非法返回 400。配置成功返回与 `GET` 相同的已配置状态；重复提交相同内容幂等。模型或维度与本地已有向量索引身份冲突时不会覆盖旧向量，后续查询/入库沿既有索引安全机制表现为明确不可用。
+- `DELETE` 立即阻止新的 embedding 获取，等待已在途的向量化操作结束后清除提供方，返回 `{"configured": false}`。清除后健康状态的 `embeddingAvailable` 变为 `false`，查询返回 `unavailable`，单题入库返回 503。
+
+鉴权失败返回 401，未知方法返回 405；任何响应都不携带密钥、异常原文或外部提供方响应。同样注意：`DASHSCOPE_*` 等环境变量不参与提供方管理。
+
 ## 固定 32/32 证据的正确解释
 仓库关联的受控验收记录使用一个可复现的 Formal156 题目快照，从 156 条来源记录中按固定规则均匀抽取 32 条查询。记录绑定 DashScope `text-embedding-v4`（1024 维）、156 条向量索引、`upstream-v2` 查询模式和已启用的提供方配置，观察到：
 
@@ -308,10 +326,7 @@ PUT /api/v1/index/problems
 | `ANKLANG_SEARCH_K` | `8` | 内部返回候选数，范围 1–20；接口仍最多输出 50 条。 |
 | `ANKLANG_MINIMUM_SIMILARITY` | `0.5` | 显示下限，范围 0–1；不是业务判定阈值。 |
 | `ANKLANG_LOCAL_DB_PATH` | `problems-data/local-index.db` | SQLite 文件路径；相对启动目录。 |
-| `DASHSCOPE_BASE_URL` | 空 | 百炼 OpenAI 兼容地址，需含 `/compatible-mode/v1`。 |
-| `DASHSCOPE_API_KEY` | 空 | 百炼 embedding 令牌；只读入内存。 |
-| `DASHSCOPE_EMBEDDING_MODEL` | `text-embedding-v4` | 向量模型标识。 |
-| `DASHSCOPE_EMBEDDING_DIM` | `1024` | 向量维度，范围 1–4096。 |
+| `DASHSCOPE_*` | 忽略 | embedding 提供方不通过环境变量配置；任何取值都不会激活或拒绝启动。 |
 | `ANKLANG_INGEST_ENABLED` | `false` | 是否在进程内启用来源适配器增量抓取。 |
 | `ANKLANG_INGEST_INTERVAL_SECONDS` | `3600` | 增量抓取间隔，范围 60–86,400 秒。 |
 | `ANKLANG_STOP_GRACE_PERIOD` | `45s` | 仅供 Compose 使用的容器停止宽限；应大于应用停止宽限。 |

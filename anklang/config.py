@@ -12,7 +12,6 @@ import ipaddress
 import os
 import re
 from dataclasses import dataclass
-from urllib.parse import urlsplit
 
 
 class ConfigError(RuntimeError):
@@ -58,38 +57,6 @@ def _read_bool(name: str, default: bool = False) -> bool:
     raise ConfigError(f"{name} 只能留空，或填写 true/false。")
 
 
-def _validate_http_url(name: str, raw: str) -> str:
-    if any(
-        character.isspace() or ord(character) < 32 or ord(character) == 127
-        for character in raw
-    ):
-        raise ConfigError(f"{name} 必须是完整的 HTTP/HTTPS 地址。")
-    try:
-        parsed = urlsplit(raw)
-        hostname = parsed.hostname
-        port = parsed.port
-    except ValueError:
-        # URL 可能误填了账号、密码等私密内容，异常链也不能回显原值。
-        parsed = None
-        hostname = None
-        port = None
-    if parsed is None:
-        raise ConfigError(f"{name} 必须是完整的 HTTP/HTTPS 地址。")
-    if parsed.scheme.lower() not in {"http", "https"} or not hostname:
-        raise ConfigError(f"{name} 必须是完整的 HTTP/HTTPS 地址。")
-    if not _valid_hostname(hostname):
-        raise ConfigError(f"{name} 的主机名不合法。")
-    if parsed.username is not None or parsed.password is not None:
-        raise ConfigError(f"{name} 不能包含账号或密码。")
-    if parsed.netloc.endswith(":") or (port is not None and not (1 <= port <= 65_535)):
-        raise ConfigError(f"{name} 的端口不合法。")
-    if "?" in raw or "#" in raw:
-        raise ConfigError(f"{name} 不能包含查询参数或页面片段。")
-    if "\\" in raw:
-        raise ConfigError(f"{name} 必须是完整的 HTTP/HTTPS 地址。")
-    return raw.rstrip("/")
-
-
 def _valid_hostname(hostname: str) -> bool:
     if not hostname or "%" in hostname or "\\" in hostname:
         return False
@@ -111,20 +78,6 @@ def _valid_hostname(hostname: str) -> bool:
         _HOST_LABEL_RE.fullmatch(label) is not None
         for label in ascii_hostname.split(".")
     )
-
-
-def _read_url(name: str, default: str) -> str:
-    raw = os.environ.get(name, "").strip() or default
-    return _validate_http_url(name, raw)
-
-
-def _read_optional_url(name: str) -> str | None:
-    """读取一个可选的 URL 型配置项：留空返回 None（表示这个可选功能未配置，调用方
-    自行决定降级），非空则必须是合法的 HTTP/HTTPS 地址。"""
-    raw = os.environ.get(name, "").strip()
-    if raw == "":
-        return None
-    return _validate_http_url(name, raw)
 
 
 def _read_bind_host(name: str, default: str) -> str:
@@ -153,10 +106,6 @@ class AppConfig:
     search_k: int
     minimum_similarity: float
     local_db_path: str = "problems-data/local-index.db"
-    dashscope_base_url: str | None = None
-    dashscope_api_key: str | None = None
-    dashscope_embedding_model: str = "text-embedding-v4"
-    dashscope_embedding_dim: int = 1024
     # 源插件后台抓取（默认关闭，打开后周期性调用源插件入库）
     ingest_enabled: bool = False
     ingest_interval_seconds: int = 3600
@@ -179,10 +128,6 @@ def load_config() -> AppConfig:
             "启用 ANKLANG_REQUIRE_SERVICE_TOKEN 时必须配置至少 16 个字符的服务令牌。"
         )
 
-    # DASHSCOPE_* 不是启动必填项；缺少时健康检查仍可用，查询明确报告后端不可用。
-    dashscope_base_url = _read_optional_url("DASHSCOPE_BASE_URL")
-    dashscope_api_key = os.environ.get("DASHSCOPE_API_KEY", "").strip() or None
-
     ingest_enabled = _read_bool("ANKLANG_INGEST_ENABLED")
 
     return AppConfig(
@@ -192,11 +137,6 @@ def load_config() -> AppConfig:
         minimum_similarity=_read_float("ANKLANG_MINIMUM_SIMILARITY", 0.5, 0.0, 1.0),
         local_db_path=os.environ.get("ANKLANG_LOCAL_DB_PATH", "").strip()
         or "problems-data/local-index.db",
-        dashscope_base_url=dashscope_base_url,
-        dashscope_api_key=dashscope_api_key,
-        dashscope_embedding_model=os.environ.get("DASHSCOPE_EMBEDDING_MODEL", "").strip()
-        or "text-embedding-v4",
-        dashscope_embedding_dim=_read_int("DASHSCOPE_EMBEDDING_DIM", 1024, 1, 4096),
         ingest_enabled=ingest_enabled,
         ingest_interval_seconds=_read_int("ANKLANG_INGEST_INTERVAL_SECONDS", 3600, 60, 86_400),
         bind_host=_read_bind_host("ANKLANG_BIND_HOST", "127.0.0.1"),

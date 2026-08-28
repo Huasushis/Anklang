@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 from anklang.embedding import EmbeddingError
 from anklang.ingest import ingest_once
+from anklang.provider import ProviderRegistry
 from anklang.sources import (
     RawProblem,
     SourceContractError,
@@ -171,7 +172,9 @@ class IncrementalIngestTests(unittest.TestCase):
                 "second query": [0.0, 1.0],
             }
         )
-        backend = UpstreamSearchBackend(self.store, embedder)  # type: ignore[arg-type]
+        backend = UpstreamSearchBackend(
+            self.store, ProviderRegistry(initial=embedder)
+        )
         with patch("anklang.ingest.discover_source_modules", return_value=[source]):
             first = ingest_once(self.store, embedder)  # type: ignore[arg-type]
             first_result = backend.search("first query", 5)

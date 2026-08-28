@@ -15,6 +15,7 @@ from anklang.http_api import (
     ServiceRuntime,
     make_handler,
 )
+from anklang.provider import ProviderRegistry
 from anklang.store import EmbeddingIndexSpec, ProblemStore
 from anklang.text_normalize import content_hash_of, normalize_statement
 from ui.server import UpstreamSearchBackend
@@ -58,7 +59,9 @@ class _Harness:
     def __init__(self, embedder: Any | None = None) -> None:
         self.store = ProblemStore(":memory:")
         self.embedder = _Embedder() if embedder is None else embedder
-        backend = UpstreamSearchBackend(self.store, self.embedder)  # type: ignore[arg-type]
+        backend = UpstreamSearchBackend(
+            self.store, ProviderRegistry(initial=self.embedder)
+        )
         config = AppConfig(
             port=8730,
             service_token=_TOKEN,
@@ -343,7 +346,9 @@ class UpsertContractTests(unittest.TestCase):
 
         unusable_store = ProblemStore(":memory:")
         unusable_store.prepare_embedding_writes(EmbeddingIndexSpec("other-model", 2))
-        unusable_backend = UpstreamSearchBackend(unusable_store, _Embedder())  # type: ignore[arg-type]
+        unusable_backend = UpstreamSearchBackend(
+            unusable_store, ProviderRegistry(initial=_Embedder())
+        )
         unusable_service = AnklangService(missing_config, unusable_backend)
         unusable_server = AnklangHTTPServer(
             ("127.0.0.1", 0), make_handler(unusable_service)

@@ -23,18 +23,26 @@ from .config import AppConfig
 from .contracts import (
     ContractError,
     build_result,
+    build_provider_status,
     build_upsert_result,
     build_v2_result,
+    parse_provider_config,
     parse_request,
     parse_upsert_request,
     utc_now_z,
+    validate_provider_status,
     validate_upsert_result,
     validate_v2_result,
 )
+from .provider import ProviderConfig
+from .store import EmbeddingIndexSpec, IndexMetadataError, ProblemStore
 
 _MAX_REQUEST_BYTES = 4_000_000
 _V1_SIMILARITY_PATH = "/api/v1/checks/similarity"
 _V2_SIMILARITY_PATH = "/api/v2/checks/similarity"
+_ADMIN_PROVIDER_PATH = "/api/v1/admin/embedding-provider"
+
+
 _UPSERT_PATH = "/api/v1/index/problems"
 _LIVE_PATH = "/api/v1/live"
 _READY_PATH = "/api/v1/ready"
@@ -117,9 +125,13 @@ class AnklangService:
         self,
         config: AppConfig,
         backend: SearchBackend,
+        provider: Any | None = None,
     ) -> None:
         self.config = config
         self.backend = backend
+        self.provider = (
+            provider if provider is not None else getattr(backend, "provider", None)
+        )
 
     def check_similarity(
         self,
@@ -215,6 +227,51 @@ class AnklangService:
         if not isinstance(result, BackendUpsertResult):
             raise BackendError(reason_code="service_unavailable", retryable=False)
         return result
+
+    def provider_status(self) -> dict[str, Any]:
+        """返回管理接口的提供方状态：只含 configured 与非机密字段。"""
+
+        if self.provider is None:
+            raise BackendError(reason_code="service_unavailable", retryable=False)
+        configured, base_url, model, dimension = self.provider.status()
+        return build_provider_status(
+            configured=configured,
+            base_url=base_url,
+            model=model,
+            dimension=dimension,
+        )
+
+    def provider_configure(self, request: dict[str, Any]) -> dict[str, Any]:
+        """把提供方写入进程内存并登记索引身份；密钥只留在注册表内部。"""
+
+        if self.provider is None:
+            raise BackendError(reason_code="service_unavailable", retryable=False)
+        store = getattr(self.backend, "store", None)
+        if store is not None:
+            try:
+                store.prepare_embedding_writes(
+                    EmbeddingIndexSpec(request["model"], request["dimension"])
+                )
+            except IndexMetadataError:
+                # 模型或维度与已有索引身份冲突时不覆盖旧向量；冲突会沿既有
+                # 索引安全机制在查询/入库时表现为明确的不可用。
+                pass
+        config = ProviderConfig(
+            base_url=request["base_url"],
+            api_key=request["api_key"],
+            model=request["model"],
+            dimension=request["dimension"],
+        )
+        self.provider.configure(config)
+        return self.provider_status()
+
+    def provider_clear(self) -> dict[str, Any]:
+        """同步清空当前提供方；返回后任何新的 embedding 调用都拿不到被清除的密钥。"""
+
+        if self.provider is None:
+            raise BackendError(reason_code="service_unavailable", retryable=False)
+        self.provider.clear()
+        return build_provider_status(configured=False)
 
     @staticmethod
     def _build_unavailable_result(
@@ -312,6 +369,8 @@ def make_handler(
                 self._handle_ready()
             elif self.path == "/api/v1/health":
                 self._handle_health()
+            elif self.path == _ADMIN_PROVIDER_PATH:
+                self._handle_admin_provider_get()
             elif self.path in {
                 _V1_SIMILARITY_PATH,
                 _V2_SIMILARITY_PATH,
@@ -328,9 +387,15 @@ def make_handler(
             self._handle_unsupported_method(suppress_body=True)
 
         def do_PUT(self) -> None:  # noqa: N802
-            if self.path != _UPSERT_PATH:
-                self._handle_unsupported_method()
+            if self.path == _UPSERT_PATH:
+                self._do_guarded_upsert()
                 return
+            if self.path == _ADMIN_PROVIDER_PATH:
+                self._handle_admin_provider_put()
+                return
+            self._handle_unsupported_method()
+
+        def _do_guarded_upsert(self) -> None:
             # 入库和查重共用同一个在途名额，不能绕过资源上限。
             if not active_runtime.try_begin_check():
                 self.close_connection = True
@@ -355,6 +420,9 @@ def make_handler(
             self._handle_unsupported_method()
 
         def do_DELETE(self) -> None:  # noqa: N802
+            if self.path == _ADMIN_PROVIDER_PATH:
+                self._handle_admin_provider_delete()
+                return
             self._handle_unsupported_method()
 
         def do_OPTIONS(self) -> None:  # noqa: N802
@@ -395,7 +463,7 @@ def make_handler(
                 _V2_SIMILARITY_PATH: "2",
             }.get(self.path)
             if api_version is None:
-                if self.path == _UPSERT_PATH:
+                if self.path in {_UPSERT_PATH, _ADMIN_PROVIDER_PATH}:
                     self._handle_unsupported_method()
                 else:
                     self._send(
@@ -554,7 +622,12 @@ def make_handler(
             self._send(200, response)
 
         def _handle_unsupported_method(self, *, suppress_body: bool = False) -> None:
-            if self.path in {_V1_SIMILARITY_PATH, _V2_SIMILARITY_PATH, _UPSERT_PATH}:
+            if self.path in {
+                _V1_SIMILARITY_PATH,
+                _V2_SIMILARITY_PATH,
+                _UPSERT_PATH,
+                _ADMIN_PROVIDER_PATH,
+            }:
                 self._send(
                     405,
                     {"error": {"code": "METHOD_NOT_ALLOWED", "message": "请求方法不受支持。"}},
@@ -609,6 +682,112 @@ def make_handler(
             ):
                 info["status"] = "degraded"
             self._send(200, info)
+
+        def _authorized_admin(self) -> bool:
+            """管理资源始终要求 Bearer 服务令牌；未配置令牌时一律失败关闭。"""
+
+            expected = service.config.service_token
+            if expected is None:
+                return False
+            header = self.headers.get("Authorization", "")
+            if not header.startswith("Bearer "):
+                return False
+            provided = header[len("Bearer ") :].strip()
+            return hmac.compare_digest(provided.encode("utf-8"), expected.encode("utf-8"))
+
+        def _handle_admin_provider_get(self) -> None:
+            if not self._authorized_admin():
+                self._send(
+                    401,
+                    {"error": {"code": "UNAUTHENTICATED", "message": "缺少或无效的令牌。"}},
+                )
+                return
+            try:
+                response = service.provider_status()
+                response = validate_provider_status(response)
+            except Exception:
+                self._send(
+                    503,
+                    {
+                        "error": {
+                            "code": "PROVIDER_UNAVAILABLE",
+                            "message": "embedding 提供方暂时不可用。",
+                        }
+                    },
+                )
+                return
+            self._send(200, response)
+
+        def _handle_admin_provider_put(self) -> None:
+            if not self._authorized_admin():
+                self._send(
+                    401,
+                    {"error": {"code": "UNAUTHENTICATED", "message": "缺少或无效的令牌。"}},
+                )
+                return
+            content_type = (
+                self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+            )
+            if content_type != "application/json":
+                self._send(
+                    415,
+                    {
+                        "error": {
+                            "code": "UNSUPPORTED_MEDIA_TYPE",
+                            "message": "请求内容类型不受支持。",
+                        }
+                    },
+                )
+                return
+            payload = self._read_json()
+            if payload is None:
+                return
+            try:
+                request = parse_provider_config(payload)
+            except ContractError:
+                self._send(
+                    400,
+                    {"error": {"code": "INVALID_REQUEST", "message": "请求不符合接口契约。"}},
+                )
+                return
+            try:
+                response = service.provider_configure(request)
+                response = validate_provider_status(response)
+            except Exception:
+                self._send(
+                    503,
+                    {
+                        "error": {
+                            "code": "PROVIDER_UNAVAILABLE",
+                            "message": "embedding 提供方暂时不可用。",
+                        }
+                    },
+                )
+                return
+            self._send(200, response)
+
+        def _handle_admin_provider_delete(self) -> None:
+            if not self._authorized_admin():
+                self._send(
+                    401,
+                    {"error": {"code": "UNAUTHENTICATED", "message": "缺少或无效的令牌。"}},
+                )
+                return
+            try:
+                response = service.provider_clear()
+                response = validate_provider_status(response)
+            except Exception:
+                self._send(
+                    503,
+                    {
+                        "error": {
+                            "code": "PROVIDER_UNAVAILABLE",
+                            "message": "embedding 提供方暂时不可用。",
+                        }
+                    },
+                )
+                return
+            self._send(200, response)
 
         def _authorized(self) -> bool:
             expected = service.config.service_token

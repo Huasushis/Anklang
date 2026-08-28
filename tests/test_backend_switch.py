@@ -1,15 +1,18 @@
 from __future__ import annotations
 
 import json
+import os
 import threading
 import unittest
 from http.client import HTTPConnection
 from http.server import ThreadingHTTPServer
 from typing import Any
+from unittest.mock import patch
 
 from anklang.config import AppConfig
 from anklang.embedding import EmbeddingClient
 from anklang.http_api import AnklangService, make_handler
+from anklang.provider import ProviderRegistry
 from anklang.store import EmbeddingIndexSpec, ProblemStore, StoredProblem
 from ui.server import UpstreamSearchBackend, build_backend
 
@@ -105,21 +108,40 @@ class BackendAssemblyTests(unittest.TestCase):
         backend = build_backend(_config())
         self.addCleanup(backend.close)
         self.assertIsInstance(backend, UpstreamSearchBackend)
-        self.assertIsNone(backend.embedder)
+        self.assertIsInstance(backend.provider, ProviderRegistry)
+        self.assertFalse(backend.provider.status()[0])
         self.assertEqual(backend.describe_health()["backend"], "upstream-v2")
 
-    def test_configured_replacement_provider_is_built(self) -> None:
-        backend = build_backend(
-            _config(
-                dashscope_base_url="https://provider.invalid/compatible-mode/v1",
-                dashscope_api_key="synthetic-token-value",
-                dashscope_embedding_model="replacement-model",
-                dashscope_embedding_dim=2,
-            )
+    def test_runtime_provider_wiring_reaches_health(self) -> None:
+        embedder = EmbeddingClient(
+            base_url="https://provider.invalid/compatible-mode/v1",
+            api_key="synthetic-token-value",
+            model="replacement-model",
+            dimensions=2,
+        )
+        backend = UpstreamSearchBackend(
+            ProblemStore(":memory:"), ProviderRegistry(initial=embedder)
         )
         self.addCleanup(backend.close)
-        self.assertIsInstance(backend.embedder, EmbeddingClient)
-        self.assertEqual(backend.embedder.model, "replacement-model")
+        self.assertTrue(backend.provider.status()[0])
+        self.assertEqual(backend.provider.status()[2], "replacement-model")
+        self.assertTrue(backend.describe_health()["embeddingAvailable"])
+
+    def test_build_backend_never_activates_dashscope_env(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "DASHSCOPE_BASE_URL": "https://dashscope.example.invalid/compatible-mode/v1",
+                "DASHSCOPE_API_KEY": "synthetic-env-key",
+                "DASHSCOPE_EMBEDDING_MODEL": "replacement-model",
+                "DASHSCOPE_EMBEDDING_DIM": "2",
+            },
+            clear=True,
+        ):
+            backend = build_backend(_config())
+        self.addCleanup(backend.close)
+        self.assertFalse(backend.provider.status()[0])
+        self.assertFalse(backend.describe_health()["embeddingAvailable"])
 
     def test_live_http_query_returns_only_ranked_candidates(self) -> None:
         store = ProblemStore(":memory:")
@@ -147,7 +169,10 @@ class BackendAssemblyTests(unittest.TestCase):
             dimensions=2,
             opener=opener,
         )
-        service = AnklangService(_config(), UpstreamSearchBackend(store, embedder))
+        service = AnklangService(
+            _config(),
+            UpstreamSearchBackend(store, ProviderRegistry(initial=embedder)),
+        )
         harness = _Harness(service)
         self.addCleanup(harness.close)
         status, payload = harness.request("/api/v2/checks/similarity", _request())
