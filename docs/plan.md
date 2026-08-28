@@ -1,129 +1,133 @@
-# Anklang 当前实现计划与验收边界
+# Anklang 实现说明与维护边界
 
-状态：当前范围已经收敛。本文件替代此前关于反向代理、LLM 复核、标定、流程采集和审核政策的计划；这些内容已废止，不能作为当前或后续验收要求。
+本文档记录当前可部署实现的职责、数据契约和验收边界。Anklang 是公开项目 [is-my-problem-new](https://github.com/fjzzq2002/is-my-problem-new) v2 的小型直接改编，不是 Urmotiv 或 Fermata 的工作流服务。
 
-## 1. 产品职责
+## 产品职责
 
-Anklang 只做原题检索：
+Anklang 只做原题候选检索：
 
 ```text
-查询题面 -> embedding -> cosine_all -> 相似度降序 -> collapse -> mkrow 候选
+查询题面 -> embedding -> cosine_all -> 相似度降序 -> collapse -> mkrow -> 候选
 ```
 
-返回结果是检索事实，不是产品判断。Anklang 不判断同题、不判断是否可参考、不决定通过或拦截，也不保存提交查询结果。
+embedding（向量化）把文字转换为固定长度的数字向量；`cosine_all` 计算向量方向的相似度；`collapse` 按来源和稳定题号去重；`mkrow` 形成公开候选。返回值是检索事实，不是产品判断。
 
-重复和参考信息由 Urmotiv 管理。Fermata 是独立审题服务，只能读取 Urmotiv 的带版本号 HTTP 接口；Fermata 和 Anklang 不互调、不共享数据库。Anklang 不提供 yuantiji 反向代理运行时。
+Anklang 不判断候选是否同题或可作参考，不决定通过、拦截、审核或后续流程，不调用 LLM 复核，不提供 yuantiji 代理，不保存查询结果或结果缓存，也不保存提交查询的业务状态。
 
-历史 32/32 标定仅记录已废止的实验路径，不证明当前查询服务的正确性，也不属于当前验收。
+跨服务边界如下：Urmotiv 插件可以把抄袭/检查信息作为 Urmotiv 的问题属性添加，供 Fermata 消费；Fermata 通过带版本号的 Urmotiv HTTP 接口读取这些属性。Anklang 不拥有这些属性、工作流状态或审核结论，不读取 Urmotiv/Fermata 数据库，也不提供两个服务运行时互调的接口。
 
-## 2. 上游保留与有限改动
+## 上游保留与有限改动
 
-上游 [is-my-problem-new v2 `ui/server.py`，提交 `72e309bd`](https://github.com/fjzzq2002/is-my-problem-new/blob/72e309bdcea2669bc3f476bea6fa81b1f21e788a/ui/server.py) 的运行入口和主链：
+上游 v2 运行入口和对应提交是 [`ui/server.py`](https://github.com/fjzzq2002/is-my-problem-new/blob/72e309bdcea2669bc3f476bea6fa81b1f21e788a/ui/server.py)。上游作者 Ziqian Zhong 的 MIT 版权声明保留在 [`LICENSE`](../LICENSE)。
 
-1. 接收题面并生成查询向量；
-2. 用 `cosine_all` 计算题库向量的余弦相似度；
-3. 按相似度降序排列；
-4. 用 `collapse` 去除重复来源行；
-5. 用 `mkrow` 形成候选。
-
-Anklang 的直接对应：
-
-| 上游职责 | Anklang | 有限差异 |
+| 上游路径或职责 | Anklang 实现 | 允许的差异 |
 | --- | --- | --- |
-| 运行入口和检索主链 | `ui/server.py` | 保留 `cosine_all`、降序、`collapse`、`mkrow` 的调用顺序；删除网页、查询改写、重排、统计和查询向量缓存 |
-| embedding 调用 | `anklang/embedding.py` | 改接环境变量配置的百炼 OpenAI 兼容接口 |
-| 题库向量 | `anklang/store.py` | 上游内存数据改为可增量写入的 SQLite 当前题目行，余弦计算不依赖 NumPy |
-| 题目来源 | `anklang/sources/`、`anklang/ingest.py` | 插件发现、独立游标、幂等更新 |
-| HTTP 适配 | `anklang/http_api.py` | 将上游检索函数封装为严格的版本化机器接口 |
+| `ui/server.py` 运行入口、`cosine_all`、排序、`collapse`、`mkrow` | `ui/server.py` | 保留调用顺序；候选字段收窄为机器接口契约。 |
+| embedding | `anklang/embedding.py` | 改用配置的百炼 OpenAI 兼容 `/embeddings` 接口，校验模型、维度、顺序、数量和响应大小。 |
+| 内存题库 | `anklang/store.py` | 使用独立 SQLite 当前题目行和向量；查询每次读取当前快照。 |
+| 题目更新 | `anklang/sources/`、`anklang/ingest.py` | 自动发现来源插件，按来源维护 UTC 游标，增量幂等插入或更新。 |
+| HTTP 适配 | `anklang/http_api.py` | 提供严格的 v1/v2 查询、存活、就绪和健康路由。 |
 
-MIT 许可证和上游作者 Ziqian Zhong 的版权声明保留在根目录 `LICENSE`。
+网页、查询改写、重排、统计、OJ 筛选、查询向量缓存、LLM 复核、流程采集和跨服务代理不属于当前实现。
 
-## 3. 查询契约
+## 数据与索引不变量
+
+- 生产题库不随镜像提供。来源插件提交 `RawProblem` 后，框架规范化题面并计算内容哈希，再使用配置的 embedding 写入 SQLite。
+- 查询和入库必须使用同一个模型标识与维度；SQLite 中的索引身份不匹配时拒绝形成候选。
+- `(source, external_id)` 是稳定主键。题目更新时间使用带毫秒的 UTC `Z` 字符串；同一题号出现无法判断先后的不同版本时整组跳过，并且不推进游标。
+- 运行时增量写入完成后，下一个查询直接读取新快照；不需要重启服务或离线全量重建。
+- embedding 未配置、提供方失败、向量无效或索引不可用时，v2 使用 `unavailable`，候选必须为空；入库任务不写无向量题目，也不推进失败来源的游标。
+- 查询响应使用 `Cache-Control: no-store`。运行时没有结果缓存、复用策略、过期时间或索引代次状态。
+
+## 来源插件契约
+
+服务每轮重新发现 `anklang/sources/` 下的子包。每个来源包只导出：
+
+```text
+SOURCE_NAME: str
+fetch_new_problems(since: str | None) -> list[RawProblem]
+```
+当前仓库只内置 `example_static` 合成来源；Urmotiv 的实际来源插件必须作为 Anklang 运行环境中的可导入子包提供。这里没有跨仓库自动发现、HTTP 回调或数据库直连。
+
+`SOURCE_NAME` 必须全局唯一。`since` 是该来源上次成功推进的 UTC 时间；`null` 表示首次读取。每条 `RawProblem` 包含稳定 `external_id`、`title`、`statement`，并可包含安全 HTTP `url`、`updated_at` 和有界标量 `metadata`。`metadata` 只用于公开候选展示，不参加题面哈希、向量或相似度。
+
+Urmotiv 的实时新增题目应由 Urmotiv 侧来源插件按此契约提供。设置 `ANKLANG_INGEST_ENABLED=true` 后，后台按 `ANKLANG_INGEST_INTERVAL_SECONDS` 周期调用来源；一个来源失败不阻断其他来源。Anklang 负责校验、规范化、embedding、幂等写入和游标比较交换，不负责来源授权、业务属性或工作流状态。
+
+## HTTP 契约
 
 ### 请求
 
-`POST /api/v1/checks/similarity` 与 `POST /api/v2/checks/similarity` 接收严格 JSON：
+`POST /api/v1/checks/similarity` 和 `POST /api/v2/checks/similarity` 均要求严格 JSON：
 
-- `apiVersion` 必须与路径一致；
-- `requestId` 是规范 UUID；
-- `contentHash` 是 64 位小写十六进制；
-- `problem` 只包含 `title`、`type`、`tagIds`、`basicStatement`。
+下面是可直接解析的合成请求形状：
 
-### 候选
+```json
+{
+  "apiVersion": "2",
+  "requestId": "00000000-0000-4000-8000-000000000001",
+  "contentHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "problem": {
+    "title": "合成示例：数组求和",
+    "type": "traditional",
+    "tagIds": ["array", "sum"],
+    "basicStatement": "给定一个整数数组，计算并输出所有元素的总和。"
+  }
+}
+```
 
-每条候选必填：
+`apiVersion` 必须与路径一致；`requestId` 必须是规范 UUID；`contentHash` 必须匹配 64 位小写十六进制。`problem` 只能有 `title`、`type`、`tagIds`、`basicStatement`，顶层也不允许额外字段。长度按 JavaScript UTF-16 字符串单元计算。完整范围和调用命令见 [`README.md`](../README.md)。
 
-- `source`：来源名；
-- `externalId`：来源内稳定题号；
-- `title`：题目标题；
-- `similarity`：`[0, 1]` 有限数。
 
-`url` 是唯一可选字段。输出不允许出现来源摘录、内部错误、复核字段或流程建议。候选最多 50 条，并按相似度降序。
+### 响应
 
-### 完整性
+v1 成功响应严格为 `apiVersion`、`contentHash`、`checkedAt`、`candidates`。它只在检索完整时返回 HTTP 200；部分或不可用返回 HTTP 503。
 
-v1 只在完整查询时返回 200。v2 用 `completion.status` 区分：
+v2 成功形成的响应严格为：
 
-- `complete`：配置范围内的查询完整完成；
-- `partial`：仍有可用候选，但某条检索信号失败；
-- `unavailable`：不能形成候选，候选数组必须为空。
+```json
+{
+  "apiVersion": "2",
+  "contentHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "checkedAt": "2026-08-28T00:00:00.000Z",
+  "completion": {
+    "status": "complete",
+    "reasonCode": "complete",
+    "retryable": false
+  },
+  "candidates": []
+}
+```
 
-HTTP 发送 `Cache-Control: no-store`。响应契约和运行时不保存查询结果，也没有复用策略、过期时间、缓存身份或索引代次。
+`completion.status` 为 `complete`、`partial` 或 `unavailable`。完整结果的原因码固定为 `complete` 且不可重试；部分结果可以携带候选；不可用结果的候选数组必须为空。非完整结果可带固定原因码和可选的 `retryAfterSeconds`（1–86,400 秒）。
 
-## 4. embedding 提供方
+候选最多 50 条，按 `similarity` 降序；每条必填 `source`、`externalId`、`title`、`similarity`，可选 `url`。v2 可额外带来源插件提供的有界 `metadata`，v1 不带该字段。`ANKLANG_MINIMUM_SIMILARITY` 只是显示下限，不形成重复、抄袭、通过或拦截政策。
 
-配置项：
+HTTP 层不向外发送题面、来源摘录、模型原始响应、复核字段、审核建议或工作流属性。错误消息是固定文本，响应不缓存。
 
-- `DASHSCOPE_BASE_URL`；
-- `DASHSCOPE_API_KEY`；
-- `DASHSCOPE_EMBEDDING_MODEL`；
-- `DASHSCOPE_EMBEDDING_DIM`。
+## 部署不变量
 
-只有 URL 和密钥同时存在才启用向量模式。请求使用 OpenAI 兼容的 `/embeddings` 路径。客户端必须验证：
+- 本机默认监听 `127.0.0.1`；Compose 容器内监听 `0.0.0.0`，宿主仍只映射到回环地址。
+- 生产必须启用 `ANKLANG_REQUIRE_SERVICE_TOKEN=true` 并提供至少 16 个字符的 `ANKLANG_SERVICE_TOKEN`。存活、就绪和健康路由供本地探针使用。
+- 容器以非 root 用户运行，根文件系统只读，只有 `/app/problems-data` 数据卷可写。
+- `GET /api/v1/live` 只表示进程可响应；`GET /api/v1/ready` 只表示进程仍接受请求，不读取题库、不访问 embedding 或网络；`GET /api/v1/health` 返回本地索引和 embedding 配置状态，不返回密钥。
+- 关闭时服务先停止接收新查询，再在 `ANKLANG_SHUTDOWN_GRACE_SECONDS` 内等待在途查询；Compose 停止宽限应更长。
 
-- 响应大小和 JSON 结构；
-- 服务端确认的模型与配置一致；
-- 向量数量、顺序、有限数和维度正确；
-- 错误信息不包含请求正文、密钥或原始响应。
+部署命令和排查顺序见 [`docs/deployment.md`](deployment.md)。
 
-未配置提供方或查询调用失败时，v2 返回 `unavailable`，候选为空。增量入库的 embedding 失败时不写题目、不推进来源游标，下一轮重新尝试。
+## 固定 32/32 证据的范围
+受控验收记录绑定一个可复现的 Formal156 题目快照，从 156 条来源记录按固定规则均匀抽取 32 条查询。记录绑定 DashScope `text-embedding-v4`（1024 维）、156 条向量索引、`upstream-v2` 查询模式和已启用的提供方配置，记录为 32/32 HTTP 200、32/32 `completion.status=complete`、失败 0 条。
 
-## 5. 运行时增量来源
+这只证明固定样本下的提供方连通性、响应契约和完整结果形成能力，不证明语义准确率、全量题库质量、同题/抄袭判断、审核结论或工作流质量。请求正文、题库内容、令牌和完整指纹不进入仓库文档。
 
-来源包位于 `anklang/sources/<name>/`，导出唯一 `SOURCE_NAME` 和 `fetch_new_problems(since)`。
+## 可验证入口
 
-每轮 `ingest_once()`：
+变更后应至少验证：
 
-1. 重新发现所有来源包；
-2. 读取该来源当前 UTC 时间游标；
-3. 校验全部返回记录后选择每个题号的明确最新版本；
-4. 规范化题面并计算内容哈希；
-5. 按需调用 embedding；
-6. 以 `(source, external_id)` 幂等插入或更新；
-7. 用比较交换推进游标，防止旧任务覆盖新进度。
+```bash
+PYTHONPATH=. python3 -m unittest discover -s tests
+python3 -m compileall -q anklang ui tests
+docker compose config -q
+docker build -t anklang:verify .
+```
 
-同时间不同内容、无法判断先后的版本整组跳过，游标不前进。一个来源失败只增加固定计数，不阻断其他来源，也不输出异常内容。
-
-服务打开 `ANKLANG_INGEST_ENABLED=true` 后，后台线程按 `ANKLANG_INGEST_INTERVAL_SECONDS` 调用同一入口。SQLite 查询不缓存题库快照；写入完成后，现有服务实例的下一次查询立即看到新增或更新题目。
-
-## 6. 部署和隐私
-
-- 默认监听 `127.0.0.1`；容器内监听 `0.0.0.0`，宿主仍只绑定回环地址；
-- 生产环境必须要求至少 16 字符的服务令牌；
-- 服务限制在途请求、客户端空闲时间和退出宽限；
-- 进程不记录请求行、题面、外部响应或异常原文；
-- `private/`、SQLite 题库、真实题面、密钥和模型原始响应不进入 Git；
-- 测试不发起真实外部请求。
-
-## 7. 验收门禁
-
-全部门禁必须通过：
-
-1. **上游对照**：许可证和文档定位固定上游提交，`ui/server.py` 保留 `cosine_all`、降序、`collapse`、`mkrow` 主链和运行入口；
-2. **有限改动**：上游之外只有 embedding 提供方、SQLite 当前行与来源游标、增量插件、版本化 HTTP 适配；
-3. **查询契约**：v1/v2 都只有查询状态与排名候选，不含结果缓存或复用字段；
-4. **embedding**：配置成功路径、响应校验、明确不可用和入库重试测试通过；
-5. **增量来源**：后台调度期间新增、更新、立即可搜、幂等、同版本冲突和并发游标测试通过；
-6. **静态边界**：运行时代码不存在代理、复核、标定、流程采集、缓存复用或跨服务耦合；
-7. **完整验证**：单元测试、编译、Compose 配置、容器构建和容器部署测试通过；
-8. **隐私与 Git**：无真实外部请求，无私有内容进入差异或暂存区，提交已推送且跟踪文件干净。
+测试使用合成数据、注入的 embedding 响应和回环 HTTP，不发起真实外部请求；生产证据不应把真实题面、模型原始响应或令牌带入 Git。
