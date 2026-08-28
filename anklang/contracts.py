@@ -6,8 +6,8 @@ anklangRequestSchema / anklangResultSchema）。任何不一致都会被 Urmotiv
 
 关键约束（容易踩坑）：
 - 路径和正文版本必须严格一致；v1 恒为 "1"，v2 恒为 "2"；
-- 响应里 contentHash 必须原样回显请求里的值；
-- checkedAt 必须是带 Z 的 UTC 时间；
+- 查询响应里 contentHash 必须原样回显请求里的值；入库响应返回规范化题面的摘要；
+- checkedAt 和入库 updatedAt 必须是带 Z 的 UTC 时间；
 - similarity 在 [0, 1]；candidates 最多 50 条；
 - 响应不能出现契约之外的字段（Urmotiv 用 .strict() 校验）。
 """
@@ -57,6 +57,17 @@ MAX_CANDIDATES = 50
 MAX_RESPONSE_BYTES = 2_000_000
 _REQUEST_KEYS = {"apiVersion", "requestId", "contentHash", "problem"}
 _PROBLEM_KEYS = {"title", "type", "tagIds", "basicStatement"}
+_UPSERT_REQUEST_KEYS = {"apiVersion", "requestId", "externalId", "updatedAt", "problem"}
+_UPSERT_PROBLEM_KEYS = {"title", "basicStatement"}
+_UPSERT_RESULT_KEYS = {
+    "apiVersion",
+    "requestId",
+    "source",
+    "externalId",
+    "contentHash",
+    "outcome",
+}
+_UPSERT_OUTCOMES = {"inserted", "updated", "unchanged"}
 _V2_RESULT_KEYS = {
     "apiVersion",
     "contentHash",
@@ -126,7 +137,93 @@ def parse_request(payload: Any, expected_api_version: str = "1") -> dict[str, An
         "basic_statement": basic_statement,
     }
 
+def parse_upsert_request(payload: Any) -> dict[str, Any]:
+    """解析 Urmotiv 单题增量入库请求；命名空间和业务属性不属于此契约。"""
 
+    if not isinstance(payload, dict):
+        raise ContractError("请求正文必须是 JSON 对象。")
+    _require_exact_keys(payload, _UPSERT_REQUEST_KEYS, "请求正文")
+    if payload.get("apiVersion") != "1":
+        raise ContractError('apiVersion 必须是字符串 "1"。')
+
+    request_id = payload.get("requestId")
+    if not isinstance(request_id, str) or not _is_uuid(request_id):
+        raise ContractError("requestId 必须是规范的 UUID。")
+
+    external_id = _normalize_required_input(
+        payload.get("externalId"), 200, "externalId"
+    )
+    updated_at = _canonical_updated_at(payload.get("updatedAt"), "updatedAt")
+
+    problem = payload.get("problem")
+    if not isinstance(problem, dict):
+        raise ContractError("problem 缺失。")
+    _require_exact_keys(problem, _UPSERT_PROBLEM_KEYS, "problem")
+
+    title = _normalize_required_input(problem.get("title"), 200, "problem.title")
+    basic_statement = problem.get("basicStatement")
+    if (
+        not isinstance(basic_statement, str)
+        or not (1 <= _utf16_length(basic_statement) <= 500_000)
+        or not _js_trim(basic_statement)
+    ):
+        raise ContractError("problem.basicStatement 不合法。")
+
+    return {
+        "request_id": request_id,
+        "external_id": external_id,
+        "updated_at": updated_at,
+        "title": title,
+        "basic_statement": basic_statement,
+    }
+
+
+
+def build_upsert_result(
+    *,
+    request_id: str,
+    external_id: str,
+    content_hash: str,
+    outcome: str,
+) -> dict[str, Any]:
+    """构造严格的单题入库成功响应；来源固定为 ``urmotiv``。"""
+
+    if not isinstance(request_id, str) or not _is_uuid(request_id):
+        raise ContractError("响应的 requestId 不合法。")
+    external_id = _normalize_required_input(external_id, 200, "响应的 externalId")
+    if not isinstance(content_hash, str) or not _HASH_RE.fullmatch(content_hash):
+        raise ContractError("响应的 contentHash 不合法。")
+    if outcome not in _UPSERT_OUTCOMES:
+        raise ContractError("响应的 outcome 不合法。")
+    result = {
+        "apiVersion": "1",
+        "requestId": request_id,
+        "source": "urmotiv",
+        "externalId": external_id,
+        "contentHash": content_hash,
+        "outcome": outcome,
+    }
+    _validate_response_size(result)
+    return result
+
+
+def validate_upsert_result(payload: Any) -> dict[str, Any]:
+    """重新验证即将发出的单题入库成功响应。"""
+
+    if not isinstance(payload, dict):
+        raise ContractError("入库响应必须是对象。")
+    _require_exact_keys(payload, _UPSERT_RESULT_KEYS, "入库响应")
+    normalized = build_upsert_result(
+        request_id=payload.get("requestId"),
+        external_id=payload.get("externalId"),
+        content_hash=payload.get("contentHash"),
+        outcome=payload.get("outcome"),
+    )
+    if payload.get("apiVersion") != "1" or payload.get("source") != "urmotiv":
+        raise ContractError("入库响应的版本或来源不合法。")
+    if normalized != payload:
+        raise ContractError("入库响应包含非规范字段或值。")
+    return normalized
 def _utc_now_z() -> str:
     now = datetime.now(timezone.utc)
     return now.strftime("%Y-%m-%dT%H:%M:%S.") + f"{now.microsecond // 1000:03d}Z"
@@ -318,6 +415,22 @@ def _is_uuid(value: str) -> bool:
     except ValueError:
         return False
     return True
+
+
+def _normalize_required_input(value: Any, limit: int, path: str) -> str:
+    if not isinstance(value, str):
+        raise ContractError(f"{path} 必须是文本。")
+    trimmed = _js_trim(value)
+    if not trimmed:
+        raise ContractError(f"{path} 不能为空。")
+    if _utf16_length(trimmed) > limit:
+        raise ContractError(f"{path} 超过长度上限。")
+    return trimmed
+
+
+def _canonical_updated_at(value: Any, path: str) -> str:
+    parsed = _parse_utc_z(value, path)
+    return parsed.strftime("%Y-%m-%dT%H:%M:%S.") + f"{parsed.microsecond:06d}Z"
 
 
 def _bounded_required(value: Any, limit: int, path: str) -> str:

@@ -1,4 +1,4 @@
-"""带版本号的查询 HTTP 适配层。
+"""带版本号的查询与单题入库 HTTP 适配层。
 
 搜索本身位于保留的上游入口 ``ui/server.py``。本模块只负责 Urmotiv 机器接口的
 鉴权、严格 JSON 契约、健康检查和有界关闭；不实现搜索、缓存或产品判断。
@@ -13,20 +13,30 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
-from .backends import BackendError, BackendSearchResult, CompletionReason, SearchBackend
+from .backends import (
+    BackendError,
+    BackendSearchResult,
+    BackendUpsertResult,
+    CompletionReason,
+    SearchBackend,
+)
 from .config import AppConfig
 from .contracts import (
     ContractError,
     build_result,
+    build_upsert_result,
     build_v2_result,
     parse_request,
+    parse_upsert_request,
     utc_now_z,
+    validate_upsert_result,
     validate_v2_result,
 )
 
 _MAX_REQUEST_BYTES = 4_000_000
 _V1_SIMILARITY_PATH = "/api/v1/checks/similarity"
 _V2_SIMILARITY_PATH = "/api/v2/checks/similarity"
+_UPSERT_PATH = "/api/v1/index/problems"
 _LIVE_PATH = "/api/v1/live"
 _READY_PATH = "/api/v1/ready"
 _BUSY_RETRY_AFTER_SECONDS = 1
@@ -182,6 +192,31 @@ class AnklangService:
                 retryable=False,
             )
 
+    def upsert_problem(self, request: dict[str, Any]) -> BackendUpsertResult:
+        """调用同一运行时索引器写入一道固定来源题目。"""
+
+        indexer = getattr(self.backend, "upsert_problem", None)
+        if not callable(indexer):
+            raise BackendError(reason_code="service_unavailable", retryable=False)
+        try:
+            result = indexer(
+                request["external_id"],
+                request["title"],
+                request["basic_statement"],
+                request["updated_at"],
+            )
+        except BackendError:
+            raise
+        except Exception as error:
+            # 后端异常只转换为固定不可用类别，不携带正文、路径或配置细节。
+            raise BackendError(
+                reason_code="service_unavailable",
+                retryable=True,
+            ) from error
+        if not isinstance(result, BackendUpsertResult):
+            raise BackendError(reason_code="service_unavailable", retryable=False)
+        return result
+
     @staticmethod
     def _build_unavailable_result(
         content_hash: str,
@@ -278,7 +313,11 @@ def make_handler(
                 self._handle_ready()
             elif self.path == "/api/v1/health":
                 self._handle_health()
-            elif self.path in {_V1_SIMILARITY_PATH, _V2_SIMILARITY_PATH}:
+            elif self.path in {
+                _V1_SIMILARITY_PATH,
+                _V2_SIMILARITY_PATH,
+                _UPSERT_PATH,
+            }:
                 self._handle_unsupported_method()
             else:
                 self._send(
@@ -290,7 +329,28 @@ def make_handler(
             self._handle_unsupported_method(suppress_body=True)
 
         def do_PUT(self) -> None:  # noqa: N802
-            self._handle_unsupported_method()
+            if self.path != _UPSERT_PATH:
+                self._handle_unsupported_method()
+                return
+            # 入库和查重共用同一个在途名额，不能绕过资源上限。
+            if not runtime.try_begin_check():
+                self.close_connection = True
+                self._send(
+                    503,
+                    {
+                        "error": {
+                            "code": "SERVICE_BUSY",
+                            "message": "查重服务正忙，请稍后重试。",
+                        }
+                    },
+                    retry_after_seconds=_BUSY_RETRY_AFTER_SECONDS,
+                    close_connection=True,
+                )
+                return
+            try:
+                self._handle_upsert()
+            finally:
+                runtime.finish_check()
 
         def do_PATCH(self) -> None:  # noqa: N802
             self._handle_unsupported_method()
@@ -336,10 +396,13 @@ def make_handler(
                 _V2_SIMILARITY_PATH: "2",
             }.get(self.path)
             if api_version is None:
-                self._send(
-                    404,
-                    {"error": {"code": "NOT_FOUND", "message": "未找到资源。"}},
-                )
+                if self.path == _UPSERT_PATH:
+                    self._handle_unsupported_method()
+                else:
+                    self._send(
+                        404,
+                        {"error": {"code": "NOT_FOUND", "message": "未找到资源。"}},
+                    )
                 return
             # 在鉴权、读取正文和调用任何后端之前取得名额。满载或退出中的请求
             # 都得到同一个小型响应；未读正文所在连接随即关闭，不能被复用。
@@ -427,8 +490,72 @@ def make_handler(
                 retry_after_seconds=retry_after,
             )
 
+        def _handle_upsert(self) -> None:
+            if not self._authorized():
+                self._send(
+                    401,
+                    {"error": {"code": "UNAUTHENTICATED", "message": "缺少或无效的令牌。"}},
+                )
+                return
+            payload = self._read_json()
+            if payload is None:
+                return
+            try:
+                request = parse_upsert_request(payload)
+            except ContractError:
+                self._send(
+                    400,
+                    {"error": {"code": "INVALID_REQUEST", "message": "请求不符合接口契约。"}},
+                )
+                return
+
+            try:
+                result = service.upsert_problem(request)
+            except Exception:
+                self._send(
+                    503,
+                    {
+                        "error": {
+                            "code": "INDEX_UNAVAILABLE",
+                            "message": "题目索引暂时不可用。",
+                        }
+                    },
+                )
+                return
+            if result.outcome == "stale":
+                self._send(
+                    409,
+                    {
+                        "error": {
+                            "code": "STALE_UPDATE",
+                            "message": "题目版本已过期或发生冲突。",
+                        }
+                    },
+                )
+                return
+            try:
+                response = build_upsert_result(
+                    request_id=request["request_id"],
+                    external_id=request["external_id"],
+                    content_hash=result.content_hash,
+                    outcome=result.outcome,
+                )
+                response = validate_upsert_result(response)
+            except (ContractError, KeyError, TypeError, ValueError, OverflowError):
+                self._send(
+                    503,
+                    {
+                        "error": {
+                            "code": "INDEX_UNAVAILABLE",
+                            "message": "题目索引暂时不可用。",
+                        }
+                    },
+                )
+                return
+            self._send(200, response)
+
         def _handle_unsupported_method(self, *, suppress_body: bool = False) -> None:
-            if self.path in {_V1_SIMILARITY_PATH, _V2_SIMILARITY_PATH}:
+            if self.path in {_V1_SIMILARITY_PATH, _V2_SIMILARITY_PATH, _UPSERT_PATH}:
                 self._send(
                     405,
                     {"error": {"code": "METHOD_NOT_ALLOWED", "message": "请求方法不受支持。"}},

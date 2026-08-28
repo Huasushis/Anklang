@@ -139,6 +139,23 @@ class BackendSearchResult:
         )
 
 
+UpsertOutcome = Literal["inserted", "updated", "unchanged", "stale"]
+
+
+@dataclass(frozen=True)
+class BackendUpsertResult:
+    """单题入库的内部结果，不直接作为 HTTP 响应发送。"""
+
+    outcome: UpsertOutcome
+    content_hash: str
+
+    def __post_init__(self) -> None:
+        if self.outcome not in {"inserted", "updated", "unchanged", "stale"}:
+            raise ValueError("入库结果状态不合法。")
+        if not isinstance(self.content_hash, str):
+            raise ValueError("入库结果哈希不合法。")
+
+
 @runtime_checkable
 class SearchBackend(Protocol):
     """所有检索后端必须实现的统一接口。

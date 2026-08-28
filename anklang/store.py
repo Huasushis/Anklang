@@ -9,6 +9,7 @@ import os
 import sqlite3
 import threading
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Literal
 
 from .metadata import MetadataContractError, parse_canonical_metadata, to_canonical_json
@@ -68,6 +69,26 @@ class IndexInspection:
 
 
 AddProblemOutcome = Literal["inserted", "updated", "unchanged", "stale"]
+
+
+def compare_updated_at(first: str | None, second: str | None) -> int:
+    """按 UTC 时刻比较版本时间，兼容不同合法小数精度的表示。"""
+
+    if first == second:
+        return 0
+    if first is None:
+        return -1
+    if second is None:
+        return 1
+    try:
+        first_time = datetime.fromisoformat(first[:-1] + "+00:00")
+        second_time = datetime.fromisoformat(second[:-1] + "+00:00")
+    except (TypeError, ValueError):
+        # 旧数据库中的非规范值只能使用原有字典序，不能让比较本身泄漏异常。
+        return -1 if first < second else 1
+    if first_time < second_time:
+        return -1
+    return 1
 
 
 _SCHEMA = """
@@ -334,17 +355,20 @@ class ProblemStore:
                     and existing["content_hash"] == problem.content_hash
                     and existing_metadata == problem.metadata
                 )
+                timestamp_comparison = compare_updated_at(
+                    new_timestamp, old_timestamp
+                )
                 if old_timestamp is not None and (
                     new_timestamp is None
-                    or new_timestamp < old_timestamp
-                    or (new_timestamp == old_timestamp and not same_payload)
+                    or timestamp_comparison < 0
+                    or (timestamp_comparison == 0 and not same_payload)
                 ):
                     self._conn.rollback()
                     return "stale"
                 if old_timestamp is None and new_timestamp is None and not same_payload:
                     self._conn.rollback()
                     return "stale"
-                if same_payload and old_timestamp == new_timestamp and (
+                if same_payload and timestamp_comparison == 0 and (
                     blob is None or existing["embedding"] == blob
                 ):
                     self._conn.rollback()

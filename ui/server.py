@@ -19,7 +19,12 @@ import time
 from collections.abc import Sequence
 from typing import Any
 
-from anklang.backends import BackendError, BackendSearchResult, SearchBackend
+from anklang.backends import (
+    BackendError,
+    BackendSearchResult,
+    BackendUpsertResult,
+    SearchBackend,
+)
 from anklang.config import AppConfig
 from anklang.embedding import EmbeddingClient, EmbeddingError
 from anklang.http_api import (
@@ -28,7 +33,8 @@ from anklang.http_api import (
     ServiceRuntime,
     make_handler,
 )
-from anklang.ingest import ingest_once
+from anklang.ingest import UpsertUnavailable, ingest_once, upsert_one_problem
+from anklang.sources import RawProblem
 from anklang.store import EmbeddingIndexSpec, IndexMetadataError, ProblemStore, StoredProblem
 from anklang.vectormath import cosine_similarity
 
@@ -144,6 +150,46 @@ class UpstreamSearchBackend(SearchBackend):
                 retryable=False,
             )
         return BackendSearchResult(candidates)
+
+    def upsert_problem(
+        self,
+        external_id: str,
+        title: str,
+        basic_statement: str,
+        updated_at: str,
+    ) -> BackendUpsertResult:
+        """把固定来源 ``urmotiv`` 的一道题写入同一 SQLite/向量路径。"""
+
+        if self.embedder is None:
+            raise BackendError(
+                reason_code="service_unavailable",
+                retryable=False,
+            )
+        try:
+            result = upsert_one_problem(
+                self.store,
+                self.embedder,
+                RawProblem(
+                    external_id=external_id,
+                    title=title,
+                    statement=basic_statement,
+                    updated_at=updated_at,
+                ),
+                source="urmotiv",
+            )
+        except UpsertUnavailable as error:
+            raise BackendError(
+                reason_code="service_unavailable",
+                retryable=True,
+            ) from error
+        except Exception as error:
+            # 只向 HTTP 层传播固定类别，避免数据库/提供方细节越过边界。
+            raise BackendError(
+                reason_code="service_unavailable",
+                retryable=True,
+            ) from error
+        return BackendUpsertResult(result.outcome, result.content_hash)
+
 
     def describe_health(self) -> dict[str, Any]:
         try:

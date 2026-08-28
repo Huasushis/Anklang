@@ -9,7 +9,7 @@ import sys
 from dataclasses import dataclass, field
 
 from .config import ConfigError, load_config
-from .embedding import EmbeddingClient, EmbeddingError
+from .embedding import EmbeddingClient
 from .sources import (
     RawProblem,
     SourceContractError,
@@ -17,9 +17,18 @@ from .sources import (
     is_valid_source_updated_at,
     validate_raw_problem,
 )
-from .store import EmbeddingIndexSpec, IndexMetadataError, ProblemStore, StoredProblem
+from .store import (
+    AddProblemOutcome,
+    EmbeddingIndexSpec,
+    IndexMetadataError,
+    ProblemStore,
+    StoredProblem,
+    compare_updated_at,
+)
 from .text_normalize import content_hash_of, normalize_statement
 from .vectormath import validate_embedding
+
+
 
 
 @dataclass
@@ -38,6 +47,72 @@ class IngestSummary:
     def fetched(self) -> int:
         return sum(self.per_source_fetched.values())
 
+
+
+class UpsertUnavailable(RuntimeError):
+    """单题入库缺少可用 embedding 或索引。"""
+
+
+@dataclass(frozen=True)
+class UpsertResult:
+    outcome: AddProblemOutcome
+    content_hash: str
+
+
+def upsert_one_problem(
+    store: ProblemStore,
+    embedder: EmbeddingClient | None,
+    raw: RawProblem,
+    *,
+    source: str,
+    index_spec: EmbeddingIndexSpec | None = None,
+) -> UpsertResult:
+    """规范化、向量化并原子写入一道题，供来源抓取和 HTTP 适配器共用。"""
+
+    if embedder is None:
+        raise UpsertUnavailable("embedding 未配置。")
+    if index_spec is None:
+        try:
+            index_spec = EmbeddingIndexSpec(
+                model=embedder.model,
+                dimensions=embedder.dimensions,
+            )
+            store.prepare_embedding_writes(index_spec)
+        except Exception as error:
+            raise UpsertUnavailable("向量索引不可用。") from error
+
+    statement = normalize_statement(raw.statement)
+    if not statement:
+        raise UpsertUnavailable("规范化后的题面为空。")
+    content_hash = content_hash_of(statement)
+    existing = store.get_problem(source, raw.external_id)
+    embedding: list[float] | None = None
+    if _needs_embedding(existing, raw, content_hash):
+        try:
+            embedding = embedder.embed_one(statement)
+            assert index_spec is not None
+            embedding = validate_embedding(
+                embedding,
+                expected_dimensions=index_spec.dimensions,
+            )
+        except Exception as error:
+            # Embedding 客户端已经隐藏了提供方细节；这里继续只抛固定类别。
+            raise UpsertUnavailable("题目向量化不可用。") from error
+    write_result = store.add_problem(
+        StoredProblem(
+            source=source,
+            external_id=raw.external_id,
+            title=raw.title,
+            url=raw.url,
+            statement=statement,
+            embedding=embedding,
+            content_hash=content_hash,
+            source_updated_at=raw.updated_at,
+            metadata=raw.metadata,
+        ),
+        index_spec=index_spec if embedding is not None else None,
+    )
+    return UpsertResult(write_result, content_hash)
 
 def ingest_once(store: ProblemStore, embedder: EmbeddingClient | None) -> IngestSummary:
     """跑一轮全部源插件的抓取入库，返回统计结果。可以反复调用，调用间隔由调用方
@@ -86,40 +161,23 @@ def ingest_once(store: ProblemStore, embedder: EmbeddingClient | None) -> Ingest
                 latest_updated_at = raw.updated_at
 
         for raw in selected:
-            statement = normalize_statement(raw.statement)
-            content_hash = content_hash_of(statement)
-            existing = store.get_problem(source_name, raw.external_id)
-            embedding: list[float] | None = None
             if embedder is None:
                 summary.embedding_failures += 1
                 may_advance_cursor = False
                 continue
-            if _needs_embedding(existing, raw, content_hash):
-                try:
-                    embedding = embedder.embed_one(statement)
-                    assert index_spec is not None
-                    embedding = validate_embedding(
-                        embedding,
-                        expected_dimensions=index_spec.dimensions,
-                    )
-                except (EmbeddingError, ValueError):
-                    summary.embedding_failures += 1
-                    may_advance_cursor = False
-                    continue
-            write_result = store.add_problem(
-                StoredProblem(
+            try:
+                upsert_result = upsert_one_problem(
+                    store,
+                    embedder,
+                    raw,
                     source=source_name,
-                    external_id=raw.external_id,
-                    title=raw.title,
-                    url=raw.url,
-                    statement=statement,
-                    embedding=embedding,
-                    content_hash=content_hash,
-                    source_updated_at=raw.updated_at,
-                    metadata=raw.metadata,
-                ),
-                index_spec=index_spec if embedding is not None else None,
-            )
+                    index_spec=index_spec,
+                )
+            except UpsertUnavailable:
+                summary.embedding_failures += 1
+                may_advance_cursor = False
+                continue
+            write_result = upsert_result.outcome
             if write_result == "inserted":
                 summary.inserted += 1
             elif write_result == "updated":
@@ -205,7 +263,7 @@ def _source_fields_can_be_updated(
     return (
         raw.updated_at is not None
         and existing.source_updated_at is not None
-        and raw.updated_at > existing.source_updated_at
+        and compare_updated_at(raw.updated_at, existing.source_updated_at) > 0
     )
 
 
