@@ -22,11 +22,13 @@ from .backends import (
 from .config import AppConfig
 from .contracts import (
     ContractError,
+    build_search_source_status,
     build_result,
     build_provider_status,
     build_upsert_result,
     build_v2_result,
     parse_provider_config,
+    parse_search_source_config,
     parse_request,
     parse_upsert_request,
     utc_now_z,
@@ -34,13 +36,18 @@ from .contracts import (
     validate_upsert_result,
     validate_v2_result,
 )
+from .embedding import EmbeddingClient
 from .provider import ProviderConfig
-from .store import EmbeddingIndexSpec, IndexMetadataError, ProblemStore
+from .search_sources import SearchSourceConfig
+from .store import ProblemStore
 
 _MAX_REQUEST_BYTES = 4_000_000
 _V1_SIMILARITY_PATH = "/api/v1/checks/similarity"
 _V2_SIMILARITY_PATH = "/api/v2/checks/similarity"
 _ADMIN_PROVIDER_PATH = "/api/v1/admin/embedding-provider"
+_ADMIN_PROVIDER_TEST_PATH = "/api/v1/admin/embedding-provider/test"
+_ADMIN_SEARCH_SOURCES_PATH = "/api/v1/admin/search-sources"
+_ADMIN_SEARCH_SOURCES_TEST_PATH = "/api/v1/admin/search-sources/test"
 
 
 _UPSERT_PATH = "/api/v1/index/problems"
@@ -234,11 +241,16 @@ class AnklangService:
         if self.provider is None:
             raise BackendError(reason_code="service_unavailable", retryable=False)
         configured, base_url, model, dimension = self.provider.status()
+        rebuild_status = getattr(self.backend, "embedding_rebuild_status", None)
+        rebuild = rebuild_status() if callable(rebuild_status) else None
+        if rebuild == {"state": "idle", "processed": 0, "total": 0}:
+            rebuild = None
         return build_provider_status(
             configured=configured,
             base_url=base_url,
             model=model,
             dimension=dimension,
+            rebuild=rebuild,
         )
 
     def provider_configure(self, request: dict[str, Any]) -> dict[str, Any]:
@@ -246,32 +258,90 @@ class AnklangService:
 
         if self.provider is None:
             raise BackendError(reason_code="service_unavailable", retryable=False)
-        store = getattr(self.backend, "store", None)
-        if store is not None:
-            try:
-                store.prepare_embedding_writes(
-                    EmbeddingIndexSpec(request["model"], request["dimension"])
-                )
-            except IndexMetadataError:
-                # 模型或维度与已有索引身份冲突时不覆盖旧向量；冲突会沿既有
-                # 索引安全机制在查询/入库时表现为明确的不可用。
-                pass
         config = ProviderConfig(
             base_url=request["base_url"],
             api_key=request["api_key"],
             model=request["model"],
             dimension=request["dimension"],
         )
-        self.provider.configure(config)
+        configure = getattr(self.backend, "configure_provider", None)
+        if callable(configure):
+            configure(config)
+        else:
+            self.provider.configure(config)
         return self.provider_status()
+
+    def provider_test(self, request: dict[str, Any]) -> dict[str, Any]:
+        """Call the draft OpenAI-compatible embedding configuration without saving it."""
+
+        client = EmbeddingClient(
+            base_url=request["base_url"],
+            api_key=request["api_key"],
+            model=request["model"],
+            dimensions=request["dimension"],
+        )
+        client.embed_one("Anklang embedding connection test")
+        return {
+            "ok": True,
+            "protocol": "openai",
+            "model": request["model"],
+            "dimension": request["dimension"],
+        }
+
+    def search_source_status(self) -> dict[str, Any]:
+        registry = getattr(self.backend, "sources", None)
+        if registry is None:
+            raise BackendError(reason_code="service_unavailable", retryable=False)
+        config, _client = registry.snapshot()
+        return build_search_source_status(
+            mode=config.mode,
+            yuantiji_base_url=config.yuantiji_base_url,
+            yuantiji_rerank=config.yuantiji_rerank,
+        )
+
+    def search_source_configure(self, request: dict[str, Any]) -> dict[str, Any]:
+        configure = getattr(self.backend, "configure_search_sources", None)
+        if not callable(configure):
+            raise BackendError(reason_code="service_unavailable", retryable=False)
+        configure(
+            SearchSourceConfig(
+                mode=request["mode"],
+                yuantiji_base_url=request["yuantiji_base_url"],
+                yuantiji_rerank=request["yuantiji_rerank"],
+            )
+        )
+        return self.search_source_status()
+
+    def search_source_test(self, request: dict[str, Any]) -> dict[str, Any]:
+        test = getattr(self.backend, "test_search_sources", None)
+        if not callable(test):
+            raise BackendError(reason_code="service_unavailable", retryable=False)
+        return test(
+            SearchSourceConfig(
+                mode=request["mode"],
+                yuantiji_base_url=request["yuantiji_base_url"],
+                yuantiji_rerank=request["yuantiji_rerank"],
+            )
+        )
 
     def provider_clear(self) -> dict[str, Any]:
         """同步清空当前提供方；返回后任何新的 embedding 调用都拿不到被清除的密钥。"""
 
         if self.provider is None:
             raise BackendError(reason_code="service_unavailable", retryable=False)
-        self.provider.clear()
-        return build_provider_status(configured=False)
+        clear = getattr(self.backend, "clear_provider", None)
+        if callable(clear):
+            clear()
+        else:
+            self.provider.clear()
+        rebuild_status = getattr(self.backend, "embedding_rebuild_status", None)
+        rebuild = rebuild_status() if callable(rebuild_status) else None
+        if rebuild == {"state": "idle", "processed": 0, "total": 0}:
+            rebuild = None
+        return build_provider_status(
+            configured=False,
+            rebuild=rebuild,
+        )
 
     @staticmethod
     def _build_unavailable_result(
@@ -371,6 +441,8 @@ def make_handler(
                 self._handle_health()
             elif self.path == _ADMIN_PROVIDER_PATH:
                 self._handle_admin_provider_get()
+            elif self.path == _ADMIN_SEARCH_SOURCES_PATH:
+                self._handle_admin_search_sources_get()
             elif self.path in {
                 _V1_SIMILARITY_PATH,
                 _V2_SIMILARITY_PATH,
@@ -392,6 +464,9 @@ def make_handler(
                 return
             if self.path == _ADMIN_PROVIDER_PATH:
                 self._handle_admin_provider_put()
+                return
+            if self.path == _ADMIN_SEARCH_SOURCES_PATH:
+                self._handle_admin_search_sources_put()
                 return
             self._handle_unsupported_method()
 
@@ -458,12 +533,22 @@ def make_handler(
             )
 
         def do_POST(self) -> None:  # noqa: N802
+            if self.path == _ADMIN_PROVIDER_TEST_PATH:
+                self._handle_admin_provider_test()
+                return
+            if self.path == _ADMIN_SEARCH_SOURCES_TEST_PATH:
+                self._handle_admin_search_sources_test()
+                return
             api_version = {
                 _V1_SIMILARITY_PATH: "1",
                 _V2_SIMILARITY_PATH: "2",
             }.get(self.path)
             if api_version is None:
-                if self.path in {_UPSERT_PATH, _ADMIN_PROVIDER_PATH}:
+                if self.path in {
+                    _UPSERT_PATH,
+                    _ADMIN_PROVIDER_PATH,
+                    _ADMIN_SEARCH_SOURCES_PATH,
+                }:
                     self._handle_unsupported_method()
                 else:
                     self._send(
@@ -627,6 +712,9 @@ def make_handler(
                 _V2_SIMILARITY_PATH,
                 _UPSERT_PATH,
                 _ADMIN_PROVIDER_PATH,
+                _ADMIN_PROVIDER_TEST_PATH,
+                _ADMIN_SEARCH_SOURCES_PATH,
+                _ADMIN_SEARCH_SOURCES_TEST_PATH,
             }:
                 self._send(
                     405,
@@ -788,6 +876,104 @@ def make_handler(
                 )
                 return
             self._send(200, response)
+
+        def _handle_admin_provider_test(self) -> None:
+            payload = self._read_authorized_admin_json()
+            if payload is None:
+                return
+            try:
+                request = parse_provider_config(payload)
+                response = service.provider_test(request)
+            except ContractError:
+                self._send(
+                    400,
+                    {"error": {"code": "INVALID_REQUEST", "message": "请求不符合接口契约。"}},
+                )
+                return
+            except Exception:
+                self._send(
+                    503,
+                    {"error": {"code": "PROVIDER_TEST_FAILED", "message": "无法通过嵌入接口测试。"}},
+                )
+                return
+            self._send(200, response)
+
+        def _handle_admin_search_sources_get(self) -> None:
+            if not self._authorized_admin():
+                self._send(
+                    401,
+                    {"error": {"code": "UNAUTHENTICATED", "message": "缺少或无效的令牌。"}},
+                )
+                return
+            try:
+                response = service.search_source_status()
+            except Exception:
+                self._send(
+                    503,
+                    {"error": {"code": "SEARCH_SOURCE_UNAVAILABLE", "message": "检索来源配置暂时不可用。"}},
+                )
+                return
+            self._send(200, response)
+
+        def _handle_admin_search_sources_put(self) -> None:
+            payload = self._read_authorized_admin_json()
+            if payload is None:
+                return
+            try:
+                request = parse_search_source_config(payload)
+                response = service.search_source_configure(request)
+            except ContractError:
+                self._send(
+                    400,
+                    {"error": {"code": "INVALID_REQUEST", "message": "请求不符合接口契约。"}},
+                )
+                return
+            except Exception:
+                self._send(
+                    503,
+                    {"error": {"code": "SEARCH_SOURCE_UNAVAILABLE", "message": "检索来源配置暂时不可用。"}},
+                )
+                return
+            self._send(200, response)
+
+        def _handle_admin_search_sources_test(self) -> None:
+            payload = self._read_authorized_admin_json()
+            if payload is None:
+                return
+            try:
+                request = parse_search_source_config(payload)
+                response = service.search_source_test(request)
+            except ContractError:
+                self._send(
+                    400,
+                    {"error": {"code": "INVALID_REQUEST", "message": "请求不符合接口契约。"}},
+                )
+                return
+            except Exception:
+                self._send(
+                    503,
+                    {"error": {"code": "SEARCH_SOURCE_TEST_FAILED", "message": "无法通过检索来源测试。"}},
+                )
+                return
+            self._send(200 if response.get("ok") is True else 503, response)
+
+        def _read_authorized_admin_json(self) -> Any | None:
+            if not self._authorized_admin():
+                self._send(
+                    401,
+                    {"error": {"code": "UNAUTHENTICATED", "message": "缺少或无效的令牌。"}},
+                )
+                return None
+            content_type = (
+                self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+            )
+            if content_type != "application/json":
+                self._send(
+                    415,
+                    {"error": {"code": "UNSUPPORTED_MEDIA_TYPE", "message": "请求内容类型不受支持。"}},
+                )
+                return None
+            return self._read_json()
 
         def _authorized(self) -> bool:
             expected = service.config.service_token

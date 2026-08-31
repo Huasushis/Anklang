@@ -71,6 +71,8 @@ _UPSERT_OUTCOMES = {"inserted", "updated", "unchanged"}
 _PROVIDER_KEYS = {"baseUrl", "apiKey", "model", "dimension"}
 _PROVIDER_STATUS_KEYS_CONFIGURED = {"configured", "baseUrl", "model", "dimension"}
 _PROVIDER_STATUS_KEYS_UNCONFIGURED = {"configured"}
+_SEARCH_SOURCE_CONFIG_KEYS = {"mode", "yuantijiBaseUrl", "yuantijiRerank"}
+_SEARCH_SOURCE_MODES = {"yuantiji", "local", "hybrid"}
 _V2_RESULT_KEYS = {
     "apiVersion",
     "contentHash",
@@ -187,12 +189,22 @@ def parse_provider_config(payload: Any) -> dict[str, Any]:
 
     if not isinstance(payload, dict):
         raise ContractError("请求正文必须是 JSON 对象。")
-    _require_exact_keys(payload, _PROVIDER_KEYS, "请求正文")
+    allowed_keys = set(_PROVIDER_KEYS)
+    if "protocol" in payload:
+        allowed_keys.add("protocol")
+    _require_exact_keys(payload, allowed_keys, "请求正文")
+
+    if payload.get("protocol", "openai") != "openai":
+        raise ContractError('protocol 必须是字符串 "openai"。')
 
     base_url_value = payload.get("baseUrl")
-    if not isinstance(base_url_value, str) or _parse_safe_http_url(_js_trim(base_url_value)) is None:
+    base_url = (
+        _embedding_base_url(_js_trim(base_url_value))
+        if isinstance(base_url_value, str)
+        else None
+    )
+    if base_url is None:
         raise ContractError("baseUrl 不合法。")
-    base_url = _js_trim(base_url_value)
     api_key = _normalize_required_input(payload.get("apiKey"), 4096, "apiKey")
     model = _normalize_required_input(payload.get("model"), 200, "model")
     dimension = payload.get("dimension")
@@ -203,6 +215,7 @@ def parse_provider_config(payload: Any) -> dict[str, Any]:
     ):
         raise ContractError("dimension 不合法。")
     return {
+        "protocol": "openai",
         "base_url": base_url,
         "api_key": api_key,
         "model": model,
@@ -216,6 +229,7 @@ def build_provider_status(
     base_url: str | None = None,
     model: str | None = None,
     dimension: int | None = None,
+    rebuild: Any | None = None,
 ) -> dict[str, Any]:
     """构造管理接口的提供方状态响应；只暴露非机密字段，绝不包含密钥。"""
 
@@ -238,6 +252,8 @@ def build_provider_status(
         }
     else:
         result = {"configured": False}
+    if rebuild is not None:
+        result["rebuild"] = _normalize_rebuild_status(rebuild)
     _validate_response_size(result)
     return result
 
@@ -250,24 +266,120 @@ def validate_provider_status(payload: Any) -> dict[str, Any]:
     configured = payload.get("configured")
     if configured is True:
         _require_exact_keys(
-            payload, _PROVIDER_STATUS_KEYS_CONFIGURED, "提供方状态响应"
+            payload,
+            _PROVIDER_STATUS_KEYS_CONFIGURED
+            | ({"rebuild"} if "rebuild" in payload else set()),
+            "提供方状态响应",
         )
         normalized = build_provider_status(
             configured=True,
             base_url=cast(str, payload.get("baseUrl")),
             model=cast(str, payload.get("model")),
             dimension=cast(int, payload.get("dimension")),
+            rebuild=payload.get("rebuild"),
         )
     elif configured is False:
         _require_exact_keys(
-            payload, _PROVIDER_STATUS_KEYS_UNCONFIGURED, "提供方状态响应"
+            payload,
+            _PROVIDER_STATUS_KEYS_UNCONFIGURED
+            | ({"rebuild"} if "rebuild" in payload else set()),
+            "提供方状态响应",
         )
-        normalized = build_provider_status(configured=False)
+        normalized = build_provider_status(
+            configured=False,
+            rebuild=payload.get("rebuild"),
+        )
     else:
         raise ContractError("提供方状态的 configured 不合法。")
     if normalized != payload:
         raise ContractError("提供方状态响应包含非规范字段或值。")
     return normalized
+
+
+def _normalize_rebuild_status(payload: Any) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        raise ContractError("向量重建状态必须是对象。")
+    allowed = {"state", "processed", "total", "reasonCode"}
+    if not set(payload).issubset(allowed) or not {"state", "processed", "total"}.issubset(payload):
+        raise ContractError("向量重建状态字段不完整。")
+    state = payload.get("state")
+    if state not in {"idle", "running", "failed"}:
+        raise ContractError("向量重建状态不合法。")
+    processed = payload.get("processed")
+    total = payload.get("total")
+    if (
+        isinstance(processed, bool)
+        or not isinstance(processed, int)
+        or processed < 0
+        or isinstance(total, bool)
+        or not isinstance(total, int)
+        or total < 0
+        or processed > total
+    ):
+        raise ContractError("向量重建进度不合法。")
+    result: dict[str, Any] = {
+        "state": state,
+        "processed": processed,
+        "total": total,
+    }
+    reason = payload.get("reasonCode")
+    if reason is not None:
+        if (
+            state != "failed"
+            or not isinstance(reason, str)
+            or not 1 <= len(reason) <= 80
+            or not re.fullmatch(r"[a-z0-9_]+", reason)
+        ):
+            raise ContractError("向量重建失败原因不合法。")
+        result["reasonCode"] = reason
+    return result
+
+
+def parse_search_source_config(payload: Any) -> dict[str, Any]:
+    """Parse the runtime selection of local and public search sources."""
+
+    if not isinstance(payload, dict):
+        raise ContractError("检索来源配置必须是 JSON 对象。")
+    _require_exact_keys(payload, _SEARCH_SOURCE_CONFIG_KEYS, "检索来源配置")
+    mode = payload.get("mode")
+    if mode not in _SEARCH_SOURCE_MODES:
+        raise ContractError("检索来源模式不合法。")
+    base_url_value = payload.get("yuantijiBaseUrl")
+    if not isinstance(base_url_value, str):
+        raise ContractError("yuantijiBaseUrl 不合法。")
+    base_url = _external_base_url(_js_trim(base_url_value))
+    if base_url is None:
+        raise ContractError("yuantijiBaseUrl 不合法。")
+    rerank = payload.get("yuantijiRerank")
+    if not isinstance(rerank, bool):
+        raise ContractError("yuantijiRerank 必须是布尔值。")
+    return {
+        "mode": mode,
+        "yuantiji_base_url": base_url,
+        "yuantiji_rerank": rerank,
+    }
+
+
+def build_search_source_status(
+    *,
+    mode: str,
+    yuantiji_base_url: str,
+    yuantiji_rerank: bool,
+) -> dict[str, Any]:
+    request = parse_search_source_config(
+        {
+            "mode": mode,
+            "yuantijiBaseUrl": yuantiji_base_url,
+            "yuantijiRerank": yuantiji_rerank,
+        }
+    )
+    result = {
+        "mode": request["mode"],
+        "yuantijiBaseUrl": request["yuantiji_base_url"],
+        "yuantijiRerank": request["yuantiji_rerank"],
+    }
+    _validate_response_size(result)
+    return result
 
 
 def build_upsert_result(
@@ -342,7 +454,11 @@ def build_result(
     normalized = _normalize_candidates(candidates)
     # v1 契约固定不携带元数据；即使后端返回了 metadata 也保持 v1 字段形状不变。
     normalized = [
-        {key: value for key, value in candidate.items() if key != "metadata"}
+        {
+            key: value
+            for key, value in candidate.items()
+            if key not in {"metadata", "statement", "statementTruncated"}
+        }
         for candidate in normalized
     ]
     normalized_checked_at = checked_at or _utc_now_z()
@@ -443,6 +559,19 @@ def _normalize_candidates(candidates: list[dict[str, Any]]) -> list[dict[str, An
                 ) from None
             if metadata is not None:
                 item["metadata"] = metadata
+        raw_statement = candidate.get("statement")
+        if raw_statement is not None:
+            if not isinstance(raw_statement, str) or not raw_statement.strip():
+                raise ContractError("candidate.statement 不合法。")
+            statement = _truncate_utf16(raw_statement.strip(), 32_000)
+            if statement != raw_statement.strip():
+                raise ContractError("candidate.statement 超出长度限制。")
+            item["statement"] = statement
+        raw_truncated = candidate.get("statementTruncated")
+        if raw_truncated is not None:
+            if raw_truncated is not True or "statement" not in item:
+                raise ContractError("candidate.statementTruncated 不合法。")
+            item["statementTruncated"] = True
         normalized.append(item)
     return normalized
 
@@ -563,6 +692,41 @@ def _parse_safe_http_url(trimmed: str) -> str | None:
     ):
         return None
     return trimmed
+
+
+def _external_base_url(trimmed: str) -> str | None:
+    safe = _parse_safe_http_url(trimmed)
+    if safe is None:
+        return None
+    parsed = urlsplit(safe)
+    if parsed.path not in {"", "/"} or parsed.query or parsed.fragment:
+        return None
+    if parsed.scheme == "http" and parsed.hostname not in {"localhost", "127.0.0.1", "::1"}:
+        return None
+    return safe.rstrip("/")
+
+
+def _embedding_base_url(trimmed: str) -> str | None:
+    safe = _parse_safe_http_url(trimmed)
+    if safe is None:
+        return None
+    parsed = urlsplit(safe)
+    if parsed.query or parsed.fragment:
+        return None
+    if parsed.scheme == "http" and not _private_service_host(parsed.hostname or ""):
+        return None
+    return safe.rstrip("/")
+
+
+def _private_service_host(hostname: str) -> bool:
+    lowered = hostname.lower().rstrip(".")
+    if lowered in {"localhost", "host.docker.internal"}:
+        return True
+    try:
+        address = ipaddress.ip_address(lowered)
+    except ValueError:
+        return "." not in lowered and _safe_hostname(lowered)
+    return address.is_private or address.is_loopback or address.is_link_local
 
 
 def _safe_http_url(value: Any) -> str | None:

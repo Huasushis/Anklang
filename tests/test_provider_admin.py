@@ -234,6 +234,9 @@ class ProviderAdminLifecycleTests(unittest.TestCase):
             _provider_payload(extra=True),
             {"baseUrl": "https://x.invalid", "model": "m", "dimension": 2},
             _provider_payload(baseUrl="ftp://x.invalid"),
+            _provider_payload(baseUrl="http://public.example.invalid/v1"),
+            _provider_payload(baseUrl="https://x.invalid/v1?tenant=unsafe"),
+            _provider_payload(protocol="other"),
             _provider_payload(apiKey=""),
             _provider_payload(dimension=0),
             _provider_payload(dimension=True),
@@ -252,6 +255,30 @@ class ProviderAdminLifecycleTests(unittest.TestCase):
         self.assertEqual(status, 415)
         status, _ = harness.request("POST", _ADMIN_PATH, _provider_payload())
         self.assertEqual(status, 405)
+
+    def test_openai_protocol_and_trailing_slash_are_normalized(self) -> None:
+        harness = _Harness()
+        self.addCleanup(harness.close)
+
+        status, raw = harness.request(
+            "PUT",
+            _ADMIN_PATH,
+            _provider_payload(
+                protocol="openai",
+                baseUrl="https://provider.example.invalid/compatible-mode/v1/",
+            ),
+        )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            json.loads(raw),
+            {
+                "configured": True,
+                "baseUrl": "https://provider.example.invalid/compatible-mode/v1",
+                "model": "replacement-model",
+                "dimension": 2,
+            },
+        )
 
 
 class ProviderRedactionTests(unittest.TestCase):
@@ -284,6 +311,7 @@ class ProviderEnvironmentSafetyTests(unittest.TestCase):
         "DASHSCOPE_API_KEY": "synthetic-env-key",
         "DASHSCOPE_EMBEDDING_MODEL": "replacement-model",
         "DASHSCOPE_EMBEDDING_DIM": "2",
+        "ANKLANG_SEARCH_MODE": "local",
     }
 
     def test_dashscope_env_never_activates_provider(self) -> None:

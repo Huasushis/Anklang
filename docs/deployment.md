@@ -6,7 +6,7 @@ Anklang 是独立的题面相似检索服务。它有自己的 SQLite（Python �
 
 - 本机运行：Python 3.11。
 - 容器运行：Docker Engine 与 Docker Compose v2。
-- 生产 embedding（把文字转换成数字向量）：一个可访问的阿里云百炼 OpenAI 兼容 embedding 接口，以及由部署平台注入的 API 密钥。
+- 生产检索默认使用 yuantiji 公共来源；若选择 `local`/`hybrid`，还需要一个可访问的 OpenAI 兼容 embedding 接口，以及由部署平台交付的 API 密钥。
 - 生产鉴权：至少 16 个字符的 `ANKLANG_SERVICE_TOKEN`。令牌只应由部署平台注入，不应写入仓库、镜像、终端历史或诊断输出。
 
 Anklang 只使用 Python 标准库，不需要安装 SDK。程序不会自动读取 `.env` 文件；请把 [`.env.example`](../.env.example) 中的字段交给进程管理器或部署平台注入。
@@ -18,12 +18,15 @@ Compose 要求 `compose.yaml` 声明的 `env_file` 在启动前已经存在。�
 ```text
 ANKLANG_SERVICE_TOKEN=<至少16个字符的随机值>
 ANKLANG_REQUIRE_SERVICE_TOKEN=true
+ANKLANG_SEARCH_MODE=yuantiji
+YUANTIJI_BASE_URL=https://yuantiji.ac
+YUANTIJI_RERANK=false
 ANKLANG_LOCAL_DB_PATH=problems-data/local-index.db
 ANKLANG_INGEST_ENABLED=false
 ANKLANG_INGEST_INTERVAL_SECONDS=3600
 ```
 
-embedding 提供方不通过环境变量配置（`DASHSCOPE_*` 等均被忽略）：进程启动时处于未配置状态，重启后回到未配置。向量能力由调用方在运行期通过管理接口供给（见下文「Embedding 提供方管理接口」）。提供方未配置或被清除时，健康路由仍可用，v2 查询明确返回 `completion.status=unavailable`；增量导入不会写入无向量题目，也不会推进来源游标。
+embedding 提供方不通过环境变量配置（`DASHSCOPE_*` 等均被忽略）：进程启动时处于未配置状态，重启后回到未配置。向量能力由调用方在运行期通过管理接口供给（见下文「Embedding 提供方管理接口」）。`yuantiji` 模式不需要它；local/hybrid 模式下提供方未配置或被清除时，健康路由仍可用，v2 查询明确返回 `completion.status=unavailable`；增量导入不会写入无向量题目，也不会推进来源游标。更换提供方会显示 `rebuild` 进度并原子切换。
 
 Compose 会覆盖下列容器内设置：
 
@@ -121,7 +124,7 @@ v2 在服务成功形成结构化结果时返回 HTTP 200；通过 `completion` 
 - `partial`：仍有可用候选，但部分检索信号失败；调用方按 `retryable` 决定是否重试；
 - `unavailable`：不能形成可信结果，`candidates` 必须为空。
 
-候选只允许 `source`、`externalId`、`title`、`similarity` 和可选 `url`；v2 可额外带有来源适配器的有界标量 `metadata`。Anklang 不返回题面摘录、复核结论、审核建议、通过/拦截字段或工作流状态。所有响应均带 `Cache-Control: no-store`。
+候选只允许 `source`、`externalId`、`title`、`similarity` 和可选 `url`；v2 可额外带有来源适配器的有界标量 `metadata`、`statement` 和 `statementTruncated`，供受信任的 Urmotiv 界面展开。Anklang 不返回复核结论、审核建议、通过/拦截字段或工作流状态。所有响应均带 `Cache-Control: no-store`。
 
 若需要检查兼容行为，可改用：
 
@@ -133,15 +136,28 @@ v1 只在完整检索时返回 HTTP 200；部分或不可用会返回 HTTP 503 �
 
 ## Embedding 提供方管理接口
 
-提供方只存在于进程内存，由三个管理路由在运行期供给；所有管理请求都必须带已有的 Bearer 服务令牌，未配置令牌时一律失败关闭。
+提供方只存在于进程内存，由四个管理路由在运行期供给；所有管理请求都必须带已有的 Bearer 服务令牌，未配置令牌时一律失败关闭。
 
 ```text
 GET    /api/v1/admin/embedding-provider
 PUT    /api/v1/admin/embedding-provider
 DELETE /api/v1/admin/embedding-provider
+POST   /api/v1/admin/embedding-provider/test
 ```
 
-`PUT` 正文只允许 `baseUrl`、`apiKey`、`model`、`dimension`（`Content-Type: application/json`）。成功响应严格为 `{"configured": true, "baseUrl", "model", "dimension"}`，未配置时为 `{"configured": false}`；任何响应都不包含 `apiKey` 或异常原文。`DELETE` 会等待已在途的向量化操作结束后才返回，清空后查询与入库明确不可用。完整字段约束见 [`README.md`](../README.md) 的「Embedding 提供方管理契约」。
+`PUT` 正文只允许 `protocol`（固定 `openai`）、`baseUrl`、`apiKey`、`model`、`dimension`（`Content-Type: application/json`）。地址是 OpenAI 兼容 API 根地址，服务请求 `POST {baseUrl}/embeddings`。成功响应严格为 `{"configured": true, "baseUrl", "model", "dimension"}`，未配置时为 `{"configured": false}`；任何响应都不包含 `apiKey` 或异常原文。`POST /api/v1/admin/embedding-provider/test` 使用固定合成文本测试草稿配置且不保存。更换模型、维度或地址时，服务在临时表中分批重建全部本地向量并原子切换；`GET`/`PUT` 的可选 `rebuild` 字段显示进度。`DELETE` 会阻止新调用并等待已在途向量化及重建批次结束后才返回。完整字段约束见 [`README.md`](../README.md) 的「Embedding 提供方管理契约」。
+
+## 检索来源管理接口
+
+所有请求使用同一个 Anklang 服务令牌：
+
+```text
+GET  /api/v1/admin/search-sources
+PUT  /api/v1/admin/search-sources
+POST /api/v1/admin/search-sources/test
+```
+
+`PUT` 选择 `yuantiji`、`local` 或 `hybrid`，并设置 yuantiji HTTPS 根地址与可选重排。`POST .../test` 先检查公共服务健康状态，再发送一段固定合成题面验证实际搜索契约；它不会读取或发送题库题面，也不会保存草稿配置。普通存活、就绪和健康探针不会主动访问 yuantiji。
 
 ## Urmotiv 单题增量入库
 

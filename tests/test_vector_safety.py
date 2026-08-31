@@ -36,8 +36,9 @@ class _Opener:
         self._payload = payload
         self.calls = 0
 
-    def __call__(self, _request: Any, timeout: float) -> _Response:  # noqa: ARG002
+    def __call__(self, request: Any, timeout: float) -> _Response:  # noqa: ARG002
         self.calls += 1
+        self.last_url = str(request.full_url)
         return _Response(self._payload)
 
 
@@ -83,8 +84,27 @@ def _embedding_client(payload: Any, *, dimensions: int = 2) -> EmbeddingClient:
     )
 
 
-
 class EmbeddingResponseSafetyTests(unittest.TestCase):
+    def test_trailing_slash_is_removed_before_appending_embeddings_path(self) -> None:
+        opener = _Opener({
+            "model": "test-model",
+            "data": [{"embedding": [1.0, 0.0]}],
+        })
+        client = EmbeddingClient(
+            base_url="https://embedding.test/compatible-mode/v1/",
+            api_key="test-key",
+            model="test-model",
+            dimensions=2,
+            opener=opener,
+        )
+
+        client.embed_one("synthetic input")
+
+        self.assertEqual(
+            opener.last_url,
+            "https://embedding.test/compatible-mode/v1/embeddings",
+        )
+
     def test_rejects_invalid_configured_dimensions(self) -> None:
         for dimensions in (True, 0, -1, 1.5):
             with self.subTest(dimensions=dimensions):
@@ -154,9 +174,9 @@ class EmbeddingResponseSafetyTests(unittest.TestCase):
         self.assertIn(
             str(caught.exception),
             {
-                "百炼 embedding 响应不是有效 JSON。",
-                "百炼 embedding 响应条数与请求不一致。",
-                "百炼 embedding 响应没有确认请求的模型。",
+                "embedding 响应不是有效 JSON。",
+                "embedding 响应条数与请求不一致。",
+                "embedding 响应没有确认请求的模型。",
             },
         )
         self.assertNotIn(marker, str(caught.exception))

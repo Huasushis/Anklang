@@ -15,6 +15,7 @@ from anklang.http_api import AnklangService, make_handler
 from anklang.provider import ProviderRegistry
 from anklang.store import EmbeddingIndexSpec, ProblemStore, StoredProblem
 from ui.server import UpstreamSearchBackend, build_backend
+from anklang.search_sources import ConfiguredSearchBackend
 
 
 def _config(**overrides: Any) -> AppConfig:
@@ -107,7 +108,8 @@ class BackendAssemblyTests(unittest.TestCase):
     def test_build_backend_uses_preserved_upstream_entrypoint(self) -> None:
         backend = build_backend(_config())
         self.addCleanup(backend.close)
-        self.assertIsInstance(backend, UpstreamSearchBackend)
+        self.assertIsInstance(backend, ConfiguredSearchBackend)
+        self.assertIsInstance(backend.local, UpstreamSearchBackend)
         self.assertIsInstance(backend.provider, ProviderRegistry)
         self.assertFalse(backend.provider.status()[0])
         self.assertEqual(backend.describe_health()["backend"], "upstream-v2")

@@ -36,8 +36,9 @@ Anklang 是独立进程、独立 SQLite 索引和独立凭据边界：
 - Anklang 不连接 Urmotiv 的数据库，也不读取 Fermata 的数据库或运行时进程。
 - Urmotiv 可以通过版本化 HTTP 接口查询 Anklang；若要把 Urmotiv 新题实时写入索引，集成方必须另行提供经过授权的适配器。
 - Fermata 只能从 Urmotiv 读取受信任的业务属性；Anklang 不保存这些属性，也不提供 Fermata 与 Anklang 的运行时互调。
-- Anklang **不提供 yuantiji relay（代理转发）**，不抓取或转发 yuantiji 请求。需要 relay 的部署必须在 Anklang 之外运行独立、获授权的 relay 或来源适配器，并自行承担其凭据、合规和故障边界。
-- Anklang 使用的是“本地索引 + 配置的 embedding 提供方”：题目行和向量落在本地 SQLite，向量生成仍调用运行期配置的 OpenAI 兼容 embedding HTTP 提供方。它不是 yuantiji relay，也不是本地 LLM 推理器。
+- Anklang 不提供代理转发或结果缓存；管理员可以在运行时选择 `yuantiji`、`local` 或 `hybrid`。
+  `yuantiji` 直接调用其公开搜索 API，只发送当前查询题面；`local`/`hybrid` 才把题目行和向量落在本地 SQLite，并调用运行期配置的 OpenAI 兼容 embedding HTTP 提供方。
+  三种来源彼此独立，Anklang 仍不执行 LLM 复核或业务裁决。
 
 上游作者的 MIT 版权声明保留在 [`LICENSE`](LICENSE)。实现边界和维护不变量见 [`docs/plan.md`](docs/plan.md)。
 
@@ -47,7 +48,7 @@ Anklang 是独立进程、独立 SQLite 索引和独立凭据边界：
 - Python 3.11 或更高版本；运行时只使用 Python 标准库。
 - 本机运行需要可写的 SQLite 数据目录；容器运行需要 Docker Engine 与 Docker Compose v2。
 - 生产环境需要一个至少 16 个字符的 `ANKLANG_SERVICE_TOKEN`，并将 `ANKLANG_REQUIRE_SERVICE_TOKEN` 设为 `true`。
-- 查询前需要一个可访问的 OpenAI 兼容 embedding 提供方。Anklang 不在环境变量或镜像中保存提供方密钥，提供方由管理接口在运行期配置。
+- 选择 `local` 或 `hybrid` 时需要一个可访问的 OpenAI 兼容 embedding 提供方；选择 `yuantiji` 时不需要它。Anklang 不在环境变量或镜像中保存提供方密钥，提供方由管理接口在运行期配置。
 - 如果启用实时入库，还需要由集成方提供来源适配器和获授权的数据读取方式；仓库内的 `example_static` 仅是合成来源。
 
 配置字段和默认值见 [`.env.example`](.env.example)。程序不会自动读取 `.env` 文件；不要把令牌或提供方密钥写入仓库、镜像、命令历史或日志。
@@ -83,7 +84,7 @@ docker compose build
 PYTHONPATH=. python3 -m anklang
 ```
 
-默认监听 `127.0.0.1:8730`。设置 `ANKLANG_BIND_HOST` 和 `ANKLANG_PORT` 可改变监听地址和端口。没有配置 embedding 提供方时，进程仍可启动并提供存活/就绪/健康路由，但查询和入库会明确返回不可用。
+默认监听 `127.0.0.1:8730`。设置 `ANKLANG_BIND_HOST` 和 `ANKLANG_PORT` 可改变监听地址和端口。`yuantiji` 模式无需 embedding；`local`/`hybrid` 没有配置 embedding 提供方时，进程仍可启动并提供存活/就绪/健康路由，但涉及本地索引的查询和入库会明确返回不可用。
 
 ### Compose 启动
 
@@ -101,7 +102,7 @@ docker compose down
 <a id="health"></a>
 ## 5. Health（存活与健康）
 
-三个 GET 路由都不会调用 embedding 提供方：
+三个 GET 路由都不会发起 embedding 或 yuantiji 网络请求：
 
 ```bash
 curl --fail --silent http://127.0.0.1:8730/api/v1/live
@@ -136,6 +137,17 @@ v2 的 `completion.status` 是 `complete`、`partial` 或 `unavailable`。不可
 
 集成方可以把授权读取到的单题通过 `PUT /api/v1/index/problems` 写入 Anklang 自己的索引，也可以实现 `anklang/sources/` 下的来源适配器并打开 `ANKLANG_INGEST_ENABLED=true`。两种路径都不共享数据库，不允许把 Urmotiv 的权限、审核意见或工作流字段写进 Anklang。
 
+### 配置检索来源
+
+检索来源是独立于本地向量索引的运行时设置。默认生产配置为 `yuantiji`；切换为 `local` 或 `hybrid` 后，Anklang 只在本地保存自己的索引，不会把 Urmotiv 的权限、审核状态或 Fermata 属性写入其中：
+
+```text
+PUT /api/v1/admin/search-sources
+{"mode":"yuantiji","yuantijiBaseUrl":"https://yuantiji.ac","yuantijiRerank":false}
+```
+
+使用 `POST /api/v1/admin/search-sources/test` 做主动连通性测试；它会发送固定合成题面验证真实搜索接口。`GET /api/v1/admin/search-sources` 只读当前配置，不会因公共服务变慢而阻塞健康探针或管理页。
+
 ### 配置 embedding
 
 提供方配置只在进程内存中存在，重启后回到未配置。配置、查询、入库共用 Anklang 服务令牌；提供方的 `apiKey` 是另一项独立的外部服务凭据，只接受管理请求，永远不会出现在 GET 响应、健康状态、日志或 Git 中：
@@ -143,6 +155,7 @@ v2 的 `completion.status` 是 `complete`、`partial` 或 `unavailable`。不可
 ```text
 PUT /api/v1/admin/embedding-provider
 {
+  "protocol": "openai",
   "baseUrl": "https://embedding.example.invalid/compatible-mode/v1",
   "apiKey": "由密钥管理器注入的提供方密钥",
   "model": "text-embedding-v4",
@@ -150,7 +163,7 @@ PUT /api/v1/admin/embedding-provider
 }
 ```
 
-`baseUrl` 必须是没有账号、密码、查询参数或片段的 HTTP/HTTPS 地址。提供方请求失败、响应不符合契约、模型或维度与本地索引冲突时，查询和入库会失败关闭。
+`protocol` 当前固定为 `openai`，表示请求 `POST {baseUrl}/embeddings`。`baseUrl` 必须是没有账号、密码、查询参数或片段的 HTTP/HTTPS 地址。首次配置、模型/维度/地址变化或旧索引缺少提供方身份时，服务会按小批次重建全部本地向量；重建期间保留旧向量但暂停本地检索，状态可从 embedding 状态中的 `rebuild` 读取。提供方请求失败、响应不符合契约、模型或维度与本地索引冲突时，查询和入库会失败关闭。
 
 <a id="api"></a>
 ## 7. API（接口）
@@ -168,6 +181,10 @@ PUT /api/v1/admin/embedding-provider
 | `GET` | `/api/v1/admin/embedding-provider` | 服务令牌 | 读取提供方公开状态，不含密钥。 |
 | `PUT` | `/api/v1/admin/embedding-provider` | 服务令牌 | 在运行期设置提供方。 |
 | `DELETE` | `/api/v1/admin/embedding-provider` | 服务令牌 | 等待在途向量化结束后清除提供方。 |
+| `GET` | `/api/v1/admin/search-sources` | 服务令牌 | 读取来源选择，不主动探测公共服务。 |
+| `PUT` | `/api/v1/admin/search-sources` | 服务令牌 | 选择 `yuantiji`、`local` 或 `hybrid`。 |
+| `POST` | `/api/v1/admin/search-sources/test` | 服务令牌 | 主动测试 yuantiji（local 模式返回无需测试）。 |
+| `POST` | `/api/v1/admin/embedding-provider/test` | 服务令牌 | 用固定合成文本测试 OpenAI 兼容接口，不保存设置。 |
 
 ### 查询请求和响应
 
@@ -189,7 +206,7 @@ v1 成功响应严格包含 `apiVersion`、`contentHash`、`checkedAt`、`candid
 }
 ```
 
-候选最多 50 条，按 `similarity` 降序；每条必填 `source`、`externalId`、`title`、`similarity`，可选 `url`。v2 可以带来源适配器提供的有界公开 `metadata`。`ANKLANG_MINIMUM_SIMILARITY` 只是显示下限，不是重复、抄袭、通过或拦截阈值。
+候选最多 50 条，按 `similarity` 降序；每条必填 `source`、`externalId`、`title`、`similarity`，可选 `url`。v2 可以带来源适配器提供的有界公开 `metadata` 和最多 32,000 个 UTF-16 单元的 `statement`（过长时附 `statementTruncated: true`），供上游界面展开核对。`ANKLANG_MINIMUM_SIMILARITY` 只是显示下限，不是重复、抄袭、通过或拦截阈值。
 
 ### 单题入库
 
@@ -199,7 +216,7 @@ v1 成功响应严格包含 `apiVersion`、`contentHash`、`checkedAt`、`candid
 
 ### embedding 管理
 
-`PUT` 请求严格只接受 `baseUrl`、`apiKey`、`model`、`dimension`。`GET` 只返回 `configured`、`baseUrl`、`model`、`dimension` 等公开状态；`DELETE` 清除内存中的提供方。管理接口没有独立的 Urmotiv、Fermata 或 yuantiji 凭据，调用者必须使用 Anklang 的服务令牌。
+`PUT` 请求接受 `protocol`（当前为 `openai`）、`baseUrl`、`apiKey`、`model`、`dimension`；`POST .../test` 只用固定合成文本测试，不保存密钥。`GET` 只返回 `configured`、`baseUrl`、`model`、`dimension` 和必要时的 `rebuild` 状态；`DELETE` 清除内存中的提供方。管理接口没有独立的 Urmotiv、Fermata 或 yuantiji 凭据，调用者必须使用 Anklang 的服务令牌。
 
 字段范围、固定错误码和严格契约以 [`docs/plan.md`](docs/plan.md) 与 `anklang/contracts.py` 为准。
 
@@ -217,11 +234,14 @@ v1 成功响应严格包含 `apiVersion`、`contentHash`、`checkedAt`、`candid
 | `ANKLANG_SHUTDOWN_GRACE_SECONDS` | `30` | 应用停止时等待在途查询的最长时间。 |
 | `ANKLANG_SEARCH_K` | `8` | 内部检索候选数，范围 1–20。 |
 | `ANKLANG_MINIMUM_SIMILARITY` | `0.5` | 候选显示下限，范围 0–1；不是业务阈值。 |
+| `ANKLANG_SEARCH_MODE` | `yuantiji` | 默认来源：`yuantiji`、`local` 或 `hybrid`。 |
+| `YUANTIJI_BASE_URL` | `https://yuantiji.ac` | yuantiji 公共搜索 API 根地址。 |
+| `YUANTIJI_RERANK` | `false` | 是否请求 yuantiji 重排。 |
 | `ANKLANG_LOCAL_DB_PATH` | `problems-data/local-index.db` | SQLite 文件路径，相对于启动目录。 |
 | `ANKLANG_INGEST_ENABLED` | `false` | 是否开启来源适配器增量抓取。 |
 | `ANKLANG_INGEST_INTERVAL_SECONDS` | `3600` | 增量抓取间隔，范围 60–86,400 秒。 |
 
-`DASHSCOPE_*` 环境变量不会配置或激活 Anklang embedding 提供方。提供方必须通过管理 API 注入，进程重启后需要重新配置。
+`DASHSCOPE_*` 等环境变量不会配置或激活 Anklang embedding 提供方。提供方必须通过管理 API 注入，进程重启后需要重新配置；`ANKLANG_SEARCH_MODE=yuantiji` 不需要这些变量。
 
 <a id="operations-and-security"></a>
 ## 9. Operations and Security（运维与安全）
@@ -266,7 +286,7 @@ docker build -t anklang:verify .
 ## 12. Contributing（贡献）
 
 1. 从 `main` 创建主题分支，并保持提交只覆盖一个可审阅的行为变化。
-2. 不改变上游检索调用顺序，不新增 yuantiji relay、结果缓存或 LLM 复核路径。
+2. 不改变上游本地检索调用顺序，不新增代理转发、结果缓存或 LLM 复核路径；yuantiji 仅作为明确可选的独立来源。
 3. 涉及 HTTP、权限、来源、索引或密钥边界时，补充无权、失败关闭和边界测试。
 4. 运行 [Testing（测试）](#testing) 中的命令，并在提交前确认没有私有数据、题面、数据库或密钥。
 5. 提交说明应包含行为、验证命令和已知限制；不要把接口运行性写成语义准确率。

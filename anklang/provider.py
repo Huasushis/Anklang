@@ -40,6 +40,7 @@ class ProviderRegistry:
         self._base_url: str | None = None
         self._model: str | None = None
         self._dimension: int | None = None
+        self._config: ProviderConfig | None = None
         if initial is not None:
             self._model = getattr(initial, "model", None)
             self._dimension = getattr(initial, "dimensions", None)
@@ -63,16 +64,27 @@ class ProviderRegistry:
             if self._in_flight == 0:
                 self._idle.notify_all()
 
-    def configure(self, config: ProviderConfig, *, opener: Any | None = None) -> None:
+    def configure(
+        self,
+        config: ProviderConfig,
+        *,
+        opener: Any | None = None,
+        client: Any | None = None,
+    ) -> None:
         """原子替换为新的提供方：先阻止新获取，等待在途操作结束后再安装。"""
 
-        client = EmbeddingClient(
+        next_client = client or EmbeddingClient(
             base_url=config.base_url,
             api_key=config.api_key,
             model=config.model,
             dimensions=config.dimension,
             opener=opener,
         )
+        if (
+            getattr(next_client, "model", None) != config.model
+            or getattr(next_client, "dimensions", None) != config.dimension
+        ):
+            raise ValueError("提供方客户端身份与配置不一致。")
         with self._lock:
             self._client = None
             while self._in_flight > 0:
@@ -80,7 +92,8 @@ class ProviderRegistry:
             self._base_url = config.base_url
             self._model = config.model
             self._dimension = config.dimension
-            self._client = client
+            self._config = config
+            self._client = next_client
 
     def clear(self) -> None:
         """立即阻止新获取，并同步等待在途操作全部结束后再返回。"""
@@ -92,6 +105,13 @@ class ProviderRegistry:
             self._base_url = None
             self._model = None
             self._dimension = None
+            self._config = None
+
+    def matches(self, config: ProviderConfig) -> bool:
+        """Compare a full in-memory configuration without exposing its API key."""
+
+        with self._lock:
+            return self._client is not None and self._config == config
 
     def status(self) -> tuple[bool, str | None, str | None, int | None]:
         """返回 (configured, baseUrl, model, dimension)，永不包含密钥。"""

@@ -34,7 +34,12 @@ from anklang.http_api import (
     make_handler,
 )
 from anklang.ingest import UpsertUnavailable, ingest_once, upsert_one_problem
-from anklang.provider import ProviderRegistry
+from anklang.provider import ProviderConfig, ProviderRegistry
+from anklang.search_sources import (
+    ConfiguredSearchBackend,
+    SearchSourceConfig,
+    SearchSourceRegistry,
+)
 from anklang.sources import RawProblem
 from anklang.store import EmbeddingIndexSpec, IndexMetadataError, ProblemStore, StoredProblem
 from anklang.vectormath import cosine_similarity
@@ -87,7 +92,24 @@ def mkrow(problem: StoredProblem, similarity: float) -> dict[str, Any]:
         row["url"] = problem.url
     if problem.metadata:
         row["metadata"] = problem.metadata
+    statement, truncated = _candidate_statement(problem.statement)
+    row["statement"] = statement
+    if truncated:
+        row["statementTruncated"] = True
     return row
+
+
+def _candidate_statement(value: str) -> tuple[str, bool]:
+    maximum = 32_000
+    current = 0
+    kept: list[str] = []
+    for character in value.strip():
+        width = 2 if ord(character) > 0xFFFF else 1
+        if current + width > maximum:
+            return "".join(kept), True
+        kept.append(character)
+        current += width
+    return "".join(kept), False
 
 
 def search(
@@ -125,12 +147,26 @@ class UpstreamSearchBackend(SearchBackend):
     ) -> None:
         self.store = store
         self.provider = provider if provider is not None else ProviderRegistry()
+        self._rebuild_lock = threading.RLock()
+        self._rebuild_generation = 0
+        self._rebuild_thread: threading.Thread | None = None
+        self._rebuild_state = "idle"
+        self._rebuild_processed = 0
+        self._rebuild_total = 0
+        self._rebuild_reason: str | None = None
+        self._pending_config: ProviderConfig | None = None
 
     @property
     def index_spec(self) -> EmbeddingIndexSpec | None:
         return self.provider.spec()
 
     def search(self, query_text: str, k: int) -> BackendSearchResult:
+        if self.embedding_rebuild_status()["state"] == "running":
+            return BackendSearchResult.unavailable(
+                reason_code="search_backend_unavailable",
+                retryable=True,
+                retry_after_seconds=1,
+            )
         client = self.provider.acquire()
         if client is None:
             return BackendSearchResult.unavailable(
@@ -171,6 +207,12 @@ class UpstreamSearchBackend(SearchBackend):
     ) -> BackendUpsertResult:
         """把固定来源 ``urmotiv`` 的一道题写入同一 SQLite/向量路径。"""
 
+        if self.embedding_rebuild_status()["state"] == "running":
+            raise BackendError(
+                reason_code="service_unavailable",
+                retryable=True,
+                retry_after_seconds=1,
+            )
         client = self.provider.acquire()
         if client is None:
             raise BackendError(
@@ -205,6 +247,206 @@ class UpstreamSearchBackend(SearchBackend):
             self.provider.release()
         return BackendUpsertResult(result.outcome, result.content_hash)
 
+    def configure_provider(self, config: ProviderConfig) -> None:
+        """Install a compatible provider or rebuild every local vector in bounded batches."""
+
+        spec = EmbeddingIndexSpec(config.model, config.dimension)
+        with self._rebuild_lock:
+            worker = self._rebuild_thread
+            if worker is not None and worker.is_alive():
+                if self._pending_config == config:
+                    return
+                raise BackendError(
+                    reason_code="service_unavailable",
+                    retryable=True,
+                    retry_after_seconds=1,
+                )
+            self._rebuild_thread = None
+
+            if self.provider.matches(config):
+                self._rebuild_state = "idle"
+                self._rebuild_processed = 0
+                self._rebuild_total = 0
+                self._rebuild_reason = None
+                self._pending_config = None
+                return
+
+            if self.store.count() == 0:
+                self.store.begin_embedding_rebuild()
+                if not self.store.finalize_embedding_rebuild(
+                    spec, base_url=config.base_url
+                ):
+                    raise BackendError(
+                        reason_code="service_unavailable", retryable=True
+                    )
+                self.provider.configure(config)
+                self._rebuild_state = "idle"
+                self._rebuild_processed = 0
+                self._rebuild_total = 0
+                self._rebuild_reason = None
+                self._pending_config = None
+                return
+
+            if self.store.index_matches_provider(spec, config.base_url):
+                self.provider.configure(config)
+                self._rebuild_state = "idle"
+                self._rebuild_processed = 0
+                self._rebuild_total = 0
+                self._rebuild_reason = None
+                self._pending_config = None
+                return
+
+            self._rebuild_generation += 1
+            generation = self._rebuild_generation
+            self._pending_config = config
+            self._rebuild_state = "running"
+            self._rebuild_processed = 0
+            self._rebuild_total = self.store.count()
+            self._rebuild_reason = None
+            worker = threading.Thread(
+                target=self._rebuild_embeddings,
+                args=(generation, config),
+                daemon=True,
+                name="anklang-embedding-rebuild",
+            )
+            self._rebuild_thread = worker
+            worker.start()
+
+    def clear_provider(self) -> None:
+        with self._rebuild_lock:
+            self._rebuild_generation += 1
+            self._pending_config = None
+            worker = self._rebuild_thread
+            if worker is not None and worker.is_alive():
+                self._rebuild_state = "running"
+                self._rebuild_reason = None
+            else:
+                worker = None
+                self._rebuild_thread = None
+                self._rebuild_state = "idle"
+                self._rebuild_processed = 0
+                self._rebuild_total = 0
+                self._rebuild_reason = None
+
+        # Block new uses of the registered client immediately. A rebuild owns a separate
+        # bounded client, so wait for its current batch to finish before reporting that the
+        # credential has been cleared.
+        self.provider.clear()
+        if worker is None:
+            return
+        worker.join(timeout=35)
+        if worker.is_alive():
+            with self._rebuild_lock:
+                self._rebuild_state = "failed"
+                self._rebuild_reason = "configuration_clear_incomplete"
+            raise BackendError(
+                reason_code="service_unavailable",
+                retryable=True,
+                retry_after_seconds=1,
+            )
+        try:
+            self.store.abort_embedding_rebuild()
+        except Exception as error:
+            with self._rebuild_lock:
+                self._rebuild_state = "failed"
+                self._rebuild_reason = "configuration_clear_incomplete"
+                self._rebuild_thread = None
+            raise BackendError(
+                reason_code="service_unavailable", retryable=True
+            ) from error
+        with self._rebuild_lock:
+            self._rebuild_thread = None
+            self._rebuild_state = "idle"
+            self._rebuild_processed = 0
+            self._rebuild_total = 0
+            self._rebuild_reason = None
+
+    def embedding_rebuild_status(self) -> dict[str, Any]:
+        with self._rebuild_lock:
+            status: dict[str, Any] = {
+                "state": self._rebuild_state,
+                "processed": self._rebuild_processed,
+                "total": self._rebuild_total,
+            }
+            if self._rebuild_reason is not None:
+                status["reasonCode"] = self._rebuild_reason
+            return status
+
+    def _rebuild_embeddings(self, generation: int, config: ProviderConfig) -> None:
+        spec = EmbeddingIndexSpec(config.model, config.dimension)
+        client = EmbeddingClient(
+            base_url=config.base_url,
+            api_key=config.api_key,
+            model=config.model,
+            dimensions=config.dimension,
+        )
+        try:
+            total = self.store.begin_embedding_rebuild()
+            with self._rebuild_lock:
+                if generation != self._rebuild_generation:
+                    return
+                self._rebuild_total = total
+            offset = 0
+            while offset < total:
+                with self._rebuild_lock:
+                    if generation != self._rebuild_generation:
+                        self.store.abort_embedding_rebuild()
+                        return
+                problems = self.store.embedding_rebuild_batch(offset, 10)
+                if not problems:
+                    break
+                vectors = client.embed_batch([problem.statement for problem in problems])
+                self.store.stage_embedding_rebuild_batch(
+                    [
+                        (
+                            problem.source,
+                            problem.external_id,
+                            problem.content_hash,
+                            vector,
+                        )
+                        for problem, vector in zip(problems, vectors, strict=True)
+                    ],
+                    spec,
+                )
+                offset += len(problems)
+                with self._rebuild_lock:
+                    if generation == self._rebuild_generation:
+                        self._rebuild_processed = offset
+            with self._rebuild_lock:
+                if generation != self._rebuild_generation:
+                    self.store.abort_embedding_rebuild()
+                    return
+            if not self.store.finalize_embedding_rebuild(
+                spec, base_url=config.base_url
+            ):
+                raise IndexMetadataError(
+                    "source_changed", "重建期间本地题目发生变化。"
+                )
+            with self._rebuild_lock:
+                if generation != self._rebuild_generation:
+                    return
+                # Keep generation validation, provider installation and the visible state
+                # transition under one lock so clear/reconfigure cannot install stale keys
+                # after the vector swap.
+                self.provider.configure(config, client=client)
+                self._rebuild_state = "idle"
+                self._rebuild_processed = total
+                self._rebuild_total = total
+                self._rebuild_reason = None
+                self._pending_config = None
+                self._rebuild_thread = None
+        except Exception:
+            try:
+                self.store.abort_embedding_rebuild()
+            except Exception:
+                pass
+            with self._rebuild_lock:
+                if generation == self._rebuild_generation:
+                    self._rebuild_state = "failed"
+                    self._rebuild_reason = "embedding_rebuild_failed"
+                    self._pending_config = None
+                    self._rebuild_thread = None
+
     def describe_health(self) -> dict[str, Any]:
         configured, _base_url, model, dimension = self.provider.status()
         spec = None
@@ -220,6 +462,7 @@ class UpstreamSearchBackend(SearchBackend):
                 "embeddingAvailable": configured,
                 "vectorIndexReady": False,
                 "vectorIndexStatus": "store_unavailable",
+                "embeddingRebuild": self.embedding_rebuild_status(),
             }
         return {
             "backend": "upstream-v2",
@@ -228,19 +471,33 @@ class UpstreamSearchBackend(SearchBackend):
             "embeddingAvailable": configured,
             "vectorIndexReady": inspection.vector_ready,
             "vectorIndexStatus": inspection.status,
+            "embeddingRebuild": self.embedding_rebuild_status(),
         }
 
     def close(self) -> None:
+        with self._rebuild_lock:
+            self._rebuild_generation += 1
+            worker = self._rebuild_thread
+        if worker is not None and worker.is_alive():
+            worker.join(timeout=35)
         self.store.close()
 
 
-def build_backend(config: AppConfig) -> UpstreamSearchBackend:
+def build_backend(config: AppConfig) -> ConfiguredSearchBackend:
     """从环境配置只创建本地存储与空的提供方注册表。
 
     提供方不由环境变量激活；进程启动后必须由 Urmotiv 通过管理接口重新供给。
     """
     store = ProblemStore(config.local_db_path)
-    return UpstreamSearchBackend(store, ProviderRegistry())
+    local = UpstreamSearchBackend(store, ProviderRegistry())
+    sources = SearchSourceRegistry(
+        SearchSourceConfig(
+            mode=config.search_mode,  # type: ignore[arg-type]
+            yuantiji_base_url=config.yuantiji_base_url,
+            yuantiji_rerank=config.yuantiji_rerank,
+        )
+    )
+    return ConfiguredSearchBackend(local, sources)
 
 
 def build_service(config: AppConfig) -> AnklangService:
@@ -248,7 +505,7 @@ def build_service(config: AppConfig) -> AnklangService:
 
 
 def start_background_ingest(
-    backend: UpstreamSearchBackend,
+    backend: ConfiguredSearchBackend,
     config: AppConfig,
     stop_event: threading.Event,
 ) -> threading.Thread:

@@ -12,7 +12,7 @@ Anklang 只做原题候选检索：
 
 embedding（向量化）把文字转换为固定长度的数字向量；`cosine_all` 计算向量方向的相似度；`collapse` 按来源和稳定题号去重；`mkrow` 形成公开候选。返回值是检索事实，不是产品判断。
 
-Anklang 不判断候选是否同题或可作参考，不决定通过、拦截、审核或后续流程，不调用 LLM 复核，不提供 yuantiji 代理，不保存查询结果或结果缓存，也不保存提交查询的业务状态。
+Anklang 不判断候选是否同题或可作参考，不决定通过、拦截、审核或后续流程，不调用 LLM 复核，不提供代理转发或结果缓存，也不保存提交查询的业务状态。检索来源可独立选择为 `yuantiji`、`local` 或 `hybrid`；yuantiji 只接收当前查询文本并返回公开候选。
 
 跨服务边界如下：Urmotiv 的受信任插件可以把抄袭/检查信息作为 Urmotiv 的问题属性添加，供 Fermata 消费；Fermata 通过带版本号的 Urmotiv HTTP 接口读取这些属性。Anklang 不拥有这些属性、工作流状态或审核结论，不读取 Urmotiv/Fermata 数据库，也不提供两个服务运行时互调的接口。
 
@@ -23,12 +23,12 @@ Anklang 不判断候选是否同题或可作参考，不决定通过、拦截、
 | 上游路径或职责 | Anklang 实现 | 允许的差异 |
 | --- | --- | --- |
 | `ui/server.py` 运行入口、`cosine_all`、排序、`collapse`、`mkrow` | `ui/server.py` | 保留调用顺序；候选字段收窄为机器接口契约。 |
-| embedding | `anklang/embedding.py` | 改用配置的百炼 OpenAI 兼容 `/embeddings` 接口，校验模型、维度、顺序、数量和响应大小。 |
+| embedding | `anklang/embedding.py` | 使用运行期配置的 OpenAI 兼容 `/embeddings` 接口，校验模型、维度、顺序、数量和响应大小；身份变化触发有界全量重建。 |
 | 内存题库 | `anklang/store.py` | 使用独立 SQLite 当前题目行和向量；查询每次读取当前快照。 |
 | 题目更新 | `anklang/sources/`、`anklang/ingest.py` | 自动发现来源适配器，按来源维护 UTC 游标，增量幂等插入或更新。 |
 | HTTP 适配 | `anklang/http_api.py` | 提供严格的 v1/v2 查询、存活、就绪和健康路由。 |
 
-网页、查询改写、重排、统计、OJ 筛选、查询向量缓存、LLM 复核、流程采集和跨服务代理不属于当前实现。
+网页、查询改写、统计、OJ 筛选、查询向量缓存、LLM 复核、流程采集和跨服务代理不属于当前实现。yuantiji 的 `rerank` 只是向独立公共来源传递的可选请求开关，不是 Anklang 自己的裁决。
 
 ## 数据与索引不变量
 
@@ -36,7 +36,7 @@ Anklang 不判断候选是否同题或可作参考，不决定通过、拦截、
 - 查询和入库必须使用同一个模型标识与维度；SQLite 中的索引身份不匹配时拒绝形成候选。
 - `(source, external_id)` 是稳定主键。题目更新时间使用带毫秒的 UTC `Z` 字符串；同一题号出现无法判断先后的不同版本时整组跳过，并且不推进游标。
 - 运行时增量写入完成后，下一个查询直接读取新快照；不需要重启服务或离线全量重建。
-- embedding 未配置、提供方失败、向量无效或索引不可用时，v2 使用 `unavailable`，候选必须为空；入库任务不写无向量题目，也不推进失败来源的游标。
+- local/hybrid 模式下 embedding 未配置、提供方失败、向量无效或索引不可用时，v2 使用 `unavailable`，候选必须为空；入库任务不写无向量题目，也不推进失败来源的游标。更换提供方会先在临时表中分批重建并在内容哈希仍一致时原子切换。
 - 查询响应使用 `Cache-Control: no-store`。运行时没有结果缓存、复用策略、过期时间或索引代次状态。
 
 ## 来源适配器契约
@@ -100,9 +100,9 @@ v2 成功形成的响应严格为：
 
 `completion.status` 为 `complete`、`partial` 或 `unavailable`。完整结果的原因码固定为 `complete` 且不可重试；部分结果可以携带候选；不可用结果的候选数组必须为空。非完整结果可带固定原因码和可选的 `retryAfterSeconds`（1–86,400 秒）。
 
-候选最多 50 条，按 `similarity` 降序；每条必填 `source`、`externalId`、`title`、`similarity`，可选 `url`。v2 可额外带来源适配器提供的有界 `metadata`，v1 不带该字段。`ANKLANG_MINIMUM_SIMILARITY` 只是显示下限，不形成重复、抄袭、通过或拦截政策。
+候选最多 50 条，按 `similarity` 降序；每条必填 `source`、`externalId`、`title`、`similarity`，可选 `url`。v2 可额外带来源适配器提供的有界 `metadata`、`statement` 和 `statementTruncated`，v1 不带这些字段。`ANKLANG_MINIMUM_SIMILARITY` 只是显示下限，不形成重复、抄袭、通过或拦截政策。
 
-HTTP 层不向外发送题面、来源摘录、模型原始响应、复核字段、审核建议或工作流属性。错误消息是固定文本，响应不缓存。
+HTTP 层只在 v2 候选中返回来源提供的有界公开题面；不返回查询题面、模型原始响应、复核字段、审核建议或工作流属性。错误消息是固定文本，响应不缓存。
 
 ### Urmotiv 单题增量入库
 

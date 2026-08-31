@@ -168,10 +168,12 @@ class ComposeEnvFileTests(unittest.TestCase):
         build_args = compose.get("services", {}).get("anklang", {}).get("build", {}).get("args", {})
         self.assertNotIn("ANKLANG_REVISION", build_args)
 
-    def test_env_has_no_proxy_review_cache_or_policy_configuration(self) -> None:
+    def test_env_has_no_review_cache_or_policy_configuration(self) -> None:
         with open(".env.example", "r") as f:
             content = f.read()
-        self.assertNotIn("YUANTIJI", content)
+        self.assertIn("ANKLANG_SEARCH_MODE=yuantiji", content)
+        self.assertIn("YUANTIJI_BASE_URL=https://yuantiji.ac", content)
+        self.assertIn("YUANTIJI_RERANK=false", content)
         self.assertNotIn("ANKLANG_LLM", content)
         self.assertNotIn("ANKLANG_CACHE", content)
         self.assertNotIn("ANKLANG_REVISION", content)

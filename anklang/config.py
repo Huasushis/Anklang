@@ -3,8 +3,8 @@
 密钥只保存在内存里；任何日志、健康检查、错误响应都不允许输出它们。
 
 Anklang 是 is-my-problem-new（MIT，Copyright (c) 2023 Ziqian Zhong）的最小直接改编：
-改用阿里云百炼（DashScope）做文本向量，支持源插件实时入库，只暴露查询入/结果出的
-查重接口。不包含 yuantiji 反向代理、LLM 复核、标定或结果缓存。
+保留原题相似度检索主链，支持独立的 yuantiji 公共来源和可选本地索引。只有在选择
+local/hybrid 时才需要运行期配置 OpenAI 兼容的 embedding 提供方。
 """
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ import ipaddress
 import os
 import re
 from dataclasses import dataclass
+from urllib.parse import urlsplit
 
 
 class ConfigError(RuntimeError):
@@ -55,6 +56,35 @@ def _read_bool(name: str, default: bool = False) -> bool:
     if raw == "false":
         return False
     raise ConfigError(f"{name} 只能留空，或填写 true/false。")
+
+
+def _read_choice(name: str, default: str, allowed: tuple[str, ...]) -> str:
+    value = os.environ.get(name, "").strip() or default
+    if value not in allowed:
+        raise ConfigError(f"{name} 必须是 {'/'.join(allowed)} 之一。")
+    return value
+
+
+def _read_external_base_url(name: str, default: str) -> str:
+    value = os.environ.get(name, "").strip() or default
+    try:
+        parsed = urlsplit(value)
+        _ = parsed.port
+    except ValueError as error:
+        raise ConfigError(f"{name} 不是合法地址。") from error
+    if (
+        parsed.scheme not in {"http", "https"}
+        or parsed.hostname is None
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path not in {"", "/"}
+        or parsed.query
+        or parsed.fragment
+        or not _valid_hostname(parsed.hostname)
+        or (parsed.scheme == "http" and parsed.hostname not in {"localhost", "127.0.0.1", "::1"})
+    ):
+        raise ConfigError(f"{name} 必须是无路径、账号或参数的 HTTPS 地址；本机测试可用 HTTP。")
+    return value.rstrip("/")
 
 
 def _valid_hostname(hostname: str) -> bool:
@@ -105,6 +135,11 @@ class AppConfig:
     service_token: str | None
     search_k: int
     minimum_similarity: float
+    # Direct AppConfig construction in embedded/local deployments preserves the local
+    # backend. load_config() below deliberately defaults production to yuantiji.
+    search_mode: str = "local"
+    yuantiji_base_url: str = "https://yuantiji.ac"
+    yuantiji_rerank: bool = False
     local_db_path: str = "problems-data/local-index.db"
     # 源插件后台抓取（默认关闭，打开后周期性调用源插件入库）
     ingest_enabled: bool = False
@@ -135,6 +170,13 @@ def load_config() -> AppConfig:
         service_token=service_token,
         search_k=_read_int("ANKLANG_SEARCH_K", 8, 1, 20),
         minimum_similarity=_read_float("ANKLANG_MINIMUM_SIMILARITY", 0.5, 0.0, 1.0),
+        search_mode=_read_choice(
+            "ANKLANG_SEARCH_MODE", "yuantiji", ("yuantiji", "local", "hybrid")
+        ),
+        yuantiji_base_url=_read_external_base_url(
+            "YUANTIJI_BASE_URL", "https://yuantiji.ac"
+        ),
+        yuantiji_rerank=_read_bool("YUANTIJI_RERANK", False),
         local_db_path=os.environ.get("ANKLANG_LOCAL_DB_PATH", "").strip()
         or "problems-data/local-index.db",
         ingest_enabled=ingest_enabled,

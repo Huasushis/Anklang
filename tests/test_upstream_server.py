@@ -106,7 +106,7 @@ class UpstreamEntrypointTests(unittest.TestCase):
         self.assertEqual(result.status, "complete")
         self.assertEqual(
             set(result.candidates[0]),
-            {"source", "externalId", "title", "similarity"},
+            {"source", "externalId", "title", "similarity", "statement"},
         )
 
     def test_provider_failure_is_explicit_unavailable(self) -> None:
