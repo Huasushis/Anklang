@@ -43,6 +43,12 @@ services:
       retries: 4
       start_period: 5s
     stop_grace_period: "${ANKLANG_STOP_GRACE_PERIOD:-45s}"
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+          cpus: "0.2"
+          pids: 128
 
 volumes:
   anklang-problems-data:

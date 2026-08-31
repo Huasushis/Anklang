@@ -126,6 +126,7 @@ class ContainerDeploymentTests(unittest.TestCase):
             'ANKLANG_CLIENT_IDLE_TIMEOUT_SECONDS: "${ANKLANG_CLIENT_IDLE_TIMEOUT_SECONDS:-15}"',
             'ANKLANG_SHUTDOWN_GRACE_SECONDS: "${ANKLANG_SHUTDOWN_GRACE_SECONDS:-30}"',
             'stop_grace_period: "${ANKLANG_STOP_GRACE_PERIOD:-45s}"',
+            'deploy:\n      resources:\n        limits:\n          memory: 1g\n          cpus: "0.2"\n          pids: 128',
             "/api/v1/live",
             "anklang-problems-data:/app/problems-data",
             "/tmp:rw,noexec,nosuid,nodev,size=16m",
